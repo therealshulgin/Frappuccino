@@ -61,18 +61,35 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Cache cargo (kani install)
+      # `~/.kani` holds the toolchain bundle `cargo kani setup` downloads, which
+      # is the largest single fetch in this workflow. It was outside the cache,
+      # so every run re-downloaded it, and a run that lost that download failed
+      # the job before a single proof had been attempted.
+      - name: Cache cargo + kani toolchain
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             ~/.cargo/bin
-          key: ${{ runner.os }}-kani-0.67.0
+            ~/.kani
+          key: ${{ runner.os }}-kani-0.67.0-v2
       - name: Install Kani
         run: |
-          cargo install --locked kani-verifier --version 0.67.0
-          cargo kani setup
+          # Retried, because a proof job that dies in its own installation
+          # reports nothing about the proofs: it is the failure mode this
+          # workflow exists to rule out, not one it may exhibit. Both commands
+          # are idempotent, so a retry after a partial install is safe.
+          for attempt in 1 2 3; do
+            if cargo install --locked kani-verifier --version 0.67.0 \
+               && cargo kani setup; then
+              exit 0
+            fi
+            echo "::warning::Kani install attempt ${attempt} failed"
+            sleep $((attempt * 30))
+          done
+          echo "::error::Kani install failed three times; the proofs did not run"
+          exit 1
       - name: Kani proofs (parse_header no-panic + postconditions)
         run: bash crypto-rs/run-kani.sh
 
