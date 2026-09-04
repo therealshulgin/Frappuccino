@@ -187,7 +187,11 @@ mod tests {
         (SignatureDomain::BatchRotation, 0x02, ServerMirror::Yes),
         (SignatureDomain::Enrollment, 0x03, ServerMirror::Yes),
         (SignatureDomain::ArchiveAuth, 0x04, ServerMirror::Retired),
-        (SignatureDomain::ProvenanceManifest, 0x05, ServerMirror::Retired),
+        (
+            SignatureDomain::ProvenanceManifest,
+            0x05,
+            ServerMirror::Retired,
+        ),
         (
             SignatureDomain::ProvenanceKeyAttestation,
             0x06,
