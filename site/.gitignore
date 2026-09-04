@@ -1,0 +1,4 @@
+# Zola build output
+/public/
+# Zola image-processing cache (if static/ images are processed)
+/static/processed_images/

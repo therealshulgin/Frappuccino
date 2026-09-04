@@ -1,0 +1,5 @@
+# Tarpaulin intermediate files — only the HTML report + README are committed
+tarpaulin.log
+cobertura.xml
+lcov.info
+*.profraw

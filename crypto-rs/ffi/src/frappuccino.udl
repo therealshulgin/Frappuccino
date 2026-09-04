@@ -1,0 +1,656 @@
+// Frappuccino UniFFI interface definition.
+//
+// Scope:
+//   S8a — crypto-rs/core: BIP-39, PinStore, Identity, Ratchet.
+//   S8b — crypto-rs/stream: STRM encrypt/decrypt + V2 server client.
+//
+// Namespace `frappuccino` → Kotlin bindings under `uniffi.frappuccino.*`.
+//
+// Wire-format contract: all `bytes` arguments are ByteArray on the Kotlin
+// side; this crate never returns a reference into internal Rust state — each
+// call returns an owned copy that Kotlin is free to zero at its discretion.
+
+namespace frappuccino {
+    // Smoke-test API (S0) — keep stable so the existing RustSmokeTest stays green.
+    string hello_world();
+    string core_version();
+
+    // -------- BIP-39 ----------------------------------------------------------
+
+    /// Generate a fresh 12-word French mnemonic using OS entropy.
+    ///
+    /// Phase 6.1.4-B : retourne `bytes` (UTF-8) au lieu de `string`. Le
+    /// mnemonic ne touche jamais le pool intern Java (immutable, non-
+    /// wipeable). Le caller Kotlin reçoit un `ByteArray` qu'il peut wipe.
+    bytes bip39_generate_fr();
+
+    /// Normalize one word (trim, NFD, lowercase, canonical-prefix match).
+    /// Throws FfiError::InvalidMnemonicWord if the word isn't in the FR list.
+    ///
+    /// Note Phase 6.1.4-B : reste sur `string` (UI helper autocomplete,
+    /// risque secrecy limité — 1 mot ne révèle pas la phrase entière).
+    [Throws=FfiError]
+    string bip39_normalize_word_fr([ByRef] string input);
+
+    /// Validate a full 12-word FR mnemonic (checksum + known words).
+    /// Throws on any structural issue.
+    ///
+    /// Phase 6.1.4-B : `mnemonic` est `bytes` (UTF-8) au lieu de `string`.
+    [Throws=FfiError]
+    void bip39_validate_fr([ByRef] bytes mnemonic);
+
+    // -------- PIN-protected store --------------------------------------------
+
+    // `pin_store_seal` REMOVED from the FFI (2026-09-03). It had no Kotlin
+    // caller at all: production seals in-crate via the `pin_session_*` calls
+    // below, and the diff-fuzz harness only ever crosses the boundary for
+    // `pin_store_open` (Main.kt). The Rust `pin_store_seal` SURVIVES in lib.rs
+    // and must stay: the parity dumper calls it in pure Rust to build the blob
+    // the harness then opens, and three unit tests cover the seal/open pair.
+
+    /// Authenticate + decrypt a blob produced by the Rust-side `pin_store_seal`
+    /// (no longer exported; see the note above). Returns
+    /// WrongPin whether the PIN or the blob is the problem (indistinguishable
+    /// on purpose — feed the lockout tracker).
+    ///
+    /// Phase 6.1.4-A : `pin` est `bytes` au lieu de `string`.
+    [Throws=FfiError]
+    bytes pin_store_open([ByRef] bytes pin, [ByRef] bytes blob);
+
+    // Lot 4b P6 — `pin_store_open_extended` (+ `UnsealedBlob`),
+    // `pin_store_seal_with_key` and `pin_store_open_with_key` REMOVED. They
+    // ferried the Argon2id-derived key across the FFI and have no caller left
+    // after the no-export migration: the combined `pin_session_*` calls below
+    // open/seal/reseal entirely in-crate. Only `pin_store_open` above survives
+    // on the FFI surface, and only for the diff-fuzz parity harness (0 prod
+    // caller). The claim that `pin_store_seal` survived for the same reason was
+    // wrong: the harness never crossed the boundary for it, which is why it was
+    // removed in turn on 2026-09-03.
+
+    // -------- PIN-session holder (Lot 4b — R-CR-1 no-export) -----------------
+    // The Argon2id-derived key lives in a process-global Zeroizing holder
+    // inside Rust (like the upload bearer). The combined calls below open/seal
+    // IN-CRATE so the derived key, the ratchet 50-sk plaintext, the provenance
+    // seed and the report master NEVER cross the FFI. The clear is wired to the
+    // ratchet-wipe drain-safe events (lock / panic / auto-lock), NEVER a 401.
+
+    /// Enrollment: run Argon2id once on `sealed_blob` and stash the derived key
+    /// + salt in the holder (the ratchet is already in memory from the kit).
+    [Throws=FfiError]
+    void pin_session_populate([ByRef] bytes pin, [ByRef] bytes sealed_blob);
+
+    /// Unlock: Argon2id once, stash the key in the holder, deserialize the
+    /// ratchet — all in-crate. Returns the ratchet handle; neither the key nor
+    /// the 50-sk plaintext crosses. Replaces pin_store_open_extended + deserialize.
+    [Throws=FfiError]
+    EphemeralRatchet pin_session_open_ratchet([ByRef] bytes pin, [ByRef] bytes sealed_blob);
+
+    /// Unlock reload (OPTION B): unseal the provenance seed with the held key and
+    /// reconstruct the signer in-crate. The seed never crosses the FFI.
+    [Throws=FfiError]
+    ProvenanceSigner pin_session_open_provenance_signer([ByRef] bytes sealed_blob);
+
+    /// Unlock reload (OPTION B): unseal the report master with the held key and
+    /// reconstruct the keyring in-crate. The master never crosses the FFI.
+    [Throws=FfiError]
+    ReportKeyring pin_session_open_report_keyring([ByRef] bytes sealed_blob);
+
+    /// Zeroize + drop the cached PIN-session key. Idempotent. Wired to lock /
+    /// panic-wipe / drain-safe auto-lock; NEVER to a 401 (not re-derivable
+    /// without the PIN).
+    void pin_session_clear();
+
+    // -------- STRM (stream blob encrypt/decrypt) -----------------------------
+
+    /// M-1 (WP-C) — true iff `name` is a single safe path component (no
+    /// separator, not `.`/`..`, not absolute, not empty). The rescue device
+    /// validates relay-supplied blob filenames with THIS shared guard before
+    /// joining them onto a local output dir. The download FFIs also enforce it.
+    boolean archive_blob_filename_is_safe([ByRef] string name);
+
+    /// Encrypt `plaintext` as a self-sealed STRM blob for `author`. Picks
+    /// SINGLE (<= 10 MiB) or CHUNKED automatically.
+    [Throws=FfiError]
+    bytes strm_encrypt([ByRef] bytes plaintext, StreamIdentity author);
+
+    /// Phase 6.1.4-C — `strm_encrypt` qui prend des paths au lieu de
+    /// buffers. Le plaintext ne touche jamais la JVM heap : Rust ouvre
+    /// `input_path`, lit en `Zeroizing<Vec<u8>>`, chiffre, écrit
+    /// `output_path`. Retourne la taille du blob (octets).
+    [Throws=FfiError]
+    u64 strm_encrypt_file([ByRef] string input_path, [ByRef] string output_path, StreamIdentity author);
+
+    // Phase 8.1.6 (forensic finding #2, 2026-06-03) — the heap-returning
+    // `strm_decrypt` is REMOVED from the FFI: it copied decrypted plaintext
+    // into a non-Zeroizing JVM ByteArray that lingered on the heap.
+    // Decryption never crosses this boundary at all: the live archive path is
+    // `archive_download_and_decrypt` below, which decrypts and writes the file
+    // inside Rust. (The Rust `strm_decrypt` survives `#[cfg(test)]` only, for
+    // the in-memory roundtrip tests.)
+
+    // `strm_decrypt_to_file` REMOVED from the FFI (2026-09-03). It was the
+    // path-based decrypt exported for Kotlin, and it never acquired a Kotlin
+    // caller: `archive_download_and_decrypt` calls `strm_core_decrypt` directly
+    // and does its own file write. The Rust fn SURVIVES in lib.rs and must stay
+    // — two tests are the only end-to-end coverage of encrypt-to-file then
+    // decrypt-to-file, including the wrong-recipient rejection.
+
+    /// Phase 6.1.4-D — secure-delete d'un fichier temporaire contenant
+    /// des secrets (MP4 plaintext, blob STRM intermédiaire). Overwrite
+    /// avec random + fsync + truncate + unlink. No-op si le fichier
+    /// n'existe pas (idempotent).
+    ///
+    /// Throws FfiError::Io sur permission denied, disk full, etc.
+    [Throws=FfiError]
+    void secure_delete_file([ByRef] string path);
+
+    // -------- Upload session bearer (§10.6, 2026-06-13) ----------------------
+    // The upload JWT never crosses the FFI as a stored Kotlin String:
+    // `StreamServerClient.verify` stashes it in a process-global Zeroizing
+    // holder in Rust; the upload path pulls a transient copy per request via
+    // `upload_auth_header()`; lock / panic / drain-complete call
+    // `upload_auth_clear()` to zeroize it. Mirrors the old Kotlin
+    // UploadAuthHolder, moved into Rust so the bearer is never a long-lived
+    // JVM String (the §10.6 heap-dump finding).
+
+    /// Transient "Bearer <jwt>" for one authenticated request, or null if no
+    /// session is active. The JWT stays in the Rust holder; Kotlin only ever
+    /// gets a short-lived per-call copy.
+    string? upload_auth_header();
+
+    /// Zeroize + drop the stored upload bearer AND reset the Rust upload client
+    /// (evictAll-equivalent): every JWT clear also tears down upload connections
+    /// carrying the bearer. lock / panic / 401 / auto-lock / drain-complete.
+    void upload_auth_clear();
+
+    /// Whether an upload session bearer is held (existence only — the bearer
+    /// itself never crosses the FFI for the chunk path). Phase 1 heap-0 gate.
+    boolean upload_auth_present();
+
+    // `upload_put_chunk` REMOVED (2026-09-03), together with its Rust body and
+    // the two transport entry points it was the sole caller of
+    // (`stream::put_chunk` and `stream::put_chunk_quic`). It was the Phase 1
+    // unauthenticated chunk PUT, superseded by the two capability-authorized
+    // calls below when Phase C made every write carry a report signature.
+    //
+    // Removing the FFI function alone would have been cosmetic: both transport
+    // entry points are `pub` and re-exported, so the compiler emits no dead-code
+    // warning and the shipped .so would have kept carrying them.
+
+    /// Phase C (relay-blind reports) — PUT a chunk authorized by the per-report
+    /// capability key R_n (not the identity). EVERY chunk carries X-Report-PK +
+    /// X-Report-Write-Sig (0x08); the creating chunk (is_creation=true) also
+    /// carries X-Report-Create-Sig (0x07) + the stream JWT bearer. The .strm is
+    /// hashed + signed INSIDE Rust (report_id == H(report_pk) by construction;
+    /// no secret crosses the FFI). Never throws — failures are in PutOutcome.
+    PutOutcome upload_put_report_chunk([ByRef] string url, [ByRef] string blob_path, TransportMode mode, ReportKeyring keyring, u32 n, [ByRef] string filename, boolean is_creation);
+
+    /// Phase C (relay-blind reports) — PUT one report-DIRECTORY entry (filename =
+    /// the opaque directory_entry_name_hex(n), M-1) to the witness's singleton
+    /// directory report, so the rescue device recovers the authoritative n_max by
+    /// re-deriving + matching the entry names (derive-and-match, NOT max of the
+    /// names) and enumerates reports EXACTLY. Same capability contract + transport
+    /// as upload_put_report_chunk, but addressed/signed by the directory key.
+    /// is_creation=true only for the entry that lazily creates the directory.
+    /// Never throws — failures are in PutOutcome.
+    PutOutcome upload_put_directory_entry([ByRef] string url, [ByRef] string blob_path, TransportMode mode, ReportKeyring keyring, [ByRef] string filename, boolean is_creation);
+
+    /// Re-arm the QUIC transport at the start of a recording. Releases the
+    /// "QUIC cannot establish on this network" latch so a recovered network gets
+    /// QUIC back at the next recording instead of waiting for a lock or an auth
+    /// clear. Clears the latch alone, so a previous recording still draining
+    /// chunks over the live connection is not disrupted. Idempotent, never
+    /// throws; a .so built without the quic feature has no latch and this is a
+    /// no-op. (Was a side effect of the retired upload_create_report, which
+    /// stopped being called when report creation became lazy.)
+    void upload_transport_rearm();
+
+    // -------- Provenance (lean hash + Bitcoin, §10.11) -----------------------
+
+    /// SHA-256 of a plaintext chunk file, computed in Rust (heap-0: read into a
+    /// Zeroizing buffer, never crosses to the JVM). Returns the 32-byte hash,
+    /// accumulated into `chunk_hashes` for `provenance_ots_commitment`.
+    [Throws=FfiError]
+    bytes provenance_hash_plaintext_file([ByRef] string path);
+
+    /// §10.11 (lean "hash + Bitcoin") — the salted OTS commitment over the media
+    /// Merkle root: SHA-256(salt ‖ chunk_merkle_root(chunk_hashes)), with
+    /// salt = HKDF(provenance seed, recording_id). This is the ONLY provenance
+    /// artifact now (no manifest, no signature, no sealing); the device submits
+    /// this 32-byte commitment to the relay for trustless timestamping.
+    [Throws=FfiError]
+    bytes provenance_ots_commitment(
+        sequence<bytes> chunk_hashes,
+        [ByRef] bytes recording_id,
+        ProvenanceSigner signer
+    );
+};
+
+/// Transport selector for upload_put_report_chunk and
+/// upload_put_directory_entry. DirectTls = pinned reqwest over
+/// TCP (Phase 1). ObfQuic = pinned HTTP/3 over QUIC + BBR (Phase 3a) with an
+/// automatic QUIC->DirectTls fallback (Phase 3b brick 3): a QUIC transport
+/// failure routes the chunk over DirectTls for the same bearer (heap-0), and
+/// latches so subsequent chunks skip QUIC until the next recording start (or auth
+/// clear). A .so built without the `quic` feature behaves as DirectTls.
+enum TransportMode {
+    "DirectTls",
+    "ObfQuic",
+};
+
+/// Result of upload_put_report_chunk and upload_put_directory_entry.
+/// http_status 0 = no HTTP response; error_detail
+/// is a short tag ("no_bearer"/"file_missing"/"timeout"/"network"/"client_build").
+dictionary PutOutcome {
+    u16 http_status;
+    u64 upload_ms;
+    u64 transfer_ms;
+    string? error_detail;
+    // Lot 3 B observability: which transport delivered this chunk -
+    // "obfquic" / "directtls" / "directtls_fallback" / "directtls_degraded" / "none".
+    string transport_used;
+};
+
+// ============================================================================
+// Errors
+// ============================================================================
+
+// Note: variants use `detail` instead of `message` — UniFFI 0.28 generates an
+// Exception subclass that would otherwise clash with the inherited `message`
+// property of `kotlin.Throwable`.
+[Error]
+interface FfiError {
+    InvalidMnemonicWord(string word, string language);
+    InvalidMnemonic(string detail);
+    DerivationFailed(string detail);
+    EmptyInput();
+    AlreadyConsumed(string resource);
+    InvalidSignature();
+    WrongPin();
+    InvalidBlob(string detail);
+    /// HTTP / TLS / framing failure from the V2 relay client.
+    Network(string detail);
+    Internal(string detail);
+    /// Phase 6.1.4-D : I/O error during secure_delete_file
+    /// (permission denied, file gone, disk full, etc.).
+    Io(string detail);
+};
+
+// ============================================================================
+// Value types (dictionaries — records without behaviour)
+// ============================================================================
+
+/// Kotlin-friendly projection of `core::ratchet::RatchetSignature`.
+dictionary RatchetSignature {
+    bytes signature;                 // 64 bytes
+    bytes ephemeral_public_key;      // 32 bytes
+    u32 batch_number;
+    u32 key_index;
+};
+
+/// Kotlin-friendly projection of `core::ratchet::RotationProof`. The 50 new
+/// public keys are serialized as `sequence<bytes>` (50 × 32-byte entries).
+dictionary RotationProof {
+    u32 new_batch_number;
+    sequence<bytes> new_batch_public_keys;
+    bytes signer_public_key;
+    u32 signer_batch_number;
+    u32 signer_key_index;
+    bytes signature;
+};
+
+/// Phase 4.4.2 — per-blob metadata returned by
+/// `StreamServerClient.archive_list_blobs`.
+dictionary ArchiveBlobInfo {
+    string filename;
+    u64 size;
+    string? last_modified;
+};
+
+/// Phase 4.4.2 — result of `archive_download_and_decrypt`. Carries the
+/// network-side download byte count plus the decrypted plaintext size
+/// and the non-secret blob metadata.
+dictionary ArchiveDownloadResult {
+    u64 downloaded_bytes;
+    u64 plaintext_bytes;
+    BlobMetadata metadata;
+};
+
+/// Non-secret metadata accompanying a decrypted STRM blob. F-C1: no author
+/// identity field — the witness identity is never written at rest (V3) nor
+/// surfaced across the FFI.
+dictionary BlobMetadata {
+    u8 version;
+    u8 mode;                     // 1 = SINGLE, 2 = CHUNKED
+    u16 grant_count;
+    u64 plaintext_len;
+};
+
+// Phase 8.1.6 (forensic finding #2) — the `StrmPlaintext` dictionary is
+// removed with the heap-returning `strm_decrypt`. Decrypt metadata is
+// returned by `strm_decrypt_to_file` as `BlobMetadata`; no plaintext
+// ByteArray crosses the FFI anymore.
+
+/// Fresh challenge payload returned by `StreamServerClient.challenge`. The
+/// client MUST pass `nonce ‖ timestamp_BE_u64` (40 bytes) to the ratchet, which
+/// prepends the 0x01 domain tag and signs 41 — signing the raw nonce, or the 40
+/// bytes without the tag, is rejected by the server.
+dictionary ChallengeValue {
+    bytes nonce;         // 32 bytes
+    u64 timestamp;       // Unix seconds (server clock)
+};
+
+/// Outcome of an enrollment attempt. Maps to a Kotlin sealed class.
+[Enum]
+interface EnrollResult {
+    Success();
+    AlreadyEnrolled();
+    Failed(u16 code, string body);
+};
+
+// ============================================================================
+// Interfaces (types with methods, held by Kotlin as handles)
+// ============================================================================
+
+/// Public-only identity pair (Ed25519 + X25519 pubs). Cheap to clone, no
+/// secret material inside — safe to expose across FFI and log.
+interface StreamIdentity {
+    /// Rebuild a StreamIdentity from previously-published public keys. Used
+    /// when the keys were persisted on device after onboarding and we want
+    /// to pass a StreamIdentity to server-facing APIs (verify) without
+    /// re-deriving from the BIP-39 phrase.
+    [Throws=FfiError, Name=from_public_keys]
+    constructor([ByRef] bytes ed25519_pk, [ByRef] bytes x25519_pk);
+
+    bytes ed25519_pk();
+    bytes x25519_pk();
+    string ed25519_pk_hex();
+
+    /// 6 groups of 4 hex chars — used in the UI to let the user verify their
+    /// phrase landed on the right identity.
+    string readable_fingerprint();
+
+    // `verify` REMOVED from this interface (2026-09-03). It has been on the
+    // surface since the UniFFI layer was created and never acquired a caller.
+    // Do not confuse it with `StreamServerClient.verify` further down, which is
+    // the live V2 authentication call. The Rust fn SURVIVES in lib.rs: its unit
+    // test is the oracle proving `EnrollmentKit::sign_enrollment` signs under
+    // the 0x03 domain prefix.
+};
+
+/// One-shot holder of the long-term Ed25519 secret + `chain_0`. After
+/// `EphemeralRatchet.from_kit` the chain is gone; after `wipe()` the ed25519
+/// secret is wiped too. Kotlin callers should construct one, call
+/// sign_enrollment + EphemeralRatchet.from_kit, then let it drop (or call
+/// wipe() defensively).
+/// Note: method named `wipe()` (not `close()`) to avoid clashing with
+/// Kotlin's `AutoCloseable.close()` inherited signature.
+interface EnrollmentKit {
+    /// Phase 6.1.4-B : `mnemonic` et `passphrase` sont `bytes` (UTF-8) au
+    /// lieu de `string`. Le mnemonic ne touche jamais le pool intern Java.
+    [Throws=FfiError, Name=from_mnemonic]
+    constructor([ByRef] bytes mnemonic, [ByRef] bytes passphrase);
+
+    [Throws=FfiError]
+    StreamIdentity identity();
+
+    /// R-C-1 domain separation: the long-term enrollment signing context, so
+    /// the domain tag is never the caller's free choice across the FFI. (Phase
+    /// C relay-blind retired `sign_archive_challenge` / the 0x04 ArchiveAuth
+    /// domain — archive reads are now identity-free.)
+    [Throws=FfiError]
+    bytes sign_enrollment([ByRef] bytes message);
+
+    void wipe();
+};
+
+/// Re-derivable archive identity — exposes X25519 unseal only, never returns
+/// the secret scalar across FFI.
+interface ArchiveIdentity {
+    /// Phase 6.1.4-B : `mnemonic` et `passphrase` sont `bytes` (UTF-8) au
+    /// lieu de `string`.
+    [Throws=FfiError, Name=from_mnemonic]
+    constructor([ByRef] bytes mnemonic, [ByRef] bytes passphrase);
+
+    StreamIdentity identity();
+
+    // B-CR-4 (audit 2026-06-26) — the heap-returning `decrypt_session_key` is
+    // REMOVED from the FFI surface. It returned the 32-byte STRM session key
+    // into a non-Zeroizing JVM ByteArray (the R-CR-1 class), and it had ZERO
+    // production callers: the live archive path decrypts inside Rust via
+    // `StreamServerClient.archive_download_and_decrypt` →
+    // `strm_decrypt_to_file`, so the session key never crosses the boundary.
+    // The Rust unseal lives on at `core::identity::ArchiveIdentity::
+    // decrypt_session_key`, used by the in-Rust `stream::decrypt` path.
+};
+
+/// The witness's dedicated provenance secret (§10.11). A separate Ed25519 key
+/// derived from the BIP-39 seed under its own HKDF context — never the device,
+/// never the long-term identity key. **It signs nothing**: the signed-manifest
+/// design it was named for was removed in the 2026-06-25 metadata walk-back, and
+/// all that survives is deriving the per-recording OTS blinding salt. Derived
+/// once at enrollment (`from_mnemonic`); the caller PIN-seals it in-crate via
+/// `seal_with_session` and reloads it at unlock
+/// (`pin_session_open_provenance_signer`) so it is live during recording — the
+/// seed never crosses the FFI.
+interface ProvenanceSigner {
+    /// Enrollment-time: derive from the mnemonic (UTF-8 bytes, like
+    /// EnrollmentKit.from_mnemonic — never touches the Java intern pool).
+    [Throws=FfiError, Name=from_mnemonic]
+    constructor([ByRef] bytes mnemonic, [ByRef] bytes passphrase);
+
+    // `from_seed` REMOVED from the surface (2026-09-03): no Kotlin caller. The
+    // Rust fn SURVIVES and is load-bearing — `pin_session_open_provenance_signer`
+    // calls it on the unlock path, so production depends on it transitively.
+
+    /// Lot 4b (OPTION B) — seal the seed with the held PIN-session key in-crate;
+    /// returns the sealed blob. The seed never crosses the FFI.
+    [Throws=FfiError]
+    bytes seal_with_session();
+
+    /// §10.11 Phase B — derive the per-recording OTS commitment salt for
+    /// `recording_id` (16 bytes). Re-derived at rescue to export into the
+    /// disclosure bundle so a verifier can recompute the salted commitment;
+    /// never sent to the relay.
+    [Throws=FfiError]
+    bytes ots_salt([ByRef] bytes recording_id);
+};
+
+/// Phase C relay-blind reports — the witness's per-report capability keyring
+/// (`core::report::ReportKeyring`). Derives a per-report key `R_n` from the
+/// BIP-39 seed under a dedicated HKDF context; the relay stores
+/// `report_id → report_pk` and never the identity, so a seizure of the relay
+/// disk reveals no `identity → report` link. Derived once at enrollment
+/// (`from_mnemonic`); the caller PIN-seals it in-crate via `seal_with_session`
+/// and reloads it at unlock (`pin_session_open_report_keyring`) so it is live
+/// during recording — the master never crosses the FFI; its lifecycle mirrors
+/// `ProvenanceSigner` (survives background recording, wiped only at lock).
+interface ReportKeyring {
+    /// Enrollment-time: derive from the mnemonic (UTF-8 bytes, like
+    /// ProvenanceSigner.from_mnemonic — never touches the Java intern pool).
+    [Throws=FfiError, Name=from_mnemonic]
+    constructor([ByRef] bytes mnemonic, [ByRef] bytes passphrase);
+
+    // `from_seed` REMOVED from the surface (2026-09-03): no Kotlin caller. The
+    // Rust fn SURVIVES and is load-bearing — `pin_session_open_report_keyring`
+    // calls it, and that is the only way the keyring is reloaded after unlock.
+
+    /// Lot 4b (OPTION B) — seal the report master with the held PIN-session key
+    /// in-crate; returns the sealed blob. The master never crosses the FFI.
+    [Throws=FfiError]
+    bytes seal_with_session();
+
+    /// report_id_n as 32 lowercase hex chars — the identity-free URL address of
+    /// report n (PUT/GET /file/{report_id}/{filename}).
+    [Throws=FfiError]
+    string report_id_hex(u32 n);
+
+    // `report_pk`, `sign_create` and `sign_write` REMOVED from the surface
+    // (2026-09-03). They exposed the three capability headers of a chunk PUT
+    // (X-Report-PK, X-Report-Create-Sig, X-Report-Write-Sig) for a Kotlin caller
+    // that never existed: `upload_put_report_chunk` builds all three inside Rust,
+    // which is the point — a signature the JVM never holds cannot leak from it.
+    //
+    // The three Rust fns SURVIVE and are the most load-bearing code in this
+    // interface: `upload_put_report_chunk` calls all three on every single chunk
+    // upload. Removing any of them breaks every write to the relay.
+
+    /// report_id of the singleton report DIRECTORY (dedicated HKDF context) as 32
+    /// lowercase hex — the fixed, identity-free address the device appends index
+    /// entries to and the rescue device fetches to read the authoritative n_max.
+    /// Its report_pk + sigs are applied inside upload_put_directory_entry.
+    [Throws=FfiError]
+    string directory_id_hex();
+
+    /// M-1 — the opaque blob NAME (32 lowercase hex) of directory entry n: the
+    /// relay-visible filename the writer PUTs for session n, and the value the
+    /// rescue re-derives + matches to recover n_max. Secret-derived (report_master),
+    /// so the relay cannot enumerate it; replaces the old plain %010d index.
+    [Throws=FfiError]
+    string directory_entry_name_hex(u32 n);
+};
+
+/// Stateful batched Ed25519 ratchet. All methods take &self with internal
+/// locking on the Rust side, so Kotlin can call freely from a single thread.
+interface EphemeralRatchet {
+    /// Consumes `kit.chain_0` (post-call the kit's chain slot is empty).
+    [Throws=FfiError, Name=from_kit]
+    constructor(EnrollmentKit kit);
+
+    // `deserialize` and `serialize` below have NO production caller, and that is
+    // deliberate: production seals the ratchet in-crate through `seal_with_pin` /
+    // `reseal_session_blob`, which never hand the blob to the JVM. They stay on
+    // the surface for the diff-fuzz parity harness, which replays a V2 blob
+    // through the real bindings and compares Kotlin against Rust
+    // (`difffuzz-jvm/src/main/kotlin/Main.kt`, case ratchet_deserialize_serialize).
+    // Remove either one and that harness stops compiling, which is exactly how a
+    // future "dead surface" pass would break it in silence. They go together: the
+    // harness tests the round-trip.
+
+    /// Resume from a previously-serialized **V2** blob. V1 blobs are REJECTED
+    /// (`CryptoError::InvalidBlob`, RT-03 fix) — they predate the MAC, so
+    /// accepting them would accept an unauthenticated ratchet. An earlier
+    /// version of this line said "V1 legacy + V2 supported", which the code has
+    /// contradicted since RT-03.
+    [Throws=FfiError, Name=deserialize]
+    constructor([ByRef] bytes blob);
+
+    /// Serialize to a V2 blob (4876 bytes). Throws on un-initialized state.
+    [Throws=FfiError]
+    bytes serialize();
+
+    /// Lot 4b — serialize + seal with the held PIN-session key in-crate; returns
+    /// the sealed blob to persist. Neither the 50-sk plaintext nor the key
+    /// crosses the FFI. The fast-reseal hot path.
+    [Throws=FfiError]
+    bytes reseal_session_blob();
+
+    /// Lot 4b — serialize + PIN-seal (Argon2id) in-crate for the INITIAL
+    /// enrollment persistence (before a PIN session exists). 50-sk never crosses.
+    [Throws=FfiError]
+    bytes seal_with_pin([ByRef] bytes pin);
+
+    /// The active batch number (0 once wiped). Lets Kotlin read the counter
+    /// without serializing the 50-sk blob to parse the header.
+    [Throws=FfiError]
+    u32 batch_number();
+
+    /// 50 × 32-byte public keys of the active batch.
+    [Throws=FfiError]
+    sequence<bytes> batch_public_keys();
+
+    /// Number of unconsumed slots left in the current batch (0..=50).
+    /// Used by the Kotlin auto-rotate trigger (`maybeAutoRotate`) — without
+    /// this, the trigger was a stub returning 50 constant, leaving rotation
+    /// permanently disabled (RT-07).
+    [Throws=FfiError]
+    u32 remaining_in_batch();
+
+    /// Sign `message` with the next available slot, mark it consumed.
+    [Throws=FfiError]
+    RatchetSignature sign_and_advance([ByRef] bytes message);
+
+    /// Roll forward to the next batch, consuming one slot of the current
+    /// batch to sign the 50 fresh public keys.
+    [Throws=FfiError]
+    RotationProof advance_batch();
+
+    /// Proactive wipe — all 50 private keys + chain key zeroed. Safe to call
+    /// multiple times.
+    void wipe();
+};
+
+/// Blocking HTTP client for the Frappuccino V2 relay.
+/// All methods are thread-safe (internally cheap-cloning `Arc`).
+interface StreamServerClient {
+    /// Build a client against `base_url` (typically `"https://136.244.101.236:8443"`).
+    /// TLS config embeds the pinned self-signed cert + SPKI SHA-256 gate.
+    [Throws=FfiError, Name=new]
+    constructor([ByRef] string base_url);
+
+    /// POST /auth/v2/enroll — register a fresh identity with its first batch.
+    [Throws=FfiError]
+    EnrollResult enroll(
+        [ByRef] string identity_pk_hex,
+        [ByRef] sequence<bytes> batch0_public_keys,
+        [ByRef] bytes batch0_signature
+    );
+
+    /// POST /auth/challenge — 32-byte server nonce bound to a server timestamp.
+    /// The caller must sign `nonce ‖ timestamp_BE_u64` via the ratchet.
+    [Throws=FfiError]
+    ChallengeValue challenge();
+
+    /// POST /auth/v2/verify — swap a ratchet signature for a JWT. `sig` must
+    /// cover `nonce ‖ timestamp_BE_u64` and `timestamp` must be the one
+    /// returned by `challenge()`.
+    ///
+    /// §10.6 (2026-06-13) — returns `true` on success and stashes the bearer
+    /// in the process-global Rust holder (see `upload_auth_header`); the JWT
+    /// is NOT returned to Kotlin. Returns `false` when the server refused
+    /// (stale slot, wrong batch, clock skew > 30 s, etc.).
+    [Throws=FfiError]
+    boolean verify(
+        StreamIdentity identity,
+        RatchetSignature sig,
+        [ByRef] string nonce_hex,
+        u64 timestamp
+    );
+
+    /// POST /auth/v2/rotate-batch — advance to batch N+1. Returns false iff
+    /// the server refused.
+    [Throws=FfiError]
+    boolean rotate_batch([ByRef] string identity_pk_hex, RotationProof proof);
+
+    /// Phase C relay-blind rescue — GET /api/v2/archive/reports/{report_id}/blobs,
+    /// **identity-free** (no bearer; the phrase-derived report_id is the
+    /// capability). Returns null on 404 (no record at this report_id — a hole in
+    /// the enumeration), the blob list when the report exists. Throws on real
+    /// transport failures (5xx / TLS) so the caller retries, never treating a
+    /// transient error as a hole.
+    [Throws=FfiError]
+    sequence<ArchiveBlobInfo>? archive_list_blobs([ByRef] string report_id);
+
+    /// Phase 4.4.2 — combined GET blob + strm_decrypt to file (id-free, Phase
+    /// C). The encrypted blob never lands on disk — only the plaintext is
+    /// written, to `output_path`. Caller is responsible for secure-deleting
+    /// `output_path` after consumption (e.g. via `secure_delete_file`).
+    [Throws=FfiError]
+    ArchiveDownloadResult archive_download_and_decrypt(
+        [ByRef] string report_id,
+        [ByRef] string filename,
+        [ByRef] string output_path,
+        ArchiveIdentity archive
+    );
+
+    /// §10.11 (provenance durability) — GET a blob and write its RAW bytes to
+    /// `output_path` with NO STRM decryption (id-free, Phase C). Used for the
+    /// opt-in `.ots` timestamp proof (and any legacy sealed `.fpm`), unsealed /
+    /// verified offline by the recipient. Returns bytes written.
+    [Throws=FfiError]
+    u64 archive_download_raw(
+        [ByRef] string report_id,
+        [ByRef] string filename,
+        [ByRef] string output_path
+    );
+};

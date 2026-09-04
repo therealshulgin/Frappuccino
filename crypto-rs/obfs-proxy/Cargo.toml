@@ -1,0 +1,31 @@
+[package]
+name = "frappuccino-obfs-proxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Transparent Salamander de-obfuscation UDP proxy fronting the relay QUIC endpoint (Phase 3b brick 1b)."
+
+[lib]
+name = "frappuccino_obfs_proxy"
+
+[[bin]]
+name = "frappuccino-obfs-proxy"
+path = "src/main.rs"
+
+[dependencies]
+# The SHARED Salamander transform — byte-identical to the client SalamanderSocket
+# (same module, no cross-language interop risk). default-features = false so the
+# proxy does NOT drag the quinn/h3/reqwest tree, only the tiny salamander module.
+frappuccino-crypto-stream = { path = "../stream", default-features = false }
+tokio = { version = "=1.52.1", default-features = false, features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync", "signal"] }
+getrandom = "=0.2.17"   # per-packet salt (not a secret; just needs to look random)
+
+[dev-dependencies]
+proptest = "=1.8.0"     # property-based no-panic / gate tests (ROADMAP 10.10 T2b)
+
+[lints]
+workspace = true

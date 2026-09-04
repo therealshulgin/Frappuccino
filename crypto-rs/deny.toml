@@ -1,0 +1,75 @@
+# cargo-deny configuration for Frappuccino Rust crypto workspace.
+# Run: cargo deny check
+
+[graph]
+all-features = true
+
+[licenses]
+# Allow only licenses compatible with Apache-2.0, the license this tree carries
+# (inherited from Tella FOSS upstream; see LICENSE and the README). A future
+# relicensing to AGPL is a publication decision, not the current state: the two
+# were declared at once here and in crypto-rs/Cargo.toml until 2026-08-28, which
+# is the kind of contradiction an auditor reads before any code.
+confidence-threshold = 0.93
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    # Our own crates. Apache-2.0 is already allowed above; this entry stays so a
+    # dependency that legitimately carries AGPL is a deliberate decision rather
+    # than a silent build failure.
+    "AGPL-3.0-or-later",
+]
+# Explicit deny.
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# `wildcards = "deny"` exists to catch an external dependency declared without a
+# version. Our own workspace crates are declared by `path = "../core"` and carry
+# no version by design, which the same check reads as a wildcard: without this,
+# the four internal crates fail a rule aimed at something else entirely.
+allow-wildcard-paths = true
+deny = [
+    # Not because they're bad, but because they pull in libsodium / C deps
+    # that we want to avoid by going pure Rust. See PLAN_RUST_EXEC.md §9.2
+    # for the one allowed exception (xsalsa20poly1305 pure-Rust alternative).
+    { name = "libsodium-sys" },
+    { name = "sodiumoxide" },
+    # OpenSSL bindings — we use rustls instead.
+    { name = "openssl" },
+    { name = "openssl-sys" },
+    # Ring — optional deny (doesn't supply Argon2id or BIP-39 idiomatically).
+    # Enable if we want to enforce RustCrypto-only policy.
+    # { name = "ring" },
+]
+
+[advisories]
+# cargo-deny advisories: fail on any known vulnerability.
+#
+# The two entries below are BUILD-TIME proc-macros pulled in by UniFFI's code
+# generator (`cargo tree -i` confirms: uniffi_macros and uniffi_bindgen). They
+# run on the developer's machine and are not linked into the shipped .so or the
+# APK, so an unmaintained advisory on them is not runtime exposure. Neither has
+# a safe upgrade today; both go away when UniFFI moves past 0.28. Re-check this
+# list on every UniFFI bump instead of letting it rot.
+ignore = [
+    "RUSTSEC-2025-0141",  # bincode unmaintained, via uniffi_macros (build only)
+    "RUSTSEC-2024-0436",  # paste unmaintained, via uniffi_bindgen (build only)
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

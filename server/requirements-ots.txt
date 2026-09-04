@@ -1,0 +1,16 @@
+# §10.11 Phase B slice 2 — OPTIONAL relay dependency: OpenTimestamps client.
+#
+# Install ONLY when enabling the /api/v2/timestamp endpoint:
+#     pip install -r requirements-ots.txt
+#     export OTS_ENABLED=true
+#
+# Kept OUT of the base requirements.txt on purpose: the running relay's
+# dependency closure stays untouched, and the timestamp endpoint stays dormant
+# (HTTP 503) until BOTH this lib is installed and OTS_ENABLED=true. Enabling it
+# touches the relay in PROD = separate operator GO.
+#
+# Provides opentimestamps.calendar.RemoteCalendar + the Timestamp /
+# DetachedTimestampFile classes used by app/timestamp_ots.py. The produced .ots
+# proofs are verified by the Rust CLI (frappuccino-cli verify-provenance --ots),
+# which uses the matching `opentimestamps` Rust crate — same OTS wire format.
+opentimestamps==0.4.5

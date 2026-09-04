@@ -1,0 +1,58 @@
+# Semgrep hygiene rules — Frappuccino, from the pre-external audit series
+# (ROADMAP §8.1.6). Run in CI via `semgrep --config .semgrep/ --error`, so a
+# match FAILS the build. Both rules were added against a codebase verified to
+# have ZERO current matches, so they are tripwires against regressions, not
+# retroactive flags.
+
+rules:
+  # Phase 8.1.6-F (audit 8.1.3) — the client IP must never reach a logger.
+  #
+  # nginx forwards X-Forwarded-For and uvicorn runs with
+  # --forwarded-allow-ips=127.0.0.1, so request.client.host is the REAL
+  # client IP, live in process RAM. The app's JsonFormatter strips a
+  # blocklist of NAMED extra fields ({client_ip, remote_addr, ...}) but it
+  # CANNOT strip an IP interpolated into a positional message string. So a
+  # single `logger.info("auth from %s", request.client.host)` (or an
+  # f-string equivalent) would write the client IP to the json-file log
+  # driver on disk — exactly the metadata sink 8.1.3 closed everywhere else.
+  # This rule keeps it closed.
+  - id: frappuccino-no-request-in-logs
+    languages: [generic]
+    severity: ERROR
+    message: >-
+      A FastAPI `request` object/attribute appears inside a logging call.
+      The client IP is live in RAM (uvicorn --forwarded-allow-ips) and the
+      JsonFormatter IP blocklist only strips NAMED extras, not positional
+      message interpolation — logging request.client/.headers/.url leaks
+      the client IP to the on-disk json-file driver. Remove it (log a
+      truncated pubkey / report id instead). See ROADMAP 8.1.6-F / audit 8.1.3.
+    patterns:
+      - pattern-regex: '(?i)\b(log|logger|logging)\.(debug|info|warning|warn|error|exception|critical)\([^)]*\brequest\b'
+    paths:
+      include:
+        - '*.py'
+
+  # Phase 8.1.6-A (audit 8.1.1) — secrets must be wiped with SecureWipe,
+  # not bare .fill(0). The JIT can dead-store-eliminate a fill(0) whose
+  # result is never read; SecureWipe.wipe() does a 2-pass (random + zero)
+  # overwrite with a side effect the JIT cannot prove dead. This caught the
+  # ratchetDerivedKey / serialized-ratchet wipes in StreamUploadManager.
+  - id: frappuccino-no-fill-zero-secret
+    languages: [generic]
+    severity: ERROR
+    message: >-
+      A buffer is wiped with .fill(0), which the JIT can dead-store-
+      eliminate. Use org.stream.crypto.SecureWipe.wipe() (2-pass,
+      JIT-resistant) for any secret-bearing ByteArray. If this buffer is
+      genuinely non-secret, add a `// nosemgrep: frappuccino-no-fill-zero-secret`
+      with a one-line justification. See ROADMAP 8.1.6-A / audit 8.1.1.
+    patterns:
+      - pattern-regex: '\.fill\(0\)'
+    paths:
+      include:
+        - '*.kt'
+      exclude:
+        # SecureWipe.kt IS the wipe primitive — its internal `buf.fill(0)`
+        # (after the random-overwrite pass) is the implementation, not a
+        # misuse. Excluding the file avoids the rule flagging its own remedy.
+        - '**/SecureWipe.kt'

@@ -1,0 +1,51 @@
+[package]
+name = "frappuccino-crypto-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "UniFFI bindings exposing frappuccino-crypto-* to Android Kotlin (and later iOS Swift, Python)."
+
+[lib]
+# Name matches the UniFFI convention `uniffi_<namespace>` so the Kotlin
+# bindings' System.loadLibrary("uniffi_frappuccino") finds the .so on Android.
+# Override via uniffi.toml if you want a different lookup name.
+name = "uniffi_frappuccino"
+# cdylib: dynamic library for Android JNI loading (.so).
+# staticlib: for iOS later (.a).
+# rlib: so this crate can be depended on by the CLI crate.
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[features]
+# Phase 3a (transport plan §10.9 / m4) — forward the QUIC transport feature to
+# the stream crate so the shipped Android `.so` carries the HTTP/3 path.
+# Opt-in: `build-android.sh` passes `--features quic`; default builds (proofs,
+# tests, fuzz) omit it and the ObfQuic FFI arm behaves as DirectTls (in-Rust,
+# heap-0). The TransportMode enum is always present in the bindings.
+quic = ["frappuccino-crypto-stream/quic"]
+
+[dependencies]
+frappuccino-crypto-core   = { path = "../core" }
+frappuccino-crypto-stream = { path = "../stream" }
+# Exact versions pinned per Rust_guidelines.md.
+uniffi    = { version = "=0.28.3", features = ["cli"] }
+thiserror = "=1.0.69"
+# Phase 6.1.4-C — Zeroizing<Vec<u8>> pour le plaintext lu depuis disk
+# dans strm_encrypt_file (wipe au drop, résiste aux optims LLVM).
+zeroize   = { version = "=1.8.2" }
+# Phase C — streaming SHA-256 of the .strm chunk in upload_put_report_chunk
+# (byte-identical to the relay's hasher; ciphertext, so no Zeroizing needed).
+sha2      = "=0.10.9"
+
+[build-dependencies]
+uniffi = { version = "=0.28.3", features = ["build"] }
+
+[lints]
+workspace = true

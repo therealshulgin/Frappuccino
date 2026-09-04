@@ -1,0 +1,169 @@
+<resources>
+    <!-- Brand typography — the "Frappuccino" wordmark uses Coffee Amore, a
+         font that is free for non-commercial use only: it has to be swapped
+         for a SIL OFL alternative before any F-Droid submission. This comment
+         is the only place in the repo carrying that constraint — the ROADMAP
+         does not — so it must not disappear with the style. The rest of the UI
+         stays on Open Sans; the typographic contrast is deliberate (OSINT flat
+         body / organic wordmark).
+
+         Default colour is the REC-button red (`@color/wa_orange`, hex #CC1A1A
+         despite the historical name). Callers may override
+         `android:textColor` for dark-on-light screens. The style is applied on
+         the onboarding "all done" screen only today (onboard_all_done_fragment,
+         hdpi and xhdpi variants). -->
+    <style name="FrappuccinoBrandText">
+        <item name="android:fontFamily">@font/coffee_amore</item>
+        <item name="android:textAllCaps">false</item>
+        <item name="android:includeFontPadding">false</item>
+        <item name="android:textColor">@color/wa_orange</item>
+    </style>
+
+    <!-- Base application theme. -->
+    <style name="AppTheme" parent="Theme.AppCompat.Light.DarkActionBar">
+        <!-- Customize your theme here. -->
+        <item name="colorPrimary">@color/colorPrimary</item>
+        <item name="colorPrimaryDark">@color/colorPrimaryDark</item>
+        <item name="colorAccent">@color/colorAccent</item>
+        <item name="android:textColorPrimaryInverse">@color/colorPrimaryInverse</item>
+        <item name="android:fontFamily">@font/open_sans</item>
+    </style>
+
+    <style name="AppTheme.NoActionBar" parent="Theme.AppCompat.Light.NoActionBar">
+        <item name="colorPrimary">@color/colorPrimary</item>
+        <item name="colorPrimaryDark">@color/colorPrimaryDark</item>
+        <item name="colorAccent">@color/colorAccent</item>
+        <item name="android:textColorPrimaryInverse">@color/colorPrimaryInverse</item>
+        <item name="android:fontFamily">@font/open_sans</item>
+    </style>
+
+    <!-- Launch theme for SplashActivity (Phase 7.2 glitch fix). The base
+         AppTheme is Theme.AppCompat.Light.*, so on a cold start the window
+         background flashed the Light theme's pale colorBackground (with the
+         launcher icon, via the Android 12+ system splash) before the dark
+         splash_layout rendered. Force the window background dark for every
+         API level; the values-v31 variant also darkens the system splash
+         background (windowSplashScreenBackground, API 31+). -->
+    <style name="AppTheme.Splash" parent="AppTheme.NoActionBar">
+        <item name="android:windowBackground">@color/space_cadet</item>
+    </style>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <!-- Dark AlertDialog for modal confirmations on the dark V2 screens
+         (Phase 7.2). The app base theme is Theme.AppCompat.Light.*, so a
+         plain AlertDialog.Builder(this) renders a light dialog on the dark
+         brand. Pass this as the builder's themeResId: dark background,
+         white text, brand-red (wa_orange) buttons. -->
+    <style name="AlertDialogDarkTheme" parent="Theme.AppCompat.Dialog.Alert">
+        <item name="android:windowBackground">@color/dark_purple</item>
+        <item name="android:textColorPrimary">@color/wa_white</item>
+        <item name="android:textColorSecondary">@color/wa_white_80</item>
+        <item name="colorAccent">@color/wa_orange</item>
+        <item name="android:fontFamily">@font/open_sans</item>
+    </style>
+
+
+    <style name="Tella_Main_White_Text">
+        <item name="android:layout_width">wrap_content</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:fontFamily">@font/open_sans</item>
+        <item name="android:textColor">@color/wa_white</item>
+        <item name="android:textSize">40sp</item>
+    </style>
+    <style name="Tella_Main_White_Text.Bold">
+        <item name="android:textStyle">bold</item>
+    </style>
+
+
+
+
+
+
+
+
+    <!-- styles for Forms section -->
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <!-- PinPadView : bouton chiffré unique, style OSINT -->
+
+    <!-- Label titre OSINT : Impact rouge sur noir -->
+    <style name="OsintTitle">
+        <item name="android:textColor">@color/wa_orange</item>
+        <item name="android:textSize">28sp</item>
+        <item name="android:fontFamily">@font/impact</item>
+        <item name="android:letterSpacing">0.1</item>
+    </style>
+
+    <!-- Sous-titre OSINT : monospace blanc semi-transparent -->
+    <style name="OsintSubtitle">
+        <item name="android:textColor">#AAFFFFFF</item>
+        <item name="android:textSize">12sp</item>
+        <item name="android:fontFamily">monospace</item>
+        <item name="android:letterSpacing">0.2</item>
+    </style>
+</resources>

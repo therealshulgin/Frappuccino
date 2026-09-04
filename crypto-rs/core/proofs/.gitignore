@@ -1,0 +1,8 @@
+# The TLC model checker jar is ~2 MB and downloaded on demand by run-tlc.sh.
+.tools/
+# TLC scratch output.
+*.old
+states/
+MC_*.tla
+MC_*.cfg
+*.st

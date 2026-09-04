@@ -1,0 +1,49 @@
+# Frappuccino relay systemd unit.
+#
+# Installation :
+#   sudo cp frappuccino-relay.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now frappuccino-relay
+#
+# Restart logs:
+#   journalctl -u frappuccino-relay -f
+#
+# Cette unit gère le cycle de vie du docker-compose à la place de l'autostart
+# Docker classique — plus propre pour ordering boot + restart sur crash + logs
+# centralisés via journald.
+
+[Unit]
+Description=Frappuccino blind relay (FastAPI + MinIO via Docker Compose)
+Documentation=https://github.com/therealshulgin/Frappuccino
+After=network-online.target docker.service
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/frappuccino
+EnvironmentFile=/opt/frappuccino/.env
+
+# IMPORTANT: --workers 1 obligatoire jusqu'à migration Redis du nonce cache
+# (RT-12 finding — multi-worker = nonce cache désynchronisé entre processes).
+# Cette contrainte est définie dans le Dockerfile (CMD uvicorn ... pas de
+# `--workers N`), pas ici, mais on la rappelle pour le prochain dev qui passe.
+
+ExecStart=/usr/bin/docker compose up -d
+ExecStop=/usr/bin/docker compose down
+ExecReload=/usr/bin/docker compose up -d --force-recreate
+
+# WP-B4 (audit 2026-06-28) — light sandbox. This unit only drives `docker
+# compose` (the real work runs in dockerd, unconfined by design), so heavy
+# confinement (ProtectSystem=strict etc.) would just break compose's file/socket
+# access for no gain. NoNewPrivileges is a free, safe win: the compose CLI never
+# needs to escalate. Per-container hardening (read_only, cap_drop) is in
+# docker-compose.yml where it actually constrains the workloads.
+NoNewPrivileges=true
+
+# Pas de restart auto — si docker-compose se vautre, on veut le voir et investiguer.
+# Pour activer auto-restart : Restart=on-failure et RestartSec=30.
+
+[Install]
+WantedBy=multi-user.target

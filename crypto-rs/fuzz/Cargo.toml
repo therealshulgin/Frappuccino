@@ -1,0 +1,61 @@
+[package]
+name = "frappuccino-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+rust-version = "1.80"
+
+# Excluded from the parent workspace: cargo-fuzz wants this crate to compile
+# standalone under nightly + libfuzzer-sys, and those don't survive the
+# workspace's lock-step pinning (stable 1.88 today).
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+frappuccino-crypto-core   = { path = "../core" }
+# No `protocol` feature: skip reqwest + rustls + hyper (+3 GiB RAM during
+# sanitizer-heavy cargo fuzz builds). The fuzz targets only exercise the
+# parsers and AEAD paths, not the HTTP client.
+frappuccino-crypto-stream = { path = "../stream", default-features = false }
+
+# Each target is its own binary — cargo-fuzz discovers them by looking at
+# `[[bin]]` entries prefixed with `fuzz_`.
+
+[[bin]]
+name = "fuzz_decrypt_blob"
+path = "fuzz_targets/fuzz_decrypt_blob.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_parse_strm_header"
+path = "fuzz_targets/fuzz_parse_strm_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_ratchet_deserialize"
+path = "fuzz_targets/fuzz_ratchet_deserialize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_pin_store_open"
+path = "fuzz_targets/fuzz_pin_store_open.rs"
+test = false
+doc = false
+bench = false
+
+# Mirror the parent workspace's release profile so fuzz-builds also get LTO.
+# libfuzzer-sys needs its own debug info for crash reports, so strip = "none".
+[profile.release]
+lto = "fat"
+codegen-units = 1
+debug = 1
+strip = "none"

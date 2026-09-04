@@ -1,0 +1,38 @@
+[Unit]
+# Phase 3b brick 1b - Salamander de-obfs proxy fronting Caddy QUIC :8444.
+# Canonical, version-controlled unit. Deploy:
+#   1. install the binary to /opt/frappuccino/obfs/frappuccino-obfs-proxy (0755)
+#   2. write the PSK to /opt/frappuccino/obfs/obfs.env (0600): FRAP_OBFS_PSK=<psk>
+#      (must match the client's quic.rs prod_target obfs_psk, byte for byte)
+#   3. copy this file to /etc/systemd/system/frappuccino-obfs-proxy.service
+#   4. systemctl daemon-reload && systemctl enable --now frappuccino-obfs-proxy
+#
+# Enabled at boot since 2026-06-23 for field-test resilience: survives relay
+# reboots, and auto-restarts on crash via Restart=on-failure (see below). The
+# obfs transport is still debug-only on the client; keep this unit enabled
+# through the release-default switch.
+Description=Frappuccino Salamander de-obfuscation UDP proxy (Phase 3b brick 1b)
+# Caddy QUIC :8444 (the forward target) runs in a Docker container, so order
+# after docker.service: the proxy must not start ahead of its upstream on boot.
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=/opt/frappuccino/obfs/obfs.env
+ExecStart=/opt/frappuccino/obfs/frappuccino-obfs-proxy 0.0.0.0:8445 127.0.0.1:8444
+Restart=on-failure
+RestartSec=2
+# The binary handles SIGTERM with a clean exit(0); keep the stop window short.
+TimeoutStopSec=5
+# Hardening (network-facing UDP relay; reads nothing but its env + binary).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# fd ceiling well above the in-process MAX_SESSIONS cap so a legitimate burst
+# never hits the default soft limit.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

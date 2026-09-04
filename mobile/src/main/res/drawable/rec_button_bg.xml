@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    REC button background — state-aware selector. Toggles inner disc
+    intensity between idle (dim) and activated (bright) without changing
+    the ring. Drive it from Kotlin with `recButton.isActivated = true/false`.
+-->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item
+        android:state_activated="true"
+        android:drawable="@drawable/rec_button_active" />
+    <item android:drawable="@drawable/rec_button_idle" />
+</selector>

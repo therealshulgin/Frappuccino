@@ -1,0 +1,30 @@
+# cargo-mutants configuration — audit infra (mutation testing).
+#
+# Mutation testing injects small faults (flip a comparison, delete a line,
+# replace a return value with a default) and checks that the test suite
+# CATCHES them. A *surviving* mutant marks a behaviour the tests don't
+# actually pin down — i.e. a test gap that line coverage alone hides. A
+# good audit pass RAISES the caught/total ratio (the mutation score).
+#
+# Run:
+#   cargo mutants                                  # whole core + stream workspace
+#   cargo mutants --file stream/src/header.rs      # one trust-boundary at a time
+#   cargo mutants --in-diff <(git diff origin/main) # only what a PR changed (CI-fast)
+#
+# Note: Argon2id unlock (pin_store) runs at m=256 MiB, so a baseline test is
+# a few seconds — the generous timeout below avoids scoring a slow run as a
+# false "timeout" (which mutants would otherwise count as caught).
+
+# Don't mutate generated UniFFI bindings, the desktop CLI, the fuzz harness,
+# or test code itself — only the library logic under core/ and stream/.
+exclude_globs = [
+    "ffi/**",
+    "cli/**",
+    "fuzz/**",
+    "**/tests/**",
+    "**/build.rs",
+]
+
+# Per-mutant timeout = (baseline test time) × this multiplier. High because
+# the Argon2 unlock path is intentionally slow.
+timeout_multiplier = 6.0

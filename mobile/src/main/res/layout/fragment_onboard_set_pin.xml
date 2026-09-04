@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    OnBoardSetPinFragment layout — V2 PIN setup (étapes 3 et 4 de l'onboarding,
+    après la phrase BIP-39).
+
+    Garder le préfixe `onboardPin_*` sur tous les ids de ce layout : il est là
+    pour ne pas masquer ceux de Tella. Les renommer en `stepLabel`, `editText`,
+    `lockView` — le réflexe de lisibilité — retire ce garde-fou.
+
+    Pas de bouton "Continuer" : la validation part toute seule quand le PIN
+    atteint 6 chiffres, via le listener onPinConfirmation. Ne pas en ajouter
+    un, ce serait un chemin de soumission de plus. Pas d'eye toggle non plus,
+    le V2 n'a pas besoin de "show password". Le step indicator en deux temps
+    est une UX héritée de Tella, pas un choix arbitraire, et l'error TextView
+    sert au mismatch entre l'étape de saisie et celle de confirmation.
+
+    Ce layout partage volontairement la structure de l'autre écran PIN de
+    l'app, activity_pin_unlock.xml : background space_cadet, step indicator
+    orange, titre + sous-titre + EditText dots + PinLockView 4×3, bouton
+    "Retour" en bas-gauche. Pas de wordmark : il a été retiré des écrans PIN
+    (voir le commentaire de onboardPin_stepLabel plus bas). Le layout Tella
+    dont cette structure descend (Option C-revert) n'est plus dans le dépôt.
+-->
+<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/space_cadet">
+
+    <!-- Step indicator orange ("ÉTAPE 1 SUR 2" / "ÉTAPE 2 SUR 2"). Le code
+         Kotlin met à jour le texte selon Step.ENTER / Step.CONFIRM.
+         Head de la chaîne packed depuis le retrait du wordmark Frappuccino
+         (résidu police "Coffee Amore" ; les écrans PIN ne montrent plus que
+         le strict nécessaire). -->
+    <TextView
+        android:id="@+id/onboardPin_stepLabel"
+        style="@style/Unlock_White_Text_Medium"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="64dp"
+        android:textSize="12sp"
+        android:letterSpacing="0.2"
+        android:textColor="@color/wa_orange"
+        app:layout_constraintBottom_toTopOf="@+id/onboardPin_enterTV"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintHorizontal_bias="0.5"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintVertical_chainStyle="packed"
+        tools:text="ÉTAPE 1 SUR 2" />
+
+    <TextView
+        android:id="@+id/onboardPin_enterTV"
+        style="@style/Unlock_White_Text_Bold"
+        android:importantForAccessibility="yes"
+        android:focusable="true"
+        app:layout_constraintBottom_toTopOf="@+id/onboardPin_msgTV"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintHorizontal_bias="0.5"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@+id/onboardPin_stepLabel"
+        tools:text="Choisis ton code PIN" />
+
+    <TextView
+        android:id="@+id/onboardPin_msgTV"
+        style="@style/Unlock_White_Text_Medium"
+        app:layout_constraintBottom_toTopOf="@+id/onboardPin_editText"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintHorizontal_bias="0.5"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@+id/onboardPin_enterTV"
+        tools:text="Au moins 6 chiffres — il te sera demandé à chaque déverrouillage." />
+
+    <rs.readahead.washington.mobile.views.pin.NoImeEditText
+        android:id="@+id/onboardPin_editText"
+        style="@style/Password_EditText"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="20dp"
+        android:textColorHint="@color/dark_purple"
+        app:layout_constraintBottom_toTopOf="@+id/onboardPin_lockView"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintTop_toBottomOf="@+id/onboardPin_msgTV"
+        tools:text="●●●●●●" />
+
+    <!-- Mismatch error message (étape CONFIRM). Affiché en orange entre
+         l'EditText et le PinLockView quand les 2 PINs ne matchent pas. -->
+    <TextView
+        android:id="@+id/onboardPin_error"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:textColor="@color/wa_orange"
+        android:textSize="12sp"
+        android:fontFamily="monospace"
+        android:visibility="gone"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@+id/onboardPin_editText"
+        tools:text="PINs différents — recommencez"
+        tools:visibility="visible" />
+
+    <org.hzontal.shared_ui.pinview.PinLockView
+        android:id="@+id/onboardPin_lockView"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:layout_marginTop="10dp"
+        app:keypadShowDeleteButton="true"
+        app:keypadTextColor="@color/wa_white"
+        app:keypadTextSize="@dimen/calc_text_size"
+        app:layout_constraintBottom_toTopOf="@+id/onboardPin_leftBtn"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintHeight_percent=".45"
+        app:layout_constraintHorizontal_bias="0.5"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@+id/onboardPin_editText"
+        app:pinLength="6" />
+
+    <TextView
+        android:id="@+id/onboardPin_leftBtn"
+        style="@style/Unlock_White_Text_Back"
+        android:text="@string/LockSelect_Action_Back"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintStart_toStartOf="parent" />
+
+</androidx.constraintlayout.widget.ConstraintLayout>

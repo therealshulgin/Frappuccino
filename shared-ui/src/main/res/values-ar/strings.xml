@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="Rename_name_Hint">Name</string>
+    <string name="action_cancel">cancel</string>
+    <string name="action_delete">delete</string>
+</resources>

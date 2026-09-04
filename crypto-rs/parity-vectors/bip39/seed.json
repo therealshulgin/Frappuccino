@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "description": "BIP-39 mnemonic_to_seed (PBKDF2-HMAC-SHA512, 2048 iter)",
+  "language": "fr",
+  "algorithm": "PBKDF2-HMAC-SHA512",
+  "iterations": 2048,
+  "seed_bytes": 64,
+  "cases": [
+    {
+      "mnemonic": "abaisser abandon abdiquer abeille abolir aborder aboutir aboyer abrasif abreuver abriter abroger",
+      "passphrase": "",
+      "seed_hex": "bc6402393a859a5f06a7333fe30fc790684884266d4ab08c3d6a04daae361940004817177f4c1685e198da54570feabb246d27156acb48694d860ef0473e9908"
+    },
+    {
+      "mnemonic": "abaisser abandon abdiquer abeille abolir aborder aboutir aboyer abrasif abreuver abriter abroger",
+      "passphrase": "motdepasse",
+      "seed_hex": "1b151a28ecb1905b0353b42fab6237e400be4026fd56344a6e32a4e5f31ba2caf60c3381c1f62707fa311e6e005f9a4a25690767b7b957cde06827f26c217cc3"
+    },
+    {
+      "mnemonic": "abaisser abandon abdiquer abeille abolir aborder aboutir aboyer abrasif abreuver abriter abroger",
+      "passphrase": "café au lait",
+      "seed_hex": "dfd1ab8e81ae1d03adf28ca93e0d82195b07ff2673cc74f4c74714d835cfc853caa99ac28ee8a19bd5e4174ae8d9b23eb241e3ba6bab6e2c5ca7b14e6277a87c"
+    },
+    {
+      "mnemonic": "abaisser abandon abdiquer abeille abolir aborder aboutir aboyer abrasif abreuver abriter abroger",
+      "passphrase": "13e mot",
+      "seed_hex": "3c60ebe42551c12b57829b600c5fc4ca74112cd729028fa27882bedb2eab1a8176a6514a82bfc92722c85c7e57cd1e96dff702f3ee9ea3ac9e8c914462432888"
+    },
+    {
+      "mnemonic": "évoquer jardin guitare soutirer mondial limonade homogène émulsion tenir xénon massif kiosque",
+      "passphrase": "",
+      "seed_hex": "0f572de7511e9bab9c18d8e14e1f44cc7d769b3702dbb70a86b324c2838d329f9e60838a7bd24980df07ba0e1c8164dbe1829be1c93e8dc1f5446e8c6445a636"
+    },
+    {
+      "mnemonic": "évoquer jardin guitare soutirer mondial limonade homogène émulsion tenir xénon massif kiosque",
+      "passphrase": "motdepasse",
+      "seed_hex": "1716d72f2a96d30ca0cb7fa489252f6233a53fdd81a8a46509ce7f2639a6c88e6721f7120bcf51b53a24061b7875553ad7a9c88f10000bf3a5196abaef2bde80"
+    },
+    {
+      "mnemonic": "évoquer jardin guitare soutirer mondial limonade homogène émulsion tenir xénon massif kiosque",
+      "passphrase": "café au lait",
+      "seed_hex": "9dd5335713e066920b623049c33dc650858c66de1beade3834dc4e21210c2948ce14dfce93cc30f46171170f5f1eb0126db24450ff3dc231c5c104ff1ee93597"
+    },
+    {
+      "mnemonic": "évoquer jardin guitare soutirer mondial limonade homogène émulsion tenir xénon massif kiosque",
+      "passphrase": "13e mot",
+      "seed_hex": "ed461fb4fd468325370f5d454072ba0fdde86f3bd9ee5a049d303636b25202642dbc60692cccae0dc39d2ff9900a77e84ade13b10895c91bb07e026a1b79c470"
+    },
+    {
+      "mnemonic": "voguer noirceur boulon sublime gruger écluse vaseux abrupt moulin recevoir chéquier bassin",
+      "passphrase": "",
+      "seed_hex": "545b6ba4712878a95e56bfb693874735dd1c36483f8e1513ac0dbf0214ff15e9892a8d5e90e1f2ec9b67d7f12fa3834580461928b52ed8bc3f4f64b0a64b3f96"
+    },
+    {
+      "mnemonic": "voguer noirceur boulon sublime gruger écluse vaseux abrupt moulin recevoir chéquier bassin",
+      "passphrase": "motdepasse",
+      "seed_hex": "305fcd8381660a027a4f81093452b3d52f0977001ed46cd4ac88175b524cb6023790e3a66d1f7219689672849a2987bd2df931d4c57edbb8b7a04653172bfdb6"
+    },
+    {
+      "mnemonic": "voguer noirceur boulon sublime gruger écluse vaseux abrupt moulin recevoir chéquier bassin",
+      "passphrase": "café au lait",
+      "seed_hex": "f0579f4abab02e2474d02cd4328089cbc0baba8f9e9194d7b0c082f76aff43ac52e2ba5e300ade6df81c1e296035a4f368ffa985c38f6157ef30f6df50e9f5e5"
+    },
+    {
+      "mnemonic": "voguer noirceur boulon sublime gruger écluse vaseux abrupt moulin recevoir chéquier bassin",
+      "passphrase": "13e mot",
+      "seed_hex": "a5d49dfec533fad2b1a3ae353270dbd34514cf3f9655d67c6154284a98a6a66cf41b2a46918bcf3ae228e98c6719b586849713bb7a42d225fe26613fa77011fc"
+    }
+  ]
+}

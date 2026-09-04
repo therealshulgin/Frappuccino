@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="hero">
+  <p class="tagline">{% if lang == 'fr' %}Le téléphone est un émetteur. Pas un coffre-fort.{% else %}{{ config.extra.tagline }}{% endif %}</p>
+  <p class="lede">{% if lang == 'fr' %}Témoignage vidéo chiffré qui quitte le téléphone pendant le tournage, vers un relais incapable de le lire. La seule clé : douze mots sur papier.{% else %}{{ config.description }}{% endif %}</p>
+  <p class="status-badge">{% if lang == 'fr' %}Prêt pour le terrain · Prêt pour l'audit · <strong>Pas prêt pour la production</strong>{% else %}Field-test ready · Audit-ready · <strong>Not production-ready</strong>{% endif %}</p>
+  <p class="cta">
+    <a class="button" href="{{ get_url(path='@/positioning.md', lang=lang) | safe }}">{% if lang == 'fr' %}Pourquoi il existe et où il se situe{% else %}Why it exists &amp; where it fits{% endif %}</a>
+  </p>
+</section>
+
+<section class="prose">
+  {{ section.content | safe }}
+</section>
+{% endblock content %}

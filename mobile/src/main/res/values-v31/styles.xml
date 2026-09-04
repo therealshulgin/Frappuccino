@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Android 12+ (API 31) — darken the system SplashScreen so the
+         launcher icon shows on space_cadet instead of the Light base
+         theme's pale colorBackground. Redefines AppTheme.Splash fully
+         (a same-name style in values-v31 REPLACES the base one on API 31+),
+         so it must also carry windowBackground. See values/styles.xml. -->
+    <style name="AppTheme.Splash" parent="AppTheme.NoActionBar">
+        <item name="android:windowBackground">@color/space_cadet</item>
+        <item name="android:windowSplashScreenBackground">@color/space_cadet</item>
+    </style>
+</resources>

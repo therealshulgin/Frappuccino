@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Monochrome layer for Android 13+ themed icons. Solid fist silhouette
+     (groove omitted — themed icons tint every opaque pixel one colour, so
+     the bg-coloured groove would vanish anyway). The system applies the
+     theme tint; the fill colour here is only a placeholder. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="1024"
+    android:viewportHeight="1024">
+    <group
+        android:translateX="35"
+        android:translateY="-23">
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M340,292 h344 a8,8 0 0 1 8,8 v48 a8,8 0 0 1 -8,8 h-344 a8,8 0 0 1 -8,-8 v-48 a8,8 0 0 1 8,-8 z M274,496 C274,474 292,456 314,456 L462,456 C484,456 500,473 500,494 L500,578 C500,610 520,637 548,646 L548,671 C548,681 540,689 530,689 L290,689 C267,689 248,670 248,647 L248,542 C248,524 258,507 274,496 Z M558,456 h114 a34,34 0 0 1 34,34 v2 a34,34 0 0 1 -34,34 h-114 a34,34 0 0 1 -34,-34 v-2 a34,34 0 0 1 34,-34 z M554,542 h108 a34,34 0 0 1 0,68 h-108 a34,34 0 0 1 0,-68 z M548,626 h100 a34,34 0 0 1 0,68 h-100 a34,34 0 0 1 0,-68 z M518,711 h118 a34,34 0 0 1 0,68 h-118 a34,34 0 0 1 0,-68 z" />
+    </group>
+</vector>

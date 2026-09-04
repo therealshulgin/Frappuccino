@@ -1,0 +1,123 @@
+# Frappuccino relay nginx config — reverse proxy TLS-terminating devant FastAPI.
+#
+# Substitutions à faire avant copie vers /etc/nginx/sites-available/frappuccino-relay :
+#   {{HOST}}        IP ou hostname (ex. 136.244.101.236 ou relay.frappuccino.app)
+#   {{RELAY_PORT}}  port HTTPS exposé (8443 par défaut)
+#   {{TLS_CERT}}    path absolu vers cert (.crt ou fullchain.pem)
+#   {{TLS_KEY}}     path absolu vers clé privée (.key ou privkey.pem)
+#
+# Activation :
+#   ln -s /etc/nginx/sites-available/frappuccino-relay /etc/nginx/sites-enabled/
+#   nginx -t && systemctl reload nginx
+
+server {
+    listen {{RELAY_PORT}} ssl http2;
+    listen [::]:{{RELAY_PORT}} ssl http2;
+    server_name {{HOST}};
+
+    # WP-B4 (audit 2026-06-28) — don't advertise the nginx version in the
+    # `Server:` header / error pages. One less fingerprint for an attacker
+    # picking CVEs by version. Costs nothing.
+    server_tokens off;
+
+    ssl_certificate     {{TLS_CERT}};
+    ssl_certificate_key {{TLS_KEY}};
+
+    # Modern TLS (Mozilla intermediate, 2026 baseline) — TLS 1.2 + 1.3 only.
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1d;
+    # Phase 3.20 — session tickets ON. Saves 1 RTT on TLS handshake
+    # after a short disconnect (e.g. wifi flap, hotspot switch). nginx
+    # auto-rotates the ticket key periodically so forward secrecy of
+    # past sessions is preserved (RFC 8446 §4.6.1 + nginx
+    # `ssl_session_ticket_key` doc). 0-RTT (early data) stays OFF — we
+    # don't opt in to replayable PUTs.
+    ssl_session_tickets on;
+
+    # Phase 6.1.2 — HSTS, gated on DOMAIN mode by render-relay-conf.sh.
+    #   DOMAIN set   → this line becomes the Strict-Transport-Security header.
+    #   DOMAIN empty → this line renders empty (solo IP / self-signed mode).
+    # HSTS is meaningless on a bare IP literal (clients ignore it per the spec)
+    # and would brick a browser the day you downgrade a self-signed test relay,
+    # so the solo mode ships WITHOUT it. The Android client pins the SPKI
+    # directly (rustls), so it never depends on HSTS either way.
+    {{HSTS_HEADER}}
+
+    # Limites pour upload de chunks vidéo.
+    # Phase 3.37 — body_size 16m → 32m. Les chunks réels Phase 3.30 sont
+    # < 3 MiB (FHD 4 Mbps × 5 s = 2.5 MiB après chiffrement, cap stable
+    # depuis le revert 3.29→3.30). 32 MiB laisse ×10 de marge pour un
+    # éventuel bitrate spike (ex. burst MediaCodec) sans ouvrir une
+    # window DoS amplification. (Depuis WP-B2 le PUT /file/{report}/{filename}
+    # EST rate-limité slowapi côté FastAPI — 600/min/IP — donc 32m reste un
+    # plafond raisonnable par requête au-dessus de cette limite de débit.)
+    #
+    # Phase 3.37 — body_timeout 60s → 120s. Sur 5G dégradé un chunk
+    # 1.7 MB peut prendre 50-70 s legit (300 kbps × packet loss 5 %).
+    # 60 s était trop strict → nginx renvoyait 408 avant que le client
+    # ne sache → circuit breaker s'ouvre → cascade de retries. 120 s
+    # donne ~1.7× marge sur le pire cas mesuré.
+    # La détection dead-peer reste rapide côté client grâce au
+    # pingInterval(15s) OkHttp ajouté en Phase 3.36 : un peer mort fait
+    # tomber la connexion en ≤ 30 s, indépendamment du timeout serveur.
+    client_max_body_size 32m;
+    client_body_timeout  120s;
+
+    # Pas de logs d'accès — relais aveugle, on ne garde aucune trace réseau.
+    access_log off;
+    error_log  /var/log/nginx/frappuccino-relay-error.log warn;
+
+    # Phase 3.38-A — TCP_NODELAY pour PUT à body unique (no pipelining
+    # côté client OkHttp). Désactive l'algorithme de Nagle qui peut
+    # retarder l'envoi des derniers segments du body de 40 ms (timer
+    # default) en attendant un ACK. Sur 5G dégradé avec 6 chunks
+    # parallèles + nginx en reverse proxy avant FastAPI, économise
+    # ~20-40 ms par chunk sans coût réseau. `tcp_nopush off` car
+    # `sendfile` n'est pas utilisé sur ce path (PUT, pas static file
+    # serving).
+    tcp_nodelay on;
+    tcp_nopush  off;
+    # Phase 3.38-A — keep-alive plus long que la valeur par défaut
+    # (65s) pour cap=8 OkHttp ConnectionPool (5 min keep-alive). Aligne
+    # le côté serveur sur le pool client : si nginx ferme à 65s, OkHttp
+    # tente de réutiliser une connexion morte et paye un nouveau
+    # handshake. 75s donne une marge sans aller jusqu'à 5min (au-delà,
+    # exposure à des connexions zombie côté nginx + slowloris-ish).
+    # `keepalive_requests 1000` (default 1000 sur nginx >= 1.19.10,
+    # explicite pour clarté) borne le nombre de PUT sur une même
+    # connexion avant rotation.
+    keepalive_timeout  75s;
+    keepalive_requests 1000;
+
+    location / {
+        proxy_pass         http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Forwarded-For   $remote_addr;
+        proxy_set_header   X-Forwarded-Proto https;
+        proxy_set_header   Connection        "";
+        # Pas de buffering pour permettre streaming d'upload.
+        proxy_request_buffering off;
+        proxy_buffering         off;
+        proxy_read_timeout      120s;
+    }
+}
+
+# Bloc HTTP pour challenge ACME Let's Encrypt — uniquement actif si tu utilises
+# certbot. Si tu restes sur cert auto-signé, ce bloc reste inerte.
+server {
+    listen 80;
+    listen [::]:80;
+    server_name {{HOST}};
+    server_tokens off;  # WP-B4 — hide the nginx version here too.
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+    location / {
+        return 308 https://$host:{{RELAY_PORT}}$request_uri;
+    }
+}

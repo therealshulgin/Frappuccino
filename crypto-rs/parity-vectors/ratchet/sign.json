@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "description": "Ratchet signAndAdvance: (state, msg) -> (signature, ephemeral_pk, key_index)",
+  "chain_0_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "signs": [
+    {
+      "message_hex": "68656c6c6f207061726974792074657374",
+      "key_index": 0,
+      "batch_number": 0,
+      "ephemeral_pk_hex": "92f0b0898703168f842cb130656065a6c88bec7f8b1372610141363ec8473637",
+      "signature_hex": "ef7f8a4652e3c06bcb0436ffe9bebdac1219cce91c09a5354fef0c8625ba862482e8a5bb0774cb417abc59c3d72e3337e383f0df69a037be5efff42a4cb66807"
+    },
+    {
+      "message_hex": "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+      "key_index": 1,
+      "batch_number": 0,
+      "ephemeral_pk_hex": "81f0d676630ee2dbdfd95e0c01ed3ce3d1e38c46c4c79a8e60b0ab0226b69e71",
+      "signature_hex": "ba84f6beaf7c876d769318cc687f27faa9c4f22dc4d70f8642f16de93fc7b557dbef3ff5b4573d00a246522f28854211be0dd617823d1b58ecde9076b4156e04"
+    }
+  ]
+}

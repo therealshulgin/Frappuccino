@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Adaptive-icon background layer: solid near-black matching the logo's
+     own background (#050505), so the foreground groove blends seamlessly. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android">
+    <solid android:color="#050505" />
+</shape>

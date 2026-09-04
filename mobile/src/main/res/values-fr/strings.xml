@@ -1,0 +1,199 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<resources>
+  <string name="app_name">Frappuccino</string>
+  <!-- Feedback statut enrôlement -->
+  <string name="enrollment_pending_banner">ENRÔLEMENT EN ATTENTE — TAP POUR LES PARAMÈTRES</string>
+  <string name="enrollment_succeeded_toast">Enrôlement serveur confirmé ✓</string>
+  <string name="enrollment_status_ok">● Enrôlé sur serveur</string>
+  <string name="enrollment_status_pending">⏳ Enrôlement serveur en attente</string>
+  <string name="enrollment_status_none">— Pas d\'identité —</string>
+  <string name="action_cancel">Annuler</string>
+  <string name="action_next">Poursuivre</string>
+  <string name="intro_document_protect">Documenter et protéger</string>
+  <string name="onboard_setup_lock">Comment souhaitez-vous verrouiller Frappuccino ?</string>
+  <string name="onboard_password">Mot de passe</string>
+  <string name="onboard_password_description">L\'option la plus sûre</string>
+  <string name="onboard_pin">Code PIN</string>
+  <string name="onboard_pin_description">Moyennement sûr</string>
+  <string name="onboard_pattern">Schéma</string>
+  <string name="onboard_pattern_description">L\'option la moins sûre</string>
+  <string name="action_continue">Continuer</string>
+  <string name="onboard.intro_title">Bienvenue à Frappuccino</string>
+  <string name="onboard.intro_get_started">Commencez</string>
+  <string name="onboard.title_camera">Appareil photo</string>
+  <string name="onboard.expl_camera">Prenez des photos et des vidéos directement dans Frappuccino. Ces fichiers sont automatiquement chiffrés et enregistrés dans Frappuccino, et ne seront pas visibles depuis la galerie habituelle de votre téléphone.</string>
+  <string name="onboard.title_recorder">Dictaphone</string>
+  <string name="onboard.expl_recorder">Record interviews or any sound around you with Frappuccino’s voice recorder.  The audio files are automatically encrypted and saved in Frappuccino’s hidden folder.</string>
+  <string name="onboard.title_files">Fichiers et dossiers cryptés</string>
+  <string name="onboard.expl_files">Securely store and organize all your files. As long as Frappuccino is locked, your files and folders will remain inaccessible to someone seizing or searching the device.</string>
+  <string name="onboard.title_lock_finish">Verrou</string>
+  <string name="onboard.expl_lock_finish">Votre verrou est configuré ! Vous pouvez le modifier à tout moment dans les Paramètres.</string>
+  <string name="onboard.title_all_done">Vous avez terminé !</string>
+  <string name="onboard.expl_all_done">You can go to Frappuccino now, or continue customizing Frappuccino to set up advanced settings.</string>
+  <string name="onboard.go_btn_all_done">Aller à Frappuccino</string>
+  <string name="onboard.advanced_btn_all_done">Paramètres avancés</string>
+  <string name="Timeout_Warning_Title">Avertissement</string>
+  <string name="Timeout_Warning_Description">Pour effectuer cette action, Frappuccino restera déverrouillée pendant 3 minutes.</string>
+  <string name="onboard.intro_organization_code">J\'ai un code de mon organisation</string>
+
+  <!-- i18n FR -->
+
+  <!-- Onboarding : code d'invitation -->
+  <string name="onboard_invite_code_title">Code d\'invitation</string>
+  <string name="onboard_invite_code_explanation">Entrez le code d\'invitation fourni par votre organisation pour vous connecter au serveur.</string>
+  <string name="onboard_invite_code_hint">Code d\'invitation</string>
+  <string name="onboard_invite_code_validate">Valider</string>
+  <string name="onboard_invite_code_skip">Passer</string>
+
+  <!-- Onboarding : génération mnémonique -->
+  <string name="onboard_mnemonic_generate_title">Votre phrase secrète</string>
+  <string name="onboard_mnemonic_generate_explanation">Notez ces 12 mots dans l\'ordre exact. C\'est votre seule clé de chiffrement. Personne d\'autre ne peut la récupérer.</string>
+  <string name="onboard_mnemonic_regenerate">Régénérer</string>
+  <string name="onboard_mnemonic_noted">J\'ai noté ma phrase</string>
+
+  <!-- Onboarding : confirmation mnémonique -->
+  <string name="onboard_mnemonic_confirm_title">Confirmez votre phrase</string>
+  <string name="onboard_mnemonic_confirm_explanation">Entrez les mots demandés pour vérifier que vous avez bien noté votre phrase.</string>
+  <string name="onboard_mnemonic_confirm_hint">Entrez le mot</string>
+  <string name="onboard_mnemonic_confirm_button">Confirmer</string>
+
+  <!-- Bouton retour générique -->
+  <string name="action_back">Retour</string>
+
+  <!-- Mode archive -->
+  <string name="archive_title">MODE ARCHIVE</string>
+  <string name="archive_prompt">SAISISSEZ VOTRE PHRASE BIP-39\nPOUR DÉCHIFFRER VOS STREAMS</string>
+  <string name="archive_warning">⚠ LA PHRASE NE QUITTE PAS CET ÉCRAN.\nNE LA PARTAGEZ JAMAIS.\nAPPUYER SUR ← EFFACE TOUT.</string>
+  <string name="archive_input_hint">12 mots séparés par des espaces</string>
+  <string name="archive_unlock">DÉVERROUILLER</string>
+  <string name="archive_close">← Fermer et effacer la session</string>
+  <!-- Phase 4.4.2 (2026-05-19) — récupération archives. -->
+  <string name="archive_retrieve_btn">RÉCUPÉRER MES STREAMS</string>
+  <string name="archive_retrieving_auth">Authentification serveur…</string>
+  <string name="archive_retrieving_reports">Listage des reports…</string>
+  <string name="archive_retrieving_blob">Téléchargement %1$s (%2$d/%3$d)…</string>
+  <string name="archive_no_reports">Aucun report trouvé pour cette identité.</string>
+  <string name="archive_auth_refused">Serveur refusé : vérifiez la phrase + la connectivité.</string>
+  <string name="archive_open_folder">OUVRIR LE DOSSIER</string>
+  <string name="archive_report_summary">%1$d blob(s) • %2$s</string>
+  <!-- UX list-persist (2026-05-20). -->
+  <string name="archive_download_all_btn">TOUT TÉLÉCHARGER</string>
+  <string name="archive_report_downloaded">✓</string>
+  <string name="archive_download_all_progress">Report %1$d/%2$d : %3$s…</string>
+  <string name="archive_download_all_done">Tous les %1$d reports téléchargés dans %2$s</string>
+  <string name="archive_download_all_partial">Stoppé au report %1$d/%2$d — retapez TOUT TÉLÉCHARGER pour reprendre.</string>
+  <!-- Bugs UX (2026-05-20) — race + écrasement accidentel. -->
+  <string name="archive_busy">Un téléchargement est déjà en cours, patientez.</string>
+  <string name="archive_redownload_title">Re-télécharger ce report ?</string>
+  <string name="archive_redownload_message">Ce report est déjà dans Downloads/Frappuccino/. Le re-télécharger remplacera les fichiers existants.</string>
+  <string name="archive_redownload_confirm">RE-TÉLÉCHARGER</string>
+  <string name="archive_redownload_cancel">ANNULER</string>
+  <!-- Foreground service de téléchargement (2026-05-30). -->
+  <string name="archive_fgs_starting">Démarrage du téléchargement…</string>
+  <string name="archive_fgs_progress">Téléchargement archive — report %1$d/%2$d</string>
+
+  <!-- Écran déverrouillage PIN -->
+  <string name="pin_unlock_title">PIN POUR DÉVERROUILLER</string>
+
+  <!-- Paramètres stream -->
+  <string name="stream_settings_title">PARAMÈTRES</string>
+  <string name="stream_settings_section_identity">— IDENTITÉ —</string>
+  <string name="stream_settings_section_ratchet">— RATCHET —</string>
+  <string name="stream_settings_section_server">— SERVEUR —</string>
+  <string name="stream_settings_section_actions">— ACTIONS —</string>
+  <string name="stream_settings_section_about">— À PROPOS —</string>
+  <string name="stream_settings_about_version">Version %1$s</string>
+  <string name="stream_settings_about_commit">Build %1$s</string>
+  <string name="stream_settings_about_license">AGPLv3 — voir la licence</string>
+  <string name="stream_settings_retry_enrollment">RÉESSAYER L\'ENRÔLEMENT SERVEUR</string>
+  <string name="stream_settings_archive_mode">MODE ARCHIVE</string>
+  <string name="stream_settings_auto_upload_on">AUTO-ENVOI : ACTIVÉ</string>
+  <string name="stream_settings_auto_upload_off">AUTO-ENVOI : DÉSACTIVÉ</string>
+  <string name="stream_settings_provenance_on">PROVENANCE : ACTIVÉE</string>
+  <string name="stream_settings_provenance_off">PROVENANCE : DÉSACTIVÉE</string>
+  <string name="stream_settings_provenance_ts_on">HORODATAGE OTS : ACTIVÉ</string>
+  <string name="stream_settings_provenance_ts_off">HORODATAGE OTS : DÉSACTIVÉ</string>
+  <!-- Calibration debug (2026-05-16) — mode bitrate fixe pour tester la lisibilité visage. -->
+  <string name="stream_settings_section_debug">— DEBUG (CALIBRATION) —</string>
+  <string name="stream_settings_debug_bitrate_on">BITRATE FIXE : ACTIVÉ</string>
+  <string name="stream_settings_debug_bitrate_off">BITRATE FIXE : DÉSACTIVÉ</string>
+  <string name="stream_settings_debug_quality">RÉSOLUTION : %1$s</string>
+  <string name="stream_settings_debug_kbps">DÉBIT : %1$d kbps</string>
+  <string name="stream_settings_debug_hevc_test">TEST HEVC 10s</string>
+  <string name="stream_settings_debug_hevc_grid">TEST HEVC GRILLE (7 paliers)</string>
+  <string name="stream_settings_debug_hevc_audio_test">TEST HEVC+AUDIO 10s</string>
+  <string name="stream_settings_debug_rolling_test">TEST ROLLING 4×5s (HEVC+AUDIO)</string>
+  <string name="stream_settings_debug_aspect_a">ASPECT : 4:3 + 0.75 (A, actuel)</string>
+  <string name="stream_settings_debug_aspect_b">ASPECT : 16:9 IDENTITÉ (B, propre)</string>
+  <string name="stream_settings_debug_codec_probe">PROBE CODECS HARDWARE</string>
+  <string name="stream_settings_lock">VERROUILLER</string>
+  <string name="stream_settings_wipe">⚠ EFFACER TOUT</string>
+  <string name="stream_settings_close">← Fermer</string>
+
+  <!-- Paramètres stream : dialogues -->
+  <string name="stream_settings_lock_dialog_title">Verrouiller ?</string>
+  <string name="stream_settings_lock_dialog_message">Le ratchet sera effacé de la RAM. Il faudra ressaisir le PIN pour streamer.</string>
+  <string name="stream_settings_lock_dialog_action">Verrouiller</string>
+  <string name="stream_settings_wipe_dialog_title">EFFACER TOUT ?</string>
+  <string name="stream_settings_wipe_dialog_message">Cela efface L\'IDENTITÉ V2 et le RATCHET :\n- Identité publique (ed25519_pk + x25519_pk)\n- Ratchet courant (batch + clés éphémères)\n- Blobs locaux (chunks en attente d\'upload)\n\nSeule votre phrase BIP-39 permettra de récupérer les streams déjà uploadés (via Mode Archive).\n\nPour un reset complet de l\'app (incluant le PIN Tella), désinstallez et réinstallez.\n\nCette action est IRRÉVERSIBLE.</string>
+  <string name="stream_settings_wipe_dialog_action">EFFACER</string>
+  <string name="stream_settings_wipe_confirm_title">Dernière confirmation</string>
+  <string name="stream_settings_wipe_confirm_message">Vraiment effacer l\'identité V2 ?</string>
+  <string name="stream_settings_wipe_confirm_yes">OUI, EFFACER</string>
+
+  <!-- StreamActivity : toasts + dialogues -->
+  <string name="stream_shake_detected">Secousse détectée — démarrage du stream</string>
+  <string name="stream_unlock_cancelled">Déverrouillage annulé</string>
+  <string name="stream_battery_dialog_title">Maintenir l\'envoi en arrière-plan</string>
+  <string name="stream_battery_dialog_message">Pour que vos vidéos continuent à s\'envoyer quand l\'écran est éteint, désactivez l\'optimisation batterie pour Frappuccino dans la fenêtre suivante.\n\nSi vous refusez, l\'enregistrement fonctionnera mais les uploads peuvent se mettre en pause après quelques minutes.</string>
+  <string name="stream_battery_dialog_configure">Configurer</string>
+  <string name="stream_battery_dialog_later">Plus tard</string>
+  <string name="stream_battery_degraded">Mode dégradé : les uploads peuvent se mettre en pause écran éteint.</string>
+  <string name="stream_oem_killer_title">Évitez que le système coupe vos enregistrements</string>
+  <string name="stream_oem_killer_message">Votre téléphone peut arrêter un enregistrement en cours pour économiser la batterie. Pour l\'empêcher, ouvrez les réglages et :\n\n• autorisez l\'app à fonctionner sans restriction (batterie / arrière-plan)\n• si l\'option existe, verrouillez l\'app dans les applications récentes</string>
+  <string name="stream_oem_killer_message_reactive">Le système a interrompu votre dernier enregistrement. Pour éviter que ça se reproduise, ouvrez les réglages et autorisez l\'app à fonctionner sans restriction en arrière-plan.</string>
+  <string name="stream_oem_killer_open">Ouvrir les réglages</string>
+  <string name="stream_oem_killer_later">Plus tard</string>
+  <string name="stream_camera_mic_required">Permissions caméra et microphone requises</string>
+  <string name="stream_encryption_not_initialized">Chiffrement non initialisé. Veuillez redémarrer l\'application.</string>
+  <string name="stream_press_stop">Appuyez sur STOP pour arrêter l\'enregistrement</string>
+    <!-- Phase 6.1.16: relocated from tella-locking-ui (module removed). V2 PIN setup step labels. -->
+    <string name="OnboardPinStep_1">ÉTAPE 1 SUR 2</string>
+    <string name="OnboardPinStep_1_Title">Choisissez votre code PIN</string>
+    <string name="OnboardPinStep_1_Hint">Au moins 6 chiffres — il vous sera demandé à chaque déverrouillage.</string>
+    <string name="OnboardPinStep_2">ÉTAPE 2 SUR 2</string>
+    <string name="OnboardPinStep_2_Title">Confirmez le même code PIN</string>
+    <string name="OnboardPinStep_2_Hint">Saisissez-le à nouveau pour vous assurer de vous en souvenir.</string>
+    <!-- Phase 6 — réglage auto-verrouillage du ratchet (StreamSettings). -->
+    <string name="stream_settings_autolock_title">Auto-verrouillage</string>
+    <string name="stream_settings_autolock_1min">1 minute</string>
+    <string name="stream_settings_autolock_5min">5 minutes</string>
+    <string name="stream_settings_autolock_15min">15 minutes</string>
+    <string name="stream_settings_autolock_30min">30 minutes</string>
+    <string name="stream_settings_autolock_never">Jamais</string>
+    <!-- Plafond qualité d\'enregistrement (StreamSettings). -->
+    <string name="stream_settings_section_recording">— ENREGISTREMENT —</string>
+    <string name="stream_settings_quality_title">Qualité max</string>
+    <string name="stream_settings_quality_auto">Auto (jusqu\'à 1080p)</string>
+    <string name="stream_settings_quality_720">720p max</string>
+    <string name="stream_settings_quality_480">480p max</string>
+    <!-- Toggle + sensibilité du shake-to-record (StreamSettings). -->
+    <string name="stream_settings_shake_on">SECOUER POUR FILMER : ACTIVÉ</string>
+    <string name="stream_settings_shake_off">SECOUER POUR FILMER : DÉSACTIVÉ</string>
+    <string name="stream_settings_shake_sensitivity_title">Sensibilité du shake</string>
+    <string name="stream_settings_shake_low">Faible</string>
+    <string name="stream_settings_shake_med">Moyenne</string>
+    <string name="stream_settings_shake_high">Élevée</string>
+
+    <!-- Bandeau fragments orphelins (in-app ; pas de notif). -->
+    <string name="orphan_banner_at_risk">%1$d fragment(s) en attente d\'envoi — appuyer</string>
+    <string name="orphan_banner_deleted">%1$d fragment(s) non envoyé(s) supprimé(s) — appuyer</string>
+    <string name="orphan_dialog_title">Fragments en attente</string>
+    <string name="orphan_dialog_at_risk">%1$d fragment(s) d\'un enregistrement n\'ont pas encore atteint le serveur (le plus ancien date du %2$s). Sans réseau utilisable, ils seront supprimés automatiquement vers le %3$s pour ne laisser aucune trace en clair. Reconnectez-vous, ou appuyez sur Réessayer.</string>
+    <string name="orphan_dialog_deleted">%1$d fragment(s) non envoyé(s) ont été supprimés (le plus ancien datait du %2$s). Ils n\'ont pas pu atteindre le serveur à temps.</string>
+    <string name="orphan_action_retry">Réessayer l\'envoi</string>
+    <string name="orphan_action_ack">J\'ai compris</string>
+    <string name="orphan_action_close">Fermer</string>
+    <string name="orphan_retry_toast">Nouvelle tentative d\'envoi lancée…</string>
+    <string name="orphan_date_unknown">date inconnue</string>
+</resources>

@@ -1,0 +1,65 @@
+name: Mutation testing (cargo-mutants)
+
+# Mutation testing injects small faults (flip a comparison, delete a line,
+# replace a return value) and checks the test suite CATCHES them. A surviving
+# mutant marks a behaviour the tests don't pin down -- a real test gap that
+# line coverage alone hides. The goal is to raise the caught/total ratio over
+# time.
+#
+# Surviving mutants deliberately do not fail the job: equivalent mutants are
+# frequent enough that a hard failure would only train us to ignore the run, so
+# the uploaded report is the review signal. The strict no-regression gate on
+# the mutation score (methodologie-securite-code.md) still needs a committed
+# baseline score to diff against.
+#
+# It's slow (rebuild + retest per mutant), so this does NOT gate every push:
+# a weekly full sweep + manual dispatch, uploaded as an artifact for review.
+# Config (timeouts, exclude_globs) lives in crypto-rs/.cargo/mutants.toml.
+# The repo is public, so both triggers below fire for real: the cron runs the
+# sweep every Monday, and a maintainer can dispatch one by hand.
+
+on:
+  schedule:
+    - cron: '0 4 * * 1'   # Mondays 04:00 UTC
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: crypto-rs
+
+jobs:
+  sweep:
+    name: cargo-mutants full sweep (core + stream)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (pinned via rust-toolchain.toml)
+        run: rustup show
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crypto-rs/target
+          key: ${{ runner.os }}-mutants-${{ hashFiles('crypto-rs/Cargo.lock') }}
+
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --version 27.1.0 --locked
+
+      - name: Mutation sweep (core + stream)
+        # --no-shuffle = deterministic ordering so two runs are comparable
+        # (pass-to-pass diffing per methodologie-securite-code.md Part 3).
+        # Surviving mutants don't fail the job (equivalent-mutant noise); the
+        # uploaded report is the review signal.
+        run: cargo mutants --no-shuffle -j 2
+        continue-on-error: true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-out
+          path: crypto-rs/mutants.out/

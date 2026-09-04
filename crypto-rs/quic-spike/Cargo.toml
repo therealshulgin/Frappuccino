@@ -1,0 +1,46 @@
+# THROWAWAY Phase 2 QUIC spike crate. NOT shipped — measures whether quinn's
+# userspace congestion control beats Android's cubic-only kernel TCP (>=3x) on a
+# degraded link, before committing to the QUIC transport (ROADMAP 10.9,
+# docs/TRANSPORT_PLAN.md Phase 2, finding B1). Ripped out after the Gate-2 call.
+#
+# Two bins:
+#   quic-bench (device)  — cross-compiled for Android arm64, pushed via adb.
+#                          Pushes N bytes over TCP (kernel cubic) AND QUIC (quinn,
+#                          selectable CC) to the sink; prints wall-clock + Mbit/s.
+#   quic-sink  (relay)    — built for x86_64 Linux (WSL), run on the relay behind
+#                          the Gate-0 netem. Drains TCP + QUIC, acks 1 byte.
+#                          Self-signed cert via rcgen, gated behind `--features sink`
+#                          so rcgen never enters the Android bench cross-compile.
+[package]
+name = "frappuccino-quic-spike"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "THROWAWAY Phase 2 QUIC spike (quinn userspace CC vs kernel cubic TCP, on-device). Not shipped."
+
+[[bin]]
+name = "quic-bench"
+path = "src/bin/bench.rs"
+
+[[bin]]
+name = "quic-sink"
+path = "src/bin/sink.rs"
+
+[features]
+# Enables the sink's self-signed cert dep. Build the sink with
+# `--features sink`; the Android bench build omits it so rcgen is never compiled
+# for arm64.
+sink = ["dep:rcgen"]
+
+[dependencies]
+# Same pinned versions already in the workspace lock (quinn/tokio pulled
+# un-compiled by reqwest; rustls is the protocol stack's pin).
+quinn            = { version = "=0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+tokio            = { version = "=1.52.1", default-features = false, features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "time"] }
+rustls           = { version = "=0.23.38", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "=1.14.0"
+rcgen            = { version = "=0.13.2", default-features = false, features = ["crypto", "ring", "pem"], optional = true }
+
+# Throwaway spike: do not inherit the workspace's pedantic clippy gate.
+[lints]

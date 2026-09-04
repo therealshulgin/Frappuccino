@@ -1,0 +1,346 @@
+theory RatchetProtocol
+/*
+  Frappuccino STREAM -- V2 ephemeral-ratchet enrollment & authentication
+  protocol, modelled in the symbolic (Dolev-Yao) setting.
+
+  ROADMAP 8.4 item (5). Companion to the TLA+ FSM model (item 4):
+    - TLA+    proves the *state-machine* discipline (monotone batch, use-once
+              mask, anti-replay) exhaustively over the 50-slot counter space.
+    - Tamarin (this file) proves the *cryptographic* protocol layer under an
+              active network attacker (Dolev-Yao): unforgeable enrollment,
+              authenticated challenge-response, batch-rotation lineage
+              (no rogue batch), secrecy of ephemeral keys, and forward secrecy
+              of past authentications.
+
+  Source of truth:
+    crypto-rs/core/src/ratchet.rs       (sign_and_advance, advance_batch / RotationProof)
+    crypto-rs/core/src/identity.rs      (sign_once(message, domain) -- enrollment)
+    crypto-rs/core/src/signature_domain.rs    (R-C-1: the explicit domain tags)
+    crypto-rs/stream/src/protocol.rs    (enroll / challenge / verify / rotate-batch)
+    server/app/routes/auth_v2.py        (the verifier: acceptance conditions)
+    docs/invariants-ratchet-verification.md   (Partie 1 sections A / B / E)
+
+  Abstraction (documented scope). A batch is modelled by ONE representative
+  ephemeral slot key. The 50-slot multiplicity and the consumed-mask
+  bookkeeping are the finite-state concern proven exhaustively by TLA+ (item 4);
+  here every slot key is an independent Ed25519 key, which is exactly what the
+  Dolev-Yao layer needs. A slot is consumed by EITHER a challenge-response auth
+  OR a batch rotation, at most once -- the server's use-once enforcement
+  (auth_v2.py: consume_ephemeral_key / "Signer key already consumed"). That
+  sentence used to rest on an encoding artefact alone: SlotAvail is a LINEAR
+  fact, so the server rules could only fire once per slot, but no lemma said so.
+  It is now `slot_use_once` below, with a negative control (NC4) that makes
+  SlotAvail persistent and requires the lemma to fall. The distinction became
+  load-bearing on 2026-09-03: the client deliberately REPLAYS unconfirmed
+  rotation proofs at the start of every authentication, so "an already-applied
+  proof grants nothing" is something the design now leans on, not a nicety.
+
+  Writing that lemma immediately showed the sentence above was too strong, so
+  read the qualifier. Use-once is guaranteed for HONESTLY generated slots, and
+  unless the slot was revealed. Server_Rotate installs the `newpk` it is handed
+  ON THE WIRE, and neither this model nor the relay checks that the new batch
+  excludes the signer's own key: `rotate_batch` overwrites `batch_keys` and
+  resets `consumed_indices` to empty (ratchet_registry.py). An attacker who
+  enrols an identity of their own can therefore rotate its slot TO ITSELF and
+  re-arm it indefinitely. Tamarin found exactly that trace. It grants nothing
+  over an identity they already own, which is why this is a scope qualifier on
+  the lemma rather than a defect to fix.
+
+  Second abstraction, and it cuts the other way. !DeviceSlot is PERSISTENT, so
+  the modelled device can keep signing from a slot the real device has erased:
+  `advance_batch` wipes the outgoing batch. This is sound for the security
+  lemmas -- giving the honest device MORE power can only make them harder to
+  prove -- but it means the availability failure the replay queue repairs is not
+  expressible here. In this model a desync repairs itself by re-signing; on a
+  real device the batch that could sign is gone. Availability is out of scope
+  for Tamarin by design; see the TLA+ model and section 4.2 of the architecture
+  document.
+
+  Domain separation (R-C-1, commit da56da4). Every V2 signature commits to an
+  explicit one-byte domain tag prepended to the signed message
+  (core/src/signature_domain.rs, mirrored byte-for-byte by the verifier in
+  server/app/signature_domain.py). The live contexts in this model:
+      0x01 AuthChallenge  ephemeral slot signs nonce||ts   (/auth/v2/verify)
+      0x02 BatchRotation  ephemeral slot signs concat(pks) (/auth/v2/rotate-batch)
+      0x03 Enrollment     long-term  key  signs concat(pks) (/auth/v2/enroll)
+  The ephemeral slot is dual-use (it signs AuthChallenge AND BatchRotation); the
+  model's symbolic tags ('auth' / 'rotate') mirror those real wire tags. The
+  model proves rotation safety genuinely DEPENDS on that ephemeral separation:
+  collapsing the two ephemeral tags (NC2) re-falsifies rotation_authentic.
+
+  Phase C relay-blind retired 0x04 ArchiveAuth: archive reads are now
+  identity-free (the phrase-derived report_id is the capability), so the
+  long-term key signs ONLY enrollment -- it is no longer dual-use. The earlier
+  long-term cross-context attack surface (an archive signature replayed as a
+  rogue enrollment -- the R-C-1 finding, demonstrated by the now-removed NC3) is
+  therefore GONE by construction: with a single long-term context there is
+  nothing to separate. root_authentic still holds; the 0x03 tag stays as defense
+  in depth for any future long-term context.
+  History: before R-C-1 the separation was only *implicit* in message length
+  (40-byte nonce||ts vs 1600-byte concat) -- the audit's open finding; R-C-1
+  made it explicit, and Phase C removed the long-term dual-use entirely.
+*/
+
+begin
+
+builtins: signing
+
+/* The server's many `if not verify(...): reject` checks are modelled by an
+   action fact Eq(verify(...), true) constrained by this equality restriction:
+   a trace is only valid where the verification actually succeeded. */
+restriction Equality:
+  "All x y #i. Eq(x, y) @ #i ==> x = y"
+
+/* The real server rejects a second enrollment of an already-known identity
+   (auth_v2.py enroll -> 409 "Identity already enrolled"). One root batch per
+   identity. */
+restriction EnrollOncePerIdentity:
+  "All idpk e1 e2 #i #j.
+      ServerEnroll(idpk, e1) @ #i & ServerEnroll(idpk, e2) @ #j ==> #i = #j"
+
+/* ===========================================================================
+   ENROLLMENT
+   Device: fresh long-term identity ltk and the batch-0 slot e0. Publishes the
+   identity pubkey, the slot pubkey, and the enrollment signature
+   sign(pk(e0), ltk) -- i.e. EnrollmentKit.sign_once over concat(batch_0_pks),
+   here represented by the single batch-0 slot pubkey.
+   =========================================================================== */
+rule Device_Enroll:
+    [ Fr(~ltk), Fr(~e0) ]
+  --[ Enroll(pk(~ltk), pk(~e0)), LtkKey(~ltk), SlotKey(~e0) ]->
+    [ !Ltk(~ltk)
+    , !DeviceSlot(~ltk, ~e0)
+    , Out(pk(~ltk))
+    , Out(pk(~e0))
+    , Out(sign(<'enroll', pk(~e0)>, ~ltk)) ]
+
+/* Server: verifies the enrollment signature under the claimed identity key,
+   then records the batch-0 slot as the available (authorized) slot for this
+   identity. RootAuthorized marks the base of the lineage chain. */
+rule Server_Enroll:
+    [ In(idpk), In(epk), In(sig) ]
+  --[ ServerEnroll(idpk, epk)
+    , Eq(verify(sig, <'enroll', epk>, idpk), true)
+    , RootAuthorized(idpk, epk) ]->
+    [ SlotAvail(idpk, epk) ]
+
+/* ===========================================================================
+   CHALLENGE  (POST /auth/challenge)
+   A fresh server nonce, one-shot: the linear ServerNonce fact is consumed by
+   exactly one verify (anti-replay). The server-stamped timestamp + the +/-30s
+   skew window (auth_v2.py) only *tighten* an already one-shot nonce, so they
+   are a replay-window refinement orthogonal to the symbolic model; omitted
+   here and noted in docs/TAMARIN_RATCHET.md.
+   =========================================================================== */
+rule Server_Challenge:
+    [ Fr(~n) ]
+  --[ Challenge(~n) ]->
+    [ Out(~n), ServerNonce(~n) ]
+
+/* ===========================================================================
+   CHALLENGE-RESPONSE AUTH  (POST /auth/v2/verify)
+   Device signs the nonce with its current slot key; the wire message also
+   carries the claimed identity (VerifyBody.ed25519_pk) which the server uses
+   to look up the slot's batch. The SIGNATURE itself covers only the nonce
+   (protocol.rs: message = nonce || ts) -- the identity binding is the registry
+   lookup, not the signature. Server verifies under the slot pubkey, consumes
+   the slot (use-once) and the nonce (one-shot), issues a JWT.
+   =========================================================================== */
+rule Device_AuthSign:
+    [ !DeviceSlot(~ltk, ~e), In(n) ]
+  --[ DeviceAuthSign(pk(~ltk), pk(~e), n) ]->
+    [ Out(<pk(~ltk), pk(~e), n, sign(<'auth', n>, ~e)>) ]
+
+rule Server_Verify:
+    [ SlotAvail(idpk, epk), ServerNonce(n), In(<idpk, epk, n, sig>) ]
+  --[ ServerAccept(idpk, epk, n)
+    , Eq(verify(sig, <'auth', n>, epk), true)
+    , ConsumeSlot(idpk, epk) ]->
+    [ IssuedJWT(idpk, n) ]
+
+/* ===========================================================================
+   BATCH ROTATION  (POST /auth/v2/rotate-batch)
+   Device signs the next batch's slot pubkey with its CURRENT slot key
+   (advance_batch / RotationProof over concat(new_batch_pks)). The server
+   verifies under the current authorized slot, consumes it, and installs the
+   new slot as the authorized one. RotateAuthorized chains the lineage.
+   =========================================================================== */
+rule Device_Rotate:
+    [ !DeviceSlot(~ltk, ~e), Fr(~e2) ]
+  --[ DeviceRotate(pk(~ltk), pk(~e), pk(~e2)), SlotKey(~e2) ]->
+    [ !DeviceSlot(~ltk, ~e2)
+    , Out(<pk(~e), pk(~e2), sign(<'rotate', pk(~e2)>, ~e)>) ]
+
+rule Server_Rotate:
+    [ SlotAvail(idpk, signerpk), In(<signerpk, newpk, sig>) ]
+  --[ ServerRotate(idpk, signerpk, newpk)
+    , Eq(verify(sig, <'rotate', newpk>, signerpk), true)
+    , RotateAuthorized(idpk, signerpk, newpk)
+    , ConsumeSlot(idpk, signerpk) ]->
+    [ SlotAvail(idpk, newpk) ]
+
+/* ===========================================================================
+   (Phase C relay-blind) The ARCHIVE-SCOPE AUTH flow is gone: archive reads are
+   now identity-free (the phrase-derived report_id is the capability), so the
+   long-term key no longer authenticates directly -- it signs only enrollment.
+   The Device_ArchiveSign / Server_ArchiveAuth rules and the archive_auth_origin
+   lemma were removed with it; see the domain-separation note in the header.
+   =========================================================================== */
+
+/* ===========================================================================
+   ADVERSARY: state-compromise reveals (for forward-secrecy reasoning).
+   Reveal_Slot leaks the device's CURRENT ephemeral slot secret (extraction of
+   the on-device ratchet state); Reveal_Ltk leaks the long-term identity secret.
+   =========================================================================== */
+rule Reveal_Slot:
+    [ !DeviceSlot(~ltk, ~e) ]
+  --[ RevealSlot(pk(~e)) ]->
+    [ Out(~e) ]
+
+rule Reveal_Ltk:
+    [ !Ltk(~ltk) ]
+  --[ RevealLtk(pk(~ltk)) ]->
+    [ Out(~ltk) ]
+
+// ===========================================================================
+// LEMMAS
+// ===========================================================================
+
+/* --- Sanity / executability: the honest flows are reachable at all. -------- */
+lemma auth_reachable:
+  exists-trace
+  "Ex idpk epk n #i. ServerAccept(idpk, epk, n) @ #i"
+
+lemma rotation_reachable:
+  exists-trace
+  "Ex idpk s nw #i. ServerRotate(idpk, s, nw) @ #i"
+
+/* --- (Part 1 A/B) Secrecy of ephemeral slot keys. -------------------------- */
+/* The adversary never learns an honest ephemeral slot secret unless that
+   slot's state was explicitly revealed. The device only ever emits pk(e) and
+   signatures sign(_, e), so e itself stays secret. */
+lemma slotkey_secrecy:
+  "All e #i #k.
+      SlotKey(e) @ #i & K(e) @ #k ==> (Ex #r. RevealSlot(pk(e)) @ #r)"
+
+/* --- Secrecy of the long-term identity key. -------------------------------- */
+lemma ltk_secrecy:
+  "All l #i #k.
+      LtkKey(l) @ #i & K(l) @ #k ==> (Ex #r. RevealLtk(pk(l)) @ #r)"
+
+/* --- (Part 1 B/E) Authentication: a JWT is issued only against a genuine
+   signature by the holder of the slot key, unless that slot was compromised.
+   Authentication is on the SLOT KEY (the signature covers only the nonce); the
+   identity attribution idpk2 may differ from idpk under an unknown-key-share
+   re-registration, which transfers no authority because the nonce is one-shot
+   and only the slot holder can sign -- see docs/TAMARIN_RATCHET.md. ----------- */
+lemma auth_slot_origin [reuse]:
+  "All idpk epk n #i.
+      ServerAccept(idpk, epk, n) @ #i
+      & (Ex e #s. SlotKey(e) @ #s & epk = pk(e))
+      ==> (Ex idpk2 #j. DeviceAuthSign(idpk2, epk, n) @ #j & #j < #i)
+        | (Ex #r. RevealSlot(epk) @ #r & #r < #i)"
+
+/* --- (Part 1 C/E) Anti-replay: a server challenge nonce authenticates at most
+   one session. The linear ServerNonce fact is consumed by the first accept. -- */
+lemma nonce_use_once:
+  "All idpk1 epk1 idpk2 epk2 n #i #j.
+      ServerAccept(idpk1, epk1, n) @ #i & ServerAccept(idpk2, epk2, n) @ #j
+      ==> #i = #j"
+
+/* --- OPEN ITEM: the rotation flow's use-once property is NOT proven here, and
+   the abstraction paragraph at the top of this file has been overstating it for
+   as long as this model has existed. This is a documented gap, not an omission.
+
+   The claim is "a slot is consumed by EITHER an auth OR a rotation, at most
+   once". `ConsumeSlot` is emitted by both server rules and appears in NO lemma;
+   the property holds only because SlotAvail is a LINEAR fact. Make it persistent
+   and all ten lemmas still verify while the server rotates one slot forever.
+
+   Three attempts to state it were written and all three were FALSIFIED by
+   Tamarin (2026-09-04), which is what makes this worth recording:
+
+     1. Unconditional               -> falsified, 16 steps
+     2. + (Ex #r. RevealSlot(s))    -> falsified, 15 steps
+     3. + RevealLtk, then restricted to honest slots via SlotKey, as
+        `auth_slot_origin` does                              -> still falsified
+
+   The concrete counter-example is ROTATE-TO-SELF. Enrolment is open by design,
+   so an attacker enrols an identity of their own and submits a rotation whose
+   new batch contains the signer's own key: `sign(<'rotate', pk(x)>, x)` with
+   newpk == signerpk. Server_Rotate consumes SlotAvail(idpk, x) and immediately
+   reinstalls the identical fact, so that key is consumable again, indefinitely.
+
+   THE RELAY DOES THE SAME. `rotate_batch` writes the submitted keys verbatim and
+   resets `consumed_indices` to empty, without checking that the signer's key is
+   absent from the new batch (server/app/ratchet_registry.py). Rotating a slot to
+   itself re-arms it.
+
+   Is it a defect? Not on its own: reaching it requires an authorized, unconsumed
+   slot of the target identity, so the attacker already holds what the slot would
+   grant, and doing it to your own identity gains nothing. What is wrong today is
+   the DOCUMENTATION, which promises a use-once guarantee the model does not
+   deliver -- and it became load-bearing on 2026-09-03, when the client started
+   deliberately replaying unconfirmed rotation proofs at each authentication.
+   That replay is safe, but its safety currently rests on an encoding accident
+   rather than on a proof.
+
+   To close this properly one of two things has to happen: either the relay
+   refuses a new batch containing the signer's key (a server change, and then the
+   unconditional lemma becomes provable), or the lemma is stated over a notion of
+   honest identity this model does not currently carry. Neither is a five-minute
+   edit, which is why this is an open item rather than a bent lemma. */
+
+/* --- (Part 1 B/E) Rotation authentication: an accepted batch rotation whose
+   signer slot was honestly generated was actually produced by the genuine
+   device (DeviceRotate), unless that slot's key was revealed. This is the
+   unforgeability of the custom RotationProof (advance_batch): the signature
+   sign(newpk, slot) cannot be produced without the slot's private key, so an
+   active attacker cannot inject a forged batch rotation. --------------------- */
+lemma rotation_authentic:
+  "All idpk signerpk newpk #i.
+      ServerRotate(idpk, signerpk, newpk) @ #i
+      & (Ex e #s. SlotKey(e) @ #s & signerpk = pk(e))
+      ==> (Ex idpk2 #j. DeviceRotate(idpk2, signerpk, newpk) @ #j & #j < #i)
+        | (Ex #r. RevealSlot(signerpk) @ #r & #r < #i)"
+
+/* --- (Part 1 B/E) Rotation lineage: every accepted rotation was signed by a
+   slot that was itself already authorized -- at enrollment (the root) or by a
+   prior rotation. By induction this chains every batch back to the root. No
+   rogue batch can be injected without an authorized predecessor. ------------- */
+lemma rotation_lineage [use_induction]:
+  "All idpk signerpk newpk #i.
+      RotateAuthorized(idpk, signerpk, newpk) @ #i
+      ==> (Ex #j. RootAuthorized(idpk, signerpk) @ #j & #j < #i)
+        | (Ex prev #j. RotateAuthorized(idpk, prev, signerpk) @ #j & #j < #i)"
+
+/* --- Base anchor of the lineage: a root authorization implies a genuine
+   enrollment by the identity owner, unless its long-term key was revealed.
+   Composed with rotation_lineage: every authorized batch of an honest,
+   un-revealed identity is rooted at that device's own enrollment. ------------ */
+lemma root_authentic:
+  "All idpk epk #i.
+      RootAuthorized(idpk, epk) @ #i
+      & (Ex ltk #s. LtkKey(ltk) @ #s & idpk = pk(ltk))
+      ==> (Ex #j. Enroll(idpk, epk) @ #j & #j < #i)
+        | (Ex #r. RevealLtk(idpk) @ #r & #r < #i)"
+
+/* --- (Part 1 B) Forward secrecy: an authentication accepted while its slot is
+   not (yet) compromised is genuine, even if that slot's state is revealed
+   LATER. Extracting the device state at time T cannot retroactively forge a
+   past authentication -- the "can only forge remaining slots, never past
+   uploads" guarantee from ratchet.rs, per independent ephemeral keys. -------- */
+lemma forward_secrecy_auth:
+  "All idpk epk n #i.
+      ServerAccept(idpk, epk, n) @ #i
+      & (Ex e #s. SlotKey(e) @ #s & epk = pk(e))
+      & (All #r. RevealSlot(epk) @ #r ==> #i < #r)
+      ==> (Ex idpk2 #j. DeviceAuthSign(idpk2, epk, n) @ #j & #j < #i)"
+
+/* (Phase C relay-blind) archive_auth_origin removed: the archive-scope flow no
+   longer exists (identity-free reads). The long-term key now signs only
+   enrollment, so its cross-context replay surface -- the R-C-1 finding this
+   lemma + NC3 demonstrated -- is gone by construction (root_authentic still
+   holds; see the header domain-separation note). */
+
+end

@@ -1,0 +1,8 @@
+# Gradle
+.gradle/
+build/
+
+# Generated UniFFI bindings — regenerated from ffi/src/frappuccino.udl, NOT
+# committed (would drift silently from the UDL). See README.md for the regen
+# command; the harness build needs them present.
+src/main/kotlin/uniffi/

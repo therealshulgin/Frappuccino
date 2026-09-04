@@ -1,0 +1,85 @@
+name: crypto-rs proofs
+
+# Re-runs the deterministic formal proofs on every change to the crypto core, so
+# the model can never silently drift from the code — the model-to-code gap a
+# fast-moving FFI/transport surface is most exposed to.
+#
+# Every runner is reproducible — pinned toolchain and tool versions — and
+# self-contained: no external service, no state outside the repo. That is a rule
+# for anything added here, not an accident of the four jobs below. Each also
+# keeps at least one negative control: a deliberately broken variant the tool
+# MUST catch, the `negative` argument on the Tamarin step below being one of
+# them. Drop a negative control and the job stays green while proving nothing.
+#
+# This workflow is the *semantic* half of the gate: it re-proves the protocol and
+# the parsers themselves. The *surface* half runs in `cargo test` (rust.yml), where
+# `signature_domain::tests::signature_domain_surface_is_frozen` breaks the build if
+# a signature domain is added, removed or retagged without reconciling the model,
+# the server mirror and the docs.
+#
+# The diff-fuzz Kotlin<->Rust parity harness is not here and must not be added: it
+# runs via Gradle from the Android build, where the JVM replays the corpus through
+# the real UniFFI->JNA bindings. cargo test (rust.yml) pins the Rust<->Python KAT
+# vectors.
+
+on:
+  push:
+    paths:
+      - 'crypto-rs/**'
+      - '.github/workflows/proofs.yml'
+  pull_request:
+    paths:
+      - 'crypto-rs/**'
+      - '.github/workflows/proofs.yml'
+  workflow_dispatch:
+
+jobs:
+  tlc:
+    name: TLA+/TLC — ratchet FSM (2800 states)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: TLC model check (EphemeralRatchet)
+        run: bash crypto-rs/core/proofs/run-tlc.sh
+
+  zeroize:
+    name: zeroize-audit — LLVM IR (no dead-store elimination)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain (pinned via rust-toolchain.toml)
+        run: rustup show
+      - name: zeroize-not-DSE guard (opt-level=s and 2)
+        run: bash crypto-rs/core/audit/assert_zeroize_not_dse.sh
+
+  kani:
+    name: Kani — bounded no-panic (stream parsers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache cargo (kani install)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+          key: ${{ runner.os }}-kani-0.67.0
+      - name: Install Kani
+        run: |
+          cargo install --locked kani-verifier --version 0.67.0
+          cargo kani setup
+      - name: Kani proofs (parse_header no-panic + postconditions)
+        run: bash crypto-rs/run-kani.sh
+
+  tamarin:
+    name: Tamarin — Dolev-Yao protocol (10 lemmas + 2 negative controls)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tamarin prove (+ negative controls must falsify)
+        run: bash crypto-rs/core/proofs/run-tamarin.sh negative

@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    PinUnlockActivity layout — V2 ratchet unlock.
+
+    Pas de bouton Retour, et ce n'est pas un oubli : on n'annule pas un
+    déverrouillage. Le back-press est rendu à l'appelant sous forme de
+    RESULT_CANCELED, côté Activity, et c'est lui qui décide de la suite.
+    Ne pas ajouter de sortie ici en harmonisant l'écran avec
+    fragment_onboard_set_pin.xml, qui en a un.
+
+    Cet écran et fragment_onboard_set_pin.xml sont volontairement tenus
+    identiques à l'œil : même fond @color/space_cadet, mêmes styles
+    Unlock_White_Text_*, même NoImeEditText pour les dots, même PinLockView
+    4×3 en pinLength="6". Une retouche visuelle de l'un doit être répercutée
+    sur l'autre, sinon les deux écrans PIN de l'app divergent. Aucun des deux
+    ne porte de wordmark : il a été retiré des écrans PIN (voir le commentaire
+    de unlockSubtitle plus bas). Le layout Tella dont cette structure descend
+    n'est plus dans le dépôt.
+
+    Pas de step indicator non plus : l'unlock n'est pas une séquence d'étapes.
+    Le fingerprint discret du bas, en revanche, n'est pas une décoration — son
+    rôle est écrit en regard de la vue.
+-->
+<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/space_cadet">
+
+    <!-- Sous-titre statique "PIN POUR DÉVERROUILLER" (mis à jour
+         dynamiquement à "DÉRIVATION DE LA CLÉ…" pendant Argon2id).
+         Head de la chaîne packed depuis le retrait du wordmark Frappuccino
+         (résidu police "Coffee Amore" ; les écrans PIN ne montrent plus que
+         le strict nécessaire). -->
+    <TextView
+        android:id="@+id/unlockSubtitle"
+        style="@style/Unlock_White_Text_Bold"
+        android:layout_marginTop="64dp"
+        android:text="@string/pin_unlock_title"
+        android:importantForAccessibility="yes"
+        android:focusable="true"
+        app:layout_constraintBottom_toTopOf="@+id/unlockDots"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintHorizontal_bias="0.5"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintVertical_chainStyle="packed" />
+
+    <!-- NoImeEditText pour afficher les chiffres saisis (style
+         Password_EditText les remplace par des dots ●●●●●●). -->
+    <rs.readahead.washington.mobile.views.pin.NoImeEditText
+        android:id="@+id/unlockDots"
+        style="@style/Password_EditText"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="20dp"
+        android:textColorHint="@color/dark_purple"
+        app:layout_constraintBottom_toTopOf="@+id/unlockError"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintTop_toBottomOf="@+id/unlockSubtitle"
+        tools:text="●●●●●●" />
+
+    <!-- Message d'erreur (PIN incorrect / lockout). -->
+    <TextView
+        android:id="@+id/unlockError"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:textColor="@color/wa_orange"
+        android:textSize="12sp"
+        android:fontFamily="monospace"
+        android:visibility="gone"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@+id/unlockDots"
+        tools:text="PIN incorrect (tentative 2)"
+        tools:visibility="visible" />
+
+    <!-- PinLockView 4×3, identique aux écrans onboarding. -->
+    <org.hzontal.shared_ui.pinview.PinLockView
+        android:id="@+id/unlockPinLockView"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:layout_marginTop="10dp"
+        app:keypadShowDeleteButton="true"
+        app:keypadTextColor="@color/wa_white"
+        app:keypadTextSize="@dimen/calc_text_size"
+        app:layout_constraintBottom_toTopOf="@+id/unlockFingerprint"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintHeight_percent=".45"
+        app:layout_constraintHorizontal_bias="0.5"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@+id/unlockError"
+        app:pinLength="6" />
+
+    <!-- Fingerprint de l'identité (signal "tu déverrouilles bien la
+         clé associée à TA phrase BIP-39"). Discret, monospace. -->
+    <TextView
+        android:id="@+id/unlockFingerprint"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="16dp"
+        android:textColor="#33FFFFFF"
+        android:textSize="10sp"
+        android:fontFamily="monospace"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        tools:text="abcd ef12 3456 7890 abcd ef12" />
+
+</androidx.constraintlayout.widget.ConstraintLayout>

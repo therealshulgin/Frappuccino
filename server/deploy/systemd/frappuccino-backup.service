@@ -1,0 +1,82 @@
+# Phase 1.x-prep (2026-05-19) — systemd unit invoked by
+# frappuccino-backup.timer. Single-shot : runs backup-state.sh, writes
+# the tarball into /opt/frappuccino/backups/, then exits.
+#
+# Pairs with frappuccino-backup.timer (the OnCalendar schedule).
+# Backups don't auto-rotate by default — add a cleanup line in the
+# ExecStart= block, or run a separate find-mtime cron, if you want
+# to bound disk usage. With therealshulgin's relay sized for ~hundreds of
+# MB of state for the foreseeable future, daily backups for 30 days
+# is fine in-place.
+#
+# Install :
+#   sudo cp server/deploy/systemd/frappuccino-backup.{service,timer} \
+#     /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now frappuccino-backup.timer
+#   sudo systemctl list-timers frappuccino-backup.timer
+
+[Unit]
+Description=Frappuccino relay state backup (server_state + minio_data)
+Documentation=https://github.com/therealshulgin/Frappuccino
+# Run after docker is up — backup-state.sh fails fast if not.
+Requires=docker.service
+After=docker.service
+# Don't pile up if a backup is somehow already running from the
+# previous fire (rare but possible if a 30-day archive grows huge
+# and the run overruns 24 h).
+ConditionPathExists=/opt/frappuccino/docker-compose.yml
+
+[Service]
+Type=oneshot
+# Backup-state.sh is sudo-friendly : runs `docker` which needs
+# either root or membership in the docker group. We run as root for
+# the systemd unit to keep the install simple ; the script itself is
+# fine to run as a non-root user that's in the docker group.
+User=root
+Group=root
+# Default backup dir = /opt/frappuccino/backups. Override via the
+# FRAPPUCCINO_BACKUP_DIR env if you want to push to an external
+# mount (NFS, sshfs, restic repo, etc.).
+Environment=FRAPPUCCINO_DEPLOY_DIR=/opt/frappuccino
+Environment=FRAPPUCCINO_BACKUP_DIR=/opt/frappuccino/backups
+# WP-A3 — at-rest encryption is MANDATORY. backup-state.sh REFUSES to write a
+# plaintext state dossier (it holds the enrolled-identity set). Set the age
+# RECIPIENT (public key, `age1…`) here; keep its IDENTITY (private key) OFF this
+# host. Generate a keypair off-host with `age-keygen`, paste only the public
+# line, then uncomment. Until this is set the unit fails loud (by design).
+#Environment=FRAPPUCCINO_BACKUP_AGE_RECIPIENT=age1REPLACE_WITH_RECIPIENT_PUBLIC_KEY
+ExecStart=/opt/frappuccino/deploy/backup-state.sh
+# Optional retention : prune backups older than 30 days after a
+# successful run. Comment out if you handle retention elsewhere
+# (e.g. restic snapshot policy, off-host rsync rotation).
+ExecStartPost=/usr/bin/find /opt/frappuccino/backups -name 'frappuccino-state-*.tar.gz.age' -mtime +30 -delete
+# Don't restart on failure : if backup fails, we don't want to retry
+# every few minutes burning CPU + disk. The timer will fire again
+# tomorrow. The Failed state is visible via `systemctl status
+# frappuccino-backup.service`.
+RemainAfterExit=no
+
+# WP-B4 (audit 2026-06-28) — sandbox. This unit streams the relay's UNENCRYPTED
+# state (the enrolled-identity set) through `tar | age` in THIS process before it
+# is encrypted to disk, so it's worth confining. Directives chosen to NOT break a
+# unit that shells out to `docker` (talks to /run/docker.sock — a socket connect,
+# unaffected by the read-only FS) and `age`:
+#   - root FS read-only except the backup dir (where the .age tarball + manifest
+#     land). If you point FRAPPUCCINO_BACKUP_DIR elsewhere, add it to ReadWritePaths.
+#   - /opt/frappuccino/backups must pre-exist (bootstrap creates it); ProtectSystem
+#     forbids creating it under the read-only parent.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/frappuccino/backups
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

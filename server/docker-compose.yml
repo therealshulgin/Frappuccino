@@ -1,0 +1,174 @@
+version: "3.8"
+
+services:
+  minio:
+    # WP-B4 (audit 2026-06-28) — pin by DIGEST, not the mutable `latest` tag, so a
+    # compromised/changed upstream image can't be silently pulled (supply chain).
+    # Digest = the image verified running on the relay 2026-06-29. To bump
+    # deliberately: `docker pull minio/minio:latest` then
+    # `docker inspect --format '{{index .RepoDigests 0}}' minio/minio:latest`,
+    # paste the new sha256 here, and redeploy (read the release notes first).
+    image: minio/minio:latest@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    # Without an explicit restart policy, a VPS reboot (kernel update, panel
+    # action, OOM kill) leaves the stack down silently: nginx is systemd-managed
+    # and comes back on the 8443 SSL block, but proxy_pass to 127.0.0.1:8000
+    # times out and the client sees StreamResetException / circuit_open cascades
+    # for hours, until someone notices and runs `docker compose up -d` by hand
+    # (field-test 2026-05-18). `unless-stopped` rather than `always`: dockerd
+    # resumes the container on crash and at boot, but a deliberate `docker stop`
+    # is still respected.
+    restart: unless-stopped
+    # Phase 8.1.6-C (audit 8.1.3) — bound the json-file log driver. Without
+    # max-size/max-file, container stdout/stderr accumulates indefinitely in
+    # /var/lib/docker/containers/<id>/<id>-json.log (a metadata sink + disk
+    # risk). 10 MB × 3 keeps recent diagnostics, caps growth at 30 MB.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    ports:
+      # Audit 2026-06-27 (R-SRV-2) — bind the S3 API to loopback ONLY. The app
+      # reaches MinIO over the internal docker bridge (MINIO_ENDPOINT: minio:9000),
+      # which does NOT use this published port, so loopback is sufficient. A bare
+      # "9000:9000" publishes on 0.0.0.0 and Docker's iptables rules bypass UFW,
+      # exposing the raw S3 surface to the internet despite `ufw default deny`.
+      - "127.0.0.1:9000:9000"
+      # 9001 (console) NOT exposed — access via internal network only
+    # Harden the MinIO container to the same posture as `server` below: no Linux
+    # capabilities, no privilege escalation, read-only root filesystem with a
+    # tmpfs for scratch (WP-B3, audit 2026-06-28).
+    #
+    # This is safe because MinIO needs none of what we take away: it binds
+    # 9000/9001, both > 1024, and file I/O to the data volume is plain DAC, not a
+    # capability. Under read_only it writes ONLY to the `minio_data` volume —
+    # objects and its own config/state live in the backend `/data/.minio.sys`,
+    # NOT in $HOME — and to the tmpfs `/tmp`, where any incidental mc scratch
+    # lands. The `mc ready local` healthcheck just reads the alias baked into the
+    # image, which read_only doesn't affect; MinIO's own official compose uses
+    # the same bare `mc ready local`.
+    #
+    # Takes effect at the next `docker compose up -d` (operator geste, like B1).
+    # Check afterwards: `docker compose ps` must show minio `(healthy)` within
+    # ~30 s. If it stays `unhealthy`/`starting`, this image's mc wants a writable
+    # config dir — add `MC_CONFIG_DIR: /tmp/.mc` to the environment (tmpfs-backed)
+    # and redeploy, rather than reaching for the hardening. Should it ever come to
+    # a rollback, that is the four directives below (read_only/tmpfs/cap_drop/
+    # security_opt); the data volume and all other config are untouched.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  server:
+    build: .
+    # See `minio` above for restart policy rationale (field-test
+    # 2026-05-18). `depends_on.minio.service_healthy` still gates the
+    # initial boot order ; for restart-after-crash, dockerd brings
+    # this service back regardless and the FastAPI app will reconnect
+    # to MinIO once it's up (MinIO comes up first via its own
+    # `unless-stopped` + faster healthcheck).
+    restart: unless-stopped
+    # Phase 8.1.6-C (audit 8.1.3) — bound the json-file log driver (see minio).
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    ports:
+      # Bind the API to loopback ONLY, mirroring the MinIO R-SRV-2 fix above
+      # (WP-B1, audit 2026-06-28 / H-3). nginx runs on the HOST and reverse-proxies
+      # 8443 -> 127.0.0.1:8000 (TLS terminator + cert pinning), so loopback is
+      # sufficient. A bare "8000:8000" publishes on 0.0.0.0 and Docker's iptables
+      # DNAT rules bypass UFW (`ufw default deny` is NOT consulted for
+      # Docker-published ports), exposing the cleartext, non-pinned FastAPI
+      # surface to the internet and defeating the TLS + pinning contract. uvicorn
+      # still binds 0.0.0.0 INSIDE the container (Dockerfile CMD) — that's the
+      # container interface Docker forwards to; the security boundary is THIS
+      # published-port binding, not the in-container host.
+      - "127.0.0.1:8000:8000"
+    environment:
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD}
+      # Phase 6.1.2 — honour the MINIO_SECURE flag from .env (was hardcoded
+      # "false", which silently ignored the operator's setting). Default stays
+      # false: server↔MinIO runs on the internal docker bridge in HTTP. Flip to
+      # true (domain/prod hardening) ONLY after provisioning MinIO TLS certs
+      # (drop a cert+key in MinIO's certs dir) — otherwise the client handshake
+      # to a plaintext MinIO fails. See deploy/README.md (IP→domain flip).
+      MINIO_SECURE: "${MINIO_SECURE:-false}"
+      MINIO_BUCKET: stream-blobs
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET}
+      # V2 : persistance de l'état ratchet (registre des identités enrôlées).
+      RATCHET_REGISTRY_FILE: /state/ratchet_registry.json
+      # BT-HIGH-13 : nonce cache persisté pour survivre aux restarts
+      # (sinon fenêtre de rejeu 60s sur tous les nonces capturés en vol).
+      NONCE_CACHE_FILE: /state/nonce_cache.json
+      # Phase 3.46-fix — reports DB doit être dans /state (le seul volume
+      # writable). Default `data/reports.json` est relatif au CWD `/app`
+      # qui est read-only (Dockerfile chmod + compose read_only=true). Sans
+      # cet override, create_report() crash sur ENOENT/EROFS et
+      # /project/default renvoie 500 → client crash sur JSONObject("")
+      # dans StreamRecordingService.initServerSession:1114.
+      REPORTS_DB_PATH: /state/reports.json
+    volumes:
+      - server_state:/state
+    # Must match the `stream` user created in the Dockerfile (Phase 6.1.7 — UID 1001).
+    # Phase 3.37-redeploy (2026-05-14) — was 1000:1000 historically, but since
+    # commit f525bb6 the Dockerfile pins UID 1001 with `chmod -R u=rX,g=,o= /app`,
+    # so a 1000-runtime user got no read perm on /app and uvicorn failed with
+    # `ModuleNotFoundError: No module named 'app'`. Aligning compose → Dockerfile
+    # closes the drift.
+    user: "1001:1001"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # A healthcheck on top of `restart: unless-stopped`, which only catches a
+    # process crash (Blue Team HIGH-8 / Blue MED-8). If uvicorn's asyncio loop
+    # wedges on an unexpected blocking call — slow fsync, runaway lock — the
+    # container stays "up" while every request 500s or times out, and dockerd
+    # sees nothing wrong.
+    #
+    # /health must NEVER touch MinIO. It only returns {"status":"ok"} from the
+    # /health route in app/main.py, and that is the point: a slow or dead MinIO
+    # would otherwise bounce this container in a loop. MinIO has its own
+    # healthcheck for its own liveness. The route is rate-limited to 30/minute by
+    # slowapi, which also bounds how fast anything outside can probe it.
+    #
+    # The probe is a python urllib one-liner because curl is absent from the slim
+    # image (Python 3.12 ships urllib in stdlib). Interval 30 s with 3 retries is
+    # ≈ 3 min of brokenness before a restart fires: generous enough to absorb a
+    # GC pause on a low-end VPS, tight enough that a real wedge clears in under
+    # 5 min unattended.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      minio:
+        condition: service_healthy
+
+volumes:
+  minio_data:
+  server_state:  # V2 : persistance ratchet + identités autorisées

@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Per-report row layout for the archive retrieval RecyclerView. Tap =
+  download all blobs of this report. Monospace + dark theme to match the rest
+  of the archive mode UI.
+
+  Never hardcode `visibility` or `alpha` in this row, and never move that
+  logic to the view side. The checkmark ships GONE and this layout sets no
+  `alpha` at all; the adapter repositions both on every bind, on both
+  branches, and a value fixed here would fight it.
+
+  And never remove a row from the list once its report has been downloaded.
+  The "✓ + faded" cue exists precisely so the row can stay: the user can then
+  re-download it, or explicitly pick the ones still remaining.
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="horizontal"
+    android:gravity="center_vertical"
+    android:padding="12dp"
+    android:layout_marginBottom="8dp"
+    android:background="@color/wa_darker_gray"
+    android:clickable="true"
+    android:focusable="true"
+    android:foreground="?attr/selectableItemBackground">
+
+    <LinearLayout
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:orientation="vertical">
+
+        <TextView
+            android:id="@+id/reportTitle"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textColor="@color/wa_white"
+            android:textSize="14sp"
+            android:fontFamily="monospace"
+            android:textStyle="bold"
+            tools:text="Report ABC123" />
+
+        <TextView
+            android:id="@+id/reportSummary"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:textColor="@color/wa_gray"
+            android:textSize="11sp"
+            android:fontFamily="monospace"
+            tools:text="12 blobs • 24 MB" />
+
+        <TextView
+            android:id="@+id/reportCreatedAt"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:textColor="@color/wa_gray"
+            android:textSize="10sp"
+            android:fontFamily="monospace"
+            tools:text="2026-05-15T12:34:00Z" />
+
+    </LinearLayout>
+
+    <!-- Checkmark slot, GONE by default, set to VISIBLE
+         by ArchiveReportsAdapter.markDownloaded(). Big and green so
+         it stands out at a glance ; the colored hex is inline to
+         avoid yet another color resource for a one-off accent. -->
+    <TextView
+        android:id="@+id/reportDownloadedCheck"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="12dp"
+        android:text="@string/archive_report_downloaded"
+        android:textSize="24sp"
+        android:textStyle="bold"
+        android:textColor="#3FE36B"
+        android:visibility="gone"
+        tools:visibility="visible" />
+
+</LinearLayout>

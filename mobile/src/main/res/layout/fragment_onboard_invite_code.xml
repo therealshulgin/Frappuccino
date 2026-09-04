@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/wa_purple"
+    android:padding="21dp">
+
+    <androidx.constraintlayout.widget.Guideline
+        android:id="@+id/guidelineCenter"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        app:layout_constraintGuide_percent="0.35" />
+
+    <TextView
+        android:id="@+id/title"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:text="@string/onboard_invite_code_title"
+        android:textSize="24sp"
+        android:textStyle="bold"
+        android:textColor="@color/wa_white"
+        android:fontFamily="@font/open_sans"
+        android:gravity="center"
+        app:layout_constraintBottom_toTopOf="@id/subtitle"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
+
+    <TextView
+        android:id="@+id/subtitle"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:text="@string/onboard_invite_code_explanation"
+        android:textSize="14sp"
+        android:textColor="@color/wa_white_80"
+        android:fontFamily="@font/open_sans"
+        android:gravity="center"
+        android:layout_marginTop="8dp"
+        android:layout_marginBottom="24dp"
+        app:layout_constraintTop_toBottomOf="@id/guidelineCenter"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
+
+    <EditText
+        android:id="@+id/inviteCodeInput"
+        android:layout_width="0dp"
+        android:layout_height="48dp"
+        android:background="@drawable/round_button_selector"
+        android:textColor="@color/wa_white"
+        android:textColorHint="@color/wa_white_80"
+        android:hint="@string/onboard_invite_code_hint"
+        android:inputType="textVisiblePassword"
+        android:padding="12dp"
+        android:fontFamily="@font/open_sans"
+        android:textSize="14sp"
+        android:layout_marginTop="16dp"
+        app:layout_constraintTop_toBottomOf="@id/subtitle"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
+
+    <TextView
+        android:id="@+id/validateBtn"
+        android:layout_width="match_parent"
+        android:layout_height="50dp"
+        android:background="@drawable/round_orange_button_selector"
+        app:backgroundTint="@color/wa_orange"
+        android:text="@string/onboard_invite_code_validate"
+        android:textColor="@color/btn_dark_letter"
+        android:textSize="16sp"
+        android:textStyle="bold"
+        android:textAllCaps="true"
+        android:fontFamily="@font/open_sans"
+        android:gravity="center"
+        android:layout_marginTop="24dp"
+        app:layout_constraintTop_toBottomOf="@id/inviteCodeInput"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
+
+    <TextView
+        android:id="@+id/skipBtn"
+        android:layout_width="match_parent"
+        android:layout_height="50dp"
+        android:background="@drawable/round_button_selector"
+        android:text="@string/onboard_invite_code_skip"
+        android:textColor="@color/wa_white"
+        android:textSize="16sp"
+        android:textStyle="bold"
+        android:textAllCaps="true"
+        android:fontFamily="@font/open_sans"
+        android:gravity="center"
+        android:layout_marginTop="12dp"
+        app:layout_constraintTop_toBottomOf="@id/validateBtn"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
+
+    <TextView
+        android:id="@+id/backBtn"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="@string/action_back"
+        android:textColor="@color/wa_white"
+        android:textSize="14sp"
+        android:fontFamily="@font/open_sans"
+        android:gravity="center"
+        android:paddingBottom="16dp"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
+
+</androidx.constraintlayout.widget.ConstraintLayout>

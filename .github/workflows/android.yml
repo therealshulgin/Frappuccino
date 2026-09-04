@@ -1,0 +1,409 @@
+name: Android build + tests
+
+# The Android half of the build had no CI at all: five workflows covered Rust,
+# the Python relay, the formal proofs and static analysis, and not one of them
+# ever ran Gradle. Nothing outside a developer laptop compiled a line of Kotlin,
+# packaged an APK, or loaded the crypto .so. An external auditability review
+# (2026-08-28, finding F-03) named it, and it is the gap this workflow closes.
+#
+# WHAT IT PROVES, IN ORDER
+#   native-libs  the shipped .so are BUILT FROM SOURCE here, not carried in --
+#                mobile/src/main/jniLibs/ is gitignored, so a clean clone has no
+#                binary at all and this job is the only thing that puts one back.
+#   apk          the Kotlin compiles, the unit tests pass, the .so gates fire,
+#                and the packaged APK really contains the native libraries.
+#   instrumented the x86_64 .so loads on a live Android system and the UniFFI
+#                bridge answers across JNA -- the on-device half a host JVM
+#                cannot stand in for.
+#   difffuzz     the Kotlin<->Rust marshalling glue agrees with Rust on a
+#                deterministic corpus.
+#
+# EVERY JOB KEEPS A CONTROL THAT CAN FAIL, same rule as proofs.yml. Two of them
+# are deliberate sabotage: a corrupted .so that checkSoProvenance must reject,
+# and a corrupted corpus line the diff-fuzz harness must report. The rule earned
+# its place the hard way -- on 2026-08-28 three jobs in this repo were red on
+# their own arguments, and the one checking dependencies had been hiding a
+# remote memory-exhaustion advisory in the upload transport for as long as it
+# had been broken. A check that fails before it checks anything is worse than no
+# check: it looks like coverage.
+#
+# WHAT IS DELIBERATELY NOT HERE
+#   Release signing. mobile/keystore.properties is absent on CI by design, so
+#   assembleRelease would emit an unsigned APK. The signing key is not a CI
+#   secret and must not become one; the release APK is signed on the release
+#   machine.
+#   A self-hosted runner on a maintainer's phone or workstation. On a public
+#   repository any pull request would then execute arbitrary code on that
+#   machine. The emulator below is the automatable half; a real handset stays a
+#   manual pre-release step.
+
+on:
+  push:
+    paths:
+      - 'mobile/**'
+      - 'stream-crypto/**'
+      - 'shared-ui/**'
+      - 'crypto-rs/**'
+      - 'build.gradle'
+      - 'settings.gradle'
+      - 'gradle.properties'
+      - 'gradle/**'
+      - 'gradlew'
+      - '.github/workflows/android.yml'
+  pull_request:
+    paths:
+      - 'mobile/**'
+      - 'stream-crypto/**'
+      - 'shared-ui/**'
+      - 'crypto-rs/**'
+      - 'build.gradle'
+      - 'settings.gradle'
+      - 'gradle.properties'
+      - 'gradle/**'
+      - 'gradlew'
+      - '.github/workflows/android.yml'
+  workflow_dispatch:
+
+env:
+  # Pinned, not "whatever the runner image ships". The runner's preinstalled NDK
+  # moves with the image and would silently change the compiler behind the
+  # shipped binary. This is the same version as the release machine, so the
+  # binary CI builds and the one that gets field-tested on a handset come out of
+  # the same toolchain; a bump here is a deliberate act on both sides. Note this
+  # is not bit-for-bit reproducibility -- build-android.sh pins neither
+  # SOURCE_DATE_EPOCH nor --remap-path-prefix, and the absolute source paths
+  # differ between a Windows checkout and this runner, so the digests will not
+  # match across the two. Same toolchain, not same bytes.
+  NDK_VERSION: '30.0.14904198'
+  CARGO_NDK_VERSION: '4.1.2'
+  # The Rust toolchain itself is pinned by crypto-rs/rust-toolchain.toml, which
+  # also declares the three Android targets, so `rustup show` installs the lot.
+  CARGO_TERM_COLOR: always
+
+jobs:
+  native-libs:
+    name: crypto .so (3 ABIs) + libtcpcc, from source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # No `set -e` here, deliberately. sdkmanager's exit code is not the evidence
+      # that the NDK is installed; the directory is. The first version of this
+      # step piped `yes` into sdkmanager under `set -euo pipefail`, which turns a
+      # perfectly normal SIGPIPE on the writer into a job failure, and sent the
+      # output to /dev/null so the log could not say what happened. It failed on
+      # its own plumbing and told nobody why.
+      - name: Install the pinned NDK
+        run: |
+          set -uo pipefail
+          sdk="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          test -n "$sdk" || { echo "neither ANDROID_SDK_ROOT nor ANDROID_HOME is set"; exit 1; }
+          mgr="$sdk/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$mgr" ]; then
+            mgr="$(find "$sdk/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -1)"
+          fi
+          test -n "$mgr" && test -x "$mgr" || {
+            echo "sdkmanager not found under $sdk/cmdline-tools:"
+            ls -R "$sdk/cmdline-tools" 2>/dev/null | head -40
+            exit 1
+          }
+          echo "sdkmanager: $mgr"
+          printf 'y\n' | "$mgr" --install "ndk;${NDK_VERSION}" || echo "sdkmanager returned $?"
+          ndk="$sdk/ndk/${NDK_VERSION}"
+          test -d "$ndk" || {
+            echo "NDK ${NDK_VERSION} is absent after the install. Present instead:"
+            ls "$sdk/ndk" 2>/dev/null || echo "  (no ndk directory at all)"
+            exit 1
+          }
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+
+      - name: Rust toolchain (pinned by crypto-rs/rust-toolchain.toml)
+        working-directory: crypto-rs
+        run: rustup show
+
+      - name: Cache cargo registry, target dir and cargo-ndk
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            crypto-rs/target
+          key: ${{ runner.os }}-android-cargo-${{ env.CARGO_NDK_VERSION }}-${{ hashFiles('crypto-rs/Cargo.lock', 'crypto-rs/**/Cargo.toml') }}
+
+      - name: Install cargo-ndk (pinned)
+        run: |
+          set -euo pipefail
+          have="$(cargo ndk --version 2>/dev/null | awk '{print $2}' || true)"
+          if [ "$have" != "${CARGO_NDK_VERSION}" ]; then
+            cargo install cargo-ndk --version "${CARGO_NDK_VERSION}" --locked
+          fi
+
+      # Also regenerates the Kotlin UniFFI bindings under
+      # stream-crypto/build/generated/ and rewrites crypto-rs/PROVENANCE.txt,
+      # both of which the apk and instrumented jobs need.
+      - name: Build libuniffi_frappuccino.so for the three shipped ABIs
+        run: bash crypto-rs/build-android.sh
+
+      - name: Build libtcpcc.so for the same ABIs
+        run: bash mobile/src/main/cpp/build-tcpcc.sh
+
+      - name: Every ABI must have produced both libraries
+        run: |
+          set -euo pipefail
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            for lib in libuniffi_frappuccino.so libtcpcc.so; do
+              f="mobile/src/main/jniLibs/$abi/$lib"
+              test -s "$f" || { echo "missing or empty: $f"; exit 1; }
+              echo "  ok  $f  ($(stat -c%s "$f") bytes)"
+            done
+          done
+          n="$(grep -c '^sha256:' crypto-rs/PROVENANCE.txt)"
+          test "$n" -eq 3 || { echo "PROVENANCE.txt records $n ABI digests, expected 3"; cat crypto-rs/PROVENANCE.txt; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-libs
+          if-no-files-found: error
+          path: |
+            mobile/src/main/jniLibs/**
+            crypto-rs/PROVENANCE.txt
+            stream-crypto/build/generated/source/uniffi/**
+
+  apk:
+    name: assembleDebug, unit tests, lint
+    needs: native-libs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # JDK 17. The build needs it and does not carry a path to it: KAPT stub
+      # generation breaks under the JDK 21 that Android Studio bundles, which is
+      # why gradle.properties explains where each context gets its pin.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-libs
+
+      - name: Negative control -- checkSoProvenance must reject a tampered .so
+        run: |
+          set -euo pipefail
+          so=mobile/src/main/jniLibs/x86_64/libuniffi_frappuccino.so
+          cp -p "$so" "$so.orig"
+          # One byte is enough: the gate is a SHA-256 comparison against
+          # PROVENANCE.txt, so any edit at all must move the digest.
+          printf '\x7f' | dd of="$so" bs=1 seek=16 count=1 conv=notrunc status=none
+          if ./gradlew --quiet :mobile:checkSoProvenance; then
+            mv "$so.orig" "$so"
+            echo "FAIL: checkSoProvenance accepted a modified .so. On CI the manifest is"
+            echo "regenerated from the very binaries it then checks, so without this control"
+            echo "the gate would pass by construction and prove nothing."
+            exit 1
+          fi
+          mv "$so.orig" "$so"
+          echo "ok: the tampered .so was rejected"
+
+      # preBuild depends on checkRustSoFresh and checkSoProvenance, so this also
+      # asserts the .so embed the current SPKI pin set and were built with
+      # --features quic.
+      - name: assembleDebug
+        run: ./gradlew :mobile:assembleDebug
+
+      - name: JVM unit tests
+        run: ./gradlew testDebugUnitTest
+
+      # Compiling the instrumented tests here, rather than only inside the
+      # emulator job, separates "the test code still builds" from "the emulator
+      # booted". The first is the failure that actually happens -- a renamed
+      # symbol, a dropped androidTest dependency, the src/androidTestRust source
+      # set losing its generated UniFFI bindings -- and it should not be reported
+      # as an emulator problem.
+      - name: Compile the instrumented tests
+        run: ./gradlew :mobile:assembleDebugAndroidTest
+
+      # mobile/lint-baseline.xml holds the 32 errors and 201 warnings that were
+      # already in the tree when lint first ran, so this task fails on a NEW
+      # finding only. See the lint block in mobile/build.gradle for what that
+      # trade does and does not buy.
+      - name: Android lint
+        run: ./gradlew :mobile:lintDebug
+
+      - name: Negative control -- lint must fail without its baseline
+        run: |
+          set -euo pipefail
+          b=mobile/lint-baseline.xml
+          test -f "$b" || { echo "$b is missing; the lint step above passed by having nothing to compare against"; exit 1; }
+          mv "$b" "$RUNNER_TEMP/lint-baseline.xml"
+          if ./gradlew :mobile:lintDebug; then
+            mv "$RUNNER_TEMP/lint-baseline.xml" "$b"
+            echo "FAIL: lint reported nothing with the baseline removed, so the green run above"
+            echo "was not lint passing -- it was lint not looking. Check that the task actually"
+            echo "analyses the sources rather than being filtered down to zero."
+            exit 1
+          fi
+          mv "$RUNNER_TEMP/lint-baseline.xml" "$b"
+          echo "ok: lint still finds the baselined issues, so the baseline is what makes it green"
+
+      - name: The APK must actually carry the native libraries
+        run: |
+          set -euo pipefail
+          # -print -quit rather than a pipe into head: under `set -o pipefail`,
+          # head closing the pipe early makes find exit non-zero and takes the
+          # step down for no reason.
+          apk="$(find mobile/build/outputs/apk/debug -name '*.apk' -print -quit)"
+          test -n "$apk" || { echo "no debug APK produced"; exit 1; }
+          echo "APK: $apk"
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            for lib in libuniffi_frappuccino.so libtcpcc.so; do
+              unzip -l "$apk" "lib/$abi/$lib" | grep -q "lib/$abi/$lib" \
+                || { echo "APK does not contain lib/$abi/$lib"; exit 1; }
+              echo "  ok  lib/$abi/$lib"
+            done
+          done
+
+      # Not `if: always()`: on a failed build there is no APK, and an upload
+      # erroring on the missing file would just bury the real failure.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debug-apk
+          if-no-files-found: error
+          path: |
+            mobile/build/outputs/apk/debug/*.apk
+            crypto-rs/PROVENANCE.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reports
+          if-no-files-found: warn
+          path: |
+            mobile/build/reports/**
+            stream-crypto/build/reports/**
+
+  instrumented:
+    name: connectedAndroidTest on an emulator
+    needs: native-libs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-libs
+
+      # Without this the emulator falls back to software rendering and takes
+      # long enough to hit the job timeout.
+      - name: Give the runner access to KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      # Pinned to a commit, not to the moving v2 tag: this is the one third-party
+      # action in the workflow and it runs before our own code does. Booting an
+      # emulator by hand is where CI jobs go to die -- boot-completion polling,
+      # timeouts, flaky snapshots -- and a job that fails on its own scaffolding
+      # is exactly the failure mode this workflow exists to avoid.
+      - name: connectedDebugAndroidTest (API 34, x86_64)
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: ./gradlew :mobile:connectedDebugAndroidTest
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: instrumented-reports
+          if-no-files-found: warn
+          path: mobile/build/reports/androidTests/**
+
+  difffuzz:
+    name: Kotlin<->Rust differential fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Rust toolchain (pinned by crypto-rs/rust-toolchain.toml)
+        working-directory: crypto-rs
+        run: rustup show
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crypto-rs/target
+          key: ${{ runner.os }}-difffuzz-cargo-${{ hashFiles('crypto-rs/Cargo.lock') }}
+
+      # The host cdylib, which JNA loads exactly as Android loads the .so: same
+      # UniFFI codegen, same marshalling path, so a divergence here is a
+      # divergence on-device.
+      - name: Build the host FFI cdylib
+        working-directory: crypto-rs
+        run: cargo build -p frappuccino-crypto-ffi
+
+      - name: Generate the Kotlin bindings for the harness
+        working-directory: crypto-rs
+        run: |
+          cargo run -p frappuccino-crypto-ffi --bin uniffi-bindgen -- \
+            generate ffi/src/frappuccino.udl --language kotlin \
+            --out-dir difffuzz-jvm/src/main/kotlin
+
+      - name: Emit the corpus (deterministic seed)
+        working-directory: crypto-rs
+        run: |
+          cargo run -p frappuccino-cli --bin frappuccino-difffuzz-dump -- 0x5EED_2026 150 \
+            > "$RUNNER_TEMP/difffuzz-corpus.jsonl"
+          wc -l < "$RUNNER_TEMP/difffuzz-corpus.jsonl"
+
+      - name: Replay the corpus through the Kotlin bindings
+        run: ./gradlew -p crypto-rs/difffuzz-jvm run --args="$RUNNER_TEMP/difffuzz-corpus.jsonl"
+
+      - name: Negative control -- a corrupted expected outcome must be reported
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/difffuzz-corpus.jsonl" "$RUNNER_TEMP/difffuzz-corpus-nc.jsonl" <<'PY'
+          import json, sys
+          src, dst = sys.argv[1], sys.argv[2]
+          lines = open(src, encoding="utf-8").read().splitlines()
+          case = json.loads(lines[0])
+          # expectedCanon() maps an unknown tag to "unknown_tag:<tag>", a string
+          # no replayed outcome can ever equal. One mismatch is all we need.
+          case["outcome"]["tag"] = "forced_mismatch"
+          lines[0] = json.dumps(case)
+          # newline="\n": without it the rewrite is line-ending-dependent, and on a
+          # Windows checkout it would silently alter all 759 lines instead of one.
+          open(dst, "w", encoding="utf-8", newline="\n").write("\n".join(lines) + "\n")
+          PY
+          if ./gradlew -p crypto-rs/difffuzz-jvm run --args="$RUNNER_TEMP/difffuzz-corpus-nc.jsonl"; then
+            echo "FAIL: the harness reported success on a corpus it should have disagreed with."
+            echo "It counts matches and exits non-zero only when one differs -- if that path is"
+            echo "broken, a green run above means nothing was compared."
+            exit 1
+          fi
+          echo "ok: the mismatch was caught"

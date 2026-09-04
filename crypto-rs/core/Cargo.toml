@@ -1,0 +1,49 @@
+[package]
+name = "frappuccino-crypto-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Pure-Rust crypto primitives for Frappuccino: BIP-39, identity derivation, ratchet, PIN-protected store, secure memory."
+
+[lib]
+name = "frappuccino_crypto_core"
+
+[dependencies]
+# Exact versions pinned per Rust_guidelines.md ("Pin dependencies precisely").
+# A caret dep like "0.12" silently widens the audit surface on minor bumps;
+# a reproducible crypto build must lock these values. Update deliberately
+# via targeted PRs with `cargo audit` proof in the commit message.
+argon2                = { version = "=0.5.3", features = ["zeroize"] }   # S4 — KDF
+blake2                = "=0.10.6"                                        # S6 — nonce derivation for crypto_box_seal
+chacha20poly1305      = { version = "=0.10.1", features = ["alloc"] }    # S4 — XChaCha20-Poly1305-IETF
+crypto_box            = { version = "=0.9.1", features = ["salsa20"] }   # S6 — NaCl crypto_box (XSalsa20-Poly1305)
+ed25519-dalek         = { version = "=2.2.0", features = ["zeroize"] }   # S3
+hmac                  = "=0.12.1"
+hkdf                  = "=0.12.4"     # S2
+memsec                = "=0.7.0"      # S2 — mlock wrapping for LockedSecret
+x25519-dalek          = { version = "=2.0.1", features = ["zeroize", "static_secrets"] }  # S3
+pbkdf2                = { version = "=0.12.2", default-features = false }
+secrecy               = "=0.8.0"      # S2 — Secret<T> wrapper
+sha2                  = "=0.10.9"
+subtle                = "=2.6.1"  # S5 — constant-time MAC comparison
+unicode-normalization = "=0.1.25"
+zeroize               = { version = "=1.8.2", features = ["derive"] }
+rand_core             = { version = "=0.6.4", features = ["std"] }
+thiserror             = "=1.0.69"
+
+[dev-dependencies]
+hex        = "=0.4.3"
+serde      = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.149"
+proptest   = "=1.8.0"   # property-based round-trip + ratchet FSM-invariant tests
+# R-C-1: cryptographically verify ratchet signatures (over the domain-prefixed
+# message) in the parity tests, rather than byte-matching a now-unregenerable
+# frozen value. Same pin as the normal dependency above.
+ed25519-dalek = "=2.2.0"
+
+[lints]
+workspace = true

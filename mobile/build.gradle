@@ -1,0 +1,558 @@
+plugins {
+    id 'com.android.application'
+    id 'kotlin-android'
+    id 'kotlin-kapt'
+    id 'dagger.hilt.android.plugin'
+}
+
+// Git short hash exposé en BuildConfig.GIT_HASH pour la
+// section ABOUT de StreamSettingsActivity. Fallback "unknown" seulement
+// quand git n'est pas lançable du tout (binaire absent du PATH) : dans un
+// arbre sans métadonnées git, git démarre, échoue, et GIT_HASH se retrouve
+// vide plutôt qu'à "unknown".
+def gitHashShort = {
+    try {
+        return "git rev-parse --short HEAD".execute(null, project.rootDir)
+            .text.trim()
+    } catch (Throwable ignored) {
+        return "unknown"
+    }
+}()
+
+// Do not drop this guard. Editing `crypto-rs/stream/src/pin.rs` (or any
+// other crypto-rs source) without re-running `build-android.sh` leaves a
+// stale .so in jniLibs/, and the gradle build packages it into the APK
+// without a word. Nothing fails at build time: the symptom appears at
+// runtime, as a TLS handshake failure, because rustls compares the live
+// server SPKI against the OLD pin embedded in the .so. Observed
+// 2026-05-15 : an SPKI rotation (commit 3c1245a) stayed invisible for
+// almost a day, the .so having been built 6 days earlier on a different
+// cert. (Phase 3.X-devops.)
+tasks.register('checkRustSoFresh') {
+    group = 'verification'
+    description = 'Fails if jniLibs .so is older than any source that requires rebuilding it (pin.rs, the UniFFI surface) OR does not embed every SPKI pin (primary + 2 break-glass) OR was built without --features quic'
+    doLast {
+        def pin = file("$rootDir/crypto-rs/stream/src/pin.rs")
+        def so  = file("$projectDir/src/main/jniLibs/arm64-v8a/libuniffi_frappuccino.so")
+        if (!pin.exists()) {
+            return // crypto-rs not present (e.g. partial checkout) — skip silently
+        }
+        if (!so.exists()) {
+            // .so missing entirely : the next launch will crash on
+            // System.loadLibrary, give a louder hint here.
+            throw new GradleException(
+                "libuniffi_frappuccino.so missing in jniLibs/arm64-v8a. " +
+                "Run `bash crypto-rs/build-android.sh` first."
+            )
+        }
+        // Sources whose edit REQUIRES rebuilding the .so. For a long time this
+        // watched pin.rs alone, which left a real hole: editing the UniFFI
+        // surface regenerates the Kotlin bindings at build time but does NOT
+        // rebuild the .so, so an APK could ship fresh bindings against a stale
+        // binary with nothing to say so. The 2026-09-03 surface reduction was
+        // exactly such an edit, and this guard could not see it.
+        def watched = [
+            'pin.rs'                 : pin,
+            'ffi/frappuccino.udl'    : file("$rootDir/crypto-rs/ffi/src/frappuccino.udl"),
+            'ffi/lib.rs'             : file("$rootDir/crypto-rs/ffi/src/lib.rs"),
+        ].findAll { name, f -> f.exists() }
+        def stale = watched.findAll { name, f -> so.lastModified() < f.lastModified() }
+        if (!stale.isEmpty()) {
+            def soDate = new Date(so.lastModified()).format('yyyy-MM-dd HH:mm:ss')
+            def rows = stale.collect { name, f ->
+                "  " + name.padRight(24) + new Date(f.lastModified()).format('yyyy-MM-dd HH:mm:ss')
+            }.join("\n")
+            throw new GradleException(
+                "Rust .so is older than a source that requires rebuilding it.\n" +
+                rows + "\n" +
+                "  libuniffi_frappuccino.so: $soDate (arm64-v8a)\n" +
+                "Run `bash crypto-rs/build-android.sh` to rebuild." +
+                "\nFor a partial build: TARGETS=arm64-v8a bash crypto-rs/build-android.sh"
+            )
+        }
+        // Value-grep (audit 2026-06-27, Lot 3 D-2 break-glass 2-pins): the mtime
+        // check above cannot catch a .so rebuilt from a DIFFERENT pin value (stale
+        // branch, hand-built .so, a dropped break-glass pin). Assert every shipped
+        // .so actually EMBEDS every SPKI pin declared in pin.rs (primary + the 2
+        // break-glass: live next and off-host next2), so a rebuild can never
+        // silently ship a binary that no longer trusts the break-glass key. Closes
+        // the "freshness = mtime only" gap the runbook §4 flagged.
+        def pinVals = (pin.text =~ /PIN_(?:SHA256|NEXT2?)_B64\s*:\s*&str\s*=\s*"([^"]+)"/)
+            .collect { it[1] }
+        if (pinVals.size() < 3) {
+            throw new GradleException(
+                "checkRustSoFresh: expected 3 SPKI pins (primary + 2 break-glass: live next " +
+                "+ off-host next2) in pin.rs, found ${pinVals.size()} — the 3-pin invariant is broken.")
+        }
+        // A .so built without `--features quic` makes the ObfQuic transport
+        // silently fall back to DirectTls — no QUIC/Salamander, no DPI resistance —
+        // and nothing else catches it: the mtime check and the SPKI grep above are
+        // both blind to a missing feature. Hence this gate (E3, WP-E, audit F-D3).
+        // The marker it looks for is the ObfQuic obfuscation PSK, which lives in
+        // the quic-gated module `crypto-rs/stream/src/quic.rs`, so it is embedded
+        // in the .so **iff** quic was compiled in. Read from source rather than
+        // hardcoded, so a PSK rotation before release updates the gate
+        // automatically, exactly like the SPKI pins above. build-android.sh defaults
+        // to the feature; a deliberate FEATURES="" build makes a DirectTls-only .so
+        // for size measurement, and that is the one build where this gate is
+        // expected to fire.
+        def quicSrc = file("$rootDir/crypto-rs/stream/src/quic.rs")
+        def quicMarkers = quicSrc.exists()
+            ? (quicSrc.text =~ /obfs_psk:\s*Some\(\s*b"([0-9a-fA-F]{32,})"/).collect { it[1] }
+            : []
+        if (quicSrc.exists() && quicMarkers.isEmpty()) {
+            throw new GradleException(
+                "checkRustSoFresh: could not extract the ObfQuic PSK marker from " +
+                "crypto-rs/stream/src/quic.rs (the obfs_psk literal moved or changed shape). " +
+                "Update this gate's regex so the --features quic check keeps working.")
+        }
+        def quicMarker = quicMarkers.isEmpty() ? null : quicMarkers[0]
+        ['arm64-v8a', 'armeabi-v7a', 'x86_64'].each { abi ->
+            def sof = file("$projectDir/src/main/jniLibs/$abi/libuniffi_frappuccino.so")
+            if (!sof.exists()) {
+                return // ABI not built in this variant; the arm64 gate above still fired
+            }
+            // Read as ISO-8859-1 so every byte maps 1:1 to a char; the base64 pins
+            // are ASCII, so a substring search is an exact byte-grep of the .so.
+            def hay = new String(sof.bytes, 'ISO-8859-1')
+            pinVals.each { pv ->
+                if (!hay.contains(pv)) {
+                    throw new GradleException(
+                        "checkRustSoFresh: jniLibs/$abi/libuniffi_frappuccino.so does NOT " +
+                        "embed the SPKI pin '$pv' from pin.rs.\nThe .so is out of sync with " +
+                        "the pin set. Run `bash crypto-rs/build-android.sh` to rebuild.")
+                }
+            }
+            // The shipped .so decodes STRM V3 only. `legacy-strm` is a CLI-side
+            // Cargo feature, but Cargo unifies features across a shared build
+            // graph: build the FFI in a graph that also holds the CLI and the
+            // stream crate comes back parsing V1/V2, putting the legacy header
+            // surface into the library this task is about to package. Nothing
+            // else here would notice. The marker is a `#[used]` static compiled
+            // in only under that feature (crypto-rs/stream/src/lib.rs), so its
+            // presence is the artefact saying what it is rather than the build
+            // command being trusted. build-android.sh refuses the same .so at
+            // build time; this gate is what stops a hand-built one.
+            if (hay.contains('FRAPPUCCINO_LEGACY_STRM_COMPILED_IN')) {
+                throw new GradleException(
+                    "checkRustSoFresh: jniLibs/$abi/libuniffi_frappuccino.so carries the " +
+                    "LEGACY STRM decoder (V1/V2). The shipped library decodes V3 only. " +
+                    "This happens when the FFI is built in a Cargo graph that also contains " +
+                    "frappuccino-cli, which enables `legacy-strm`; the feature is then " +
+                    "unified into the stream crate for every consumer. Rebuild with " +
+                    "`bash crypto-rs/build-android.sh`, which builds -p frappuccino-crypto-ffi.")
+            }
+            // E3: the ObfQuic PSK must be present, i.e. the .so carries QUIC.
+            if (quicMarker != null && !hay.contains(quicMarker)) {
+                throw new GradleException(
+                    "checkRustSoFresh: jniLibs/$abi/libuniffi_frappuccino.so was built WITHOUT " +
+                    "--features quic (the ObfQuic PSK from quic.rs is absent), so the ObfQuic " +
+                    "transport silently degrades to DirectTls — no QUIC/Salamander, no DPI " +
+                    "resistance (F-D3).\nRebuild with `bash crypto-rs/build-android.sh` (it passes " +
+                    "--features quic by default). If you deliberately built FEATURES=\"\" for a " +
+                    "size-delta measurement, rebuild with quic before producing a shippable APK.")
+            }
+        }
+    }
+}
+// WP-E4 (audit 2026-06-28) — provenance gate. checkRustSoFresh proves the .so is
+// FRESH and embeds the right pins/quic; it cannot prove the shipped binary is the
+// one built from THIS commit's source (a .so from a different commit can still pass
+// the byte-greps). This gate recomputes each shipped jniLibs .so SHA-256 and fails
+// unless it matches crypto-rs/PROVENANCE.txt (regenerated by build-android.sh on
+// every build), closing the hand-built / stale / swapped-.so gap (F-D2).
+tasks.register('checkSoProvenance') {
+    group = 'verification'
+    description = 'Fails if a shipped jniLibs .so SHA-256 does not match crypto-rs/PROVENANCE.txt'
+    doLast {
+        def manifest = file("$rootDir/crypto-rs/PROVENANCE.txt")
+        if (!manifest.exists()) {
+            logger.warn("checkSoProvenance: crypto-rs/PROVENANCE.txt absent — provenance gate skipped " +
+                "(run `bash crypto-rs/build-android.sh` to generate it).")
+            return
+        }
+        def expected = [:]
+        manifest.eachLine { line ->
+            def m = (line =~ /^sha256:([a-z0-9_-]+)=([0-9a-fA-F]{64})\s*$/)
+            if (m.find()) { expected[m.group(1)] = m.group(2).toLowerCase() }
+        }
+        if (expected.isEmpty()) {
+            throw new GradleException(
+                "checkSoProvenance: no sha256:<abi> lines parsed from crypto-rs/PROVENANCE.txt — " +
+                "the manifest format changed. Update this gate or regenerate the manifest.")
+        }
+        ['arm64-v8a', 'armeabi-v7a', 'x86_64'].each { abi ->
+            def sof = file("$projectDir/src/main/jniLibs/$abi/libuniffi_frappuccino.so")
+            if (!sof.exists()) {
+                return // ABI not built in this variant
+            }
+            def exp = expected[abi]
+            if (exp == null) {
+                throw new GradleException(
+                    "checkSoProvenance: jniLibs/$abi/libuniffi_frappuccino.so is shipped but " +
+                    "crypto-rs/PROVENANCE.txt has no sha256:$abi entry. Regenerate the manifest " +
+                    "with `bash crypto-rs/build-android.sh`.")
+            }
+            def md = java.security.MessageDigest.getInstance('SHA-256')
+            sof.withInputStream { is ->
+                byte[] buf = new byte[65536]
+                int n
+                while ((n = is.read(buf)) != -1) md.update(buf, 0, n)
+            }
+            def actual = md.digest().collect { String.format('%02x', it) }.join('')
+            if (actual != exp) {
+                throw new GradleException(
+                    "checkSoProvenance: jniLibs/$abi/libuniffi_frappuccino.so SHA-256 does NOT match " +
+                    "the provenance manifest.\n" +
+                    "  expected (PROVENANCE.txt): $exp\n" +
+                    "  actual   (shipped .so):    $actual\n" +
+                    "The shipped .so is not the one this commit's manifest records — it was hand-built, " +
+                    "stale, or swapped.\nRebuild + regenerate the manifest with `bash crypto-rs/build-android.sh`.")
+            }
+        }
+    }
+}
+
+afterEvaluate {
+    tasks.named('preBuild').configure { dependsOn 'checkRustSoFresh', 'checkSoProvenance' }
+}
+
+// === Release signing (transport flip, ROADMAP §10.7) ===
+// keystore.properties is git-ignored and created by the release signer (see the
+// keytool command in the flip runbook). It holds storeFile / storePassword /
+// keyAlias / keyPassword. ABSENT on CI and fresh checkouts → the release build
+// stays unsigned (assembleRelease still succeeds, emitting -unsigned.apk) so a
+// machine without the signing secret never has its build broken.
+def keystorePropsFile = rootProject.file("mobile/keystore.properties")
+def keystoreProps = new Properties()
+if (keystorePropsFile.exists()) {
+    keystorePropsFile.withInputStream { keystoreProps.load(it) }
+}
+
+android {
+    compileSdk versions.compileSdk
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    defaultConfig {
+        applicationId "org.hzontal.tellaFOSS"
+        minSdkVersion versions.minSdk
+        compileSdkVersion versions.compileSdk
+        targetSdkVersion versions.targetSdk
+        versionCode 186
+        versionName "2.11.0"
+        buildConfigField "String", "GIT_HASH", "\"${gitHashShort}\""
+        multiDexEnabled true
+        // Modern test runner required by AndroidJUnit4. Without it, Gradle falls back
+        // to the deprecated android.test.InstrumentationTestRunner (API 24 obsolete).
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        aaptOptions {
+            cruncherEnabled = false
+            useNewCruncher = false
+            noCompress 'png'
+        }
+        vectorDrawables.generatedDensities = []
+        // vectorDrawables.useSupportLibrary = true // don't care about apk size, care about crashes
+
+        dependenciesInfo {
+            // Disables dependency metadata when building APKs.
+            includeInApk = false
+            // Disables dependency metadata when building Android App Bundles.
+            includeInBundle = false
+        }
+    }
+
+    signingConfigs {
+        // Defined only when the signer's keystore.properties is present, so a
+        // checkout without the secret still configures cleanly (release just
+        // stays unsigned). create() inside the guard so the release buildType
+        // below never references a missing config.
+        if (keystorePropsFile.exists()) {
+            create('release') {
+                storeFile rootProject.file(keystoreProps.getProperty('storeFile'))
+                storePassword keystoreProps.getProperty('storePassword')
+                keyAlias keystoreProps.getProperty('keyAlias')
+                keyPassword keystoreProps.getProperty('keyPassword')
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            debuggable true
+            // S8d: AGP 8 logs "Debuggable builds are no longer name minified"
+            // but R8 tree-shaking still runs and strips `DesugarCollections`
+            // methods that JNA reaches only via D8's desugar-rewrite, causing
+            // a runtime NoSuchMethodError on the Rust smoke test. Release
+            // builds keep minifyEnabled (below) — that path is covered by
+            // explicit -keep rules in proguard-rules.pro for any future JNA
+            // bump.
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            crunchPngs false
+        }
+        release {
+            // Sign with the dedicated release keystore when present (transport
+            // flip §10.7). Guarded so an unsigned release build still works on a
+            // machine without the keystore. The signature != the debug key, so
+            // the first signed install over a debug build needs an uninstall
+            // (-> re-enrollment) — expected, documented in the flip runbook.
+            if (keystorePropsFile.exists()) {
+                signingConfig signingConfigs.getByName('release')
+            }
+            debuggable false
+            minifyEnabled true
+            // Ne jamais repasser la release sur proguard-android.txt : ce fichier
+            // du SDK contient -dontobfuscate, et les deux variantes du SDK ne
+            // diffèrent que par un suffixe dans leur nom. On livrerait une APK
+            // sans obfuscation R8, en silence, sans qu'aucun build ni aucun test
+            // n'échoue. proguard-android-optimize.txt, lui, active l'obfuscation
+            // R8 par défaut : les noms de classes/methods hors keep rules sont
+            // renommés a/b/c. Les keeps existants (UniFFI, JNA, kotlin stdlib
+            // pour tests instrumentés, stream-crypto API) couvrent les surfaces
+            // qui dépendent de réflection.
+            //
+            // R8 fait aussi des optims plus agressives en mode optimize
+            // (inlining, dead code elim) : risque marginal de casser un path
+            // qu'on n'aurait pas testé. Si bug à la release, le repli est de
+            // revenir sur proguard-android.txt + rules custom — au prix de
+            // l'obfuscation, ce fichier portant -dontobfuscate : on échangerait
+            // un bug contre une release en clair. (Phase 6.1.5.)
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            crunchPngs false
+        }
+
+    }
+
+    compileOptions {
+        // S8d: desugar 2.x + AGP 8 ships DesugarCollections.synchronizedMap so
+        // JNA 5.x (used by UniFFI bindings) no longer crashes at static init.
+        // We can enable coreLibraryDesugaring unconditionally.
+        coreLibraryDesugaringEnabled = true
+
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+    kotlinOptions {
+        jvmTarget = '11'
+    }
+
+// Apply JVM toolchain to enforce Java 17 for Kotlin
+    java {
+        toolchain {
+            languageVersion.set(JavaLanguageVersion.of(17))
+        }
+    }
+
+    buildFeatures {
+        viewBinding = true
+    }
+    // Android lint runs in CI (.github/workflows/android.yml). It had never run
+    // anywhere before that, and the first clean run reported 32 errors and 201
+    // warnings, every one of them pre-existing.
+    //
+    // lint-baseline.xml records exactly those and nothing else, so the task
+    // fails on a NEW finding and passes on the old ones. That is a deliberate
+    // trade and it is worth being precise about what it does and does not mean:
+    //
+    //   - It is a ledger, not a fix. Every entry is a real finding still in the
+    //     tree; the file names each one with its file and line, so the debt is
+    //     readable rather than hidden behind a disabled check.
+    //   - The alternative, abortOnError=false, is worse than no lint at all: a
+    //     check that cannot fail reads as coverage while proving nothing.
+    //   - Deleting the file and regenerating it silently absorbs whatever broke
+    //     in between. Regenerate deliberately, and read the diff.
+    //
+    // The 28 NewApi entries are not cosmetic: minSdkVersion is 21 and the code
+    // calls API 23/24/26/28 methods unguarded (ConnectivityManager.activeNetwork,
+    // PowerManager.isIgnoringBatteryOptimizations, registerReceiver with
+    // RECEIVER_NOT_EXPORTED, Context.getSystemService(Class)). On an API 21 or 22
+    // handset those throw NoSuchMethodError, which is an Error and therefore not
+    // caught by the catch (Exception) blocks some of them sit in. Either the
+    // floor is really 23+ and minSdkVersion should say so, or the call sites need
+    // guards. Baselining them keeps the build honest about the choice being open.
+    lint {
+        checkReleaseBuilds false
+        baseline = file('lint-baseline.xml')
+    }
+    hilt {
+        enableExperimentalClasspathAggregation = true
+        enableAggregatingTask = true
+    }
+    packagingOptions {
+        exclude 'META-INF/services/java.time.zone.ZoneRulesProvider'
+        exclude 'META-INF/*.version'
+        exclude 'META-INF/*.properties'
+        exclude 'META-INF/*.kotlin_module'
+        exclude 'META-INF/*.sf'
+        exclude 'META-INF/*.rsa'
+        exclude 'META-INF/*.mf'
+        exclude 'META-INF/services/*'
+        // S8d: kxml2 2.3.0 ships a malformed
+        // META-INF/services/org.xmlpull.v1.XmlPullParserFactory (comma-joined
+        // class names on one line). AGP 8 R8 parses it strictly → "Missing
+        // class". Dropping the file is safe: kxml2 classes stay on the
+        // classpath, just not auto-registered via ServiceLoader.
+        exclude 'META-INF/services/org.xmlpull.v1.XmlPullParserFactory'
+    }
+    namespace 'rs.readahead.washington.mobile'
+
+    // === Rust crypto-rs integration ===
+    // The compiled `.so` must stay in mobile/src/main/jniLibs/ — the APK is
+    // produced from mobile, and System.loadLibrary finds the native lib there
+    // at runtime.
+    //
+    // The Kotlin UniFFI bindings, also generated by crypto-rs/build-android.sh,
+    // do live in stream-crypto/ (so StreamUploadManager et al. can import
+    // uniffi.frappuccino.*), which is why nothing under `mobile` declares them:
+    // `mobile` picks them up transitively via the
+    // `implementation project(':stream-crypto')` dep (S8c.1). Not finding them
+    // here does not mean the generation is broken — do not add a second uniffi
+    // srcDirs on this side.
+    sourceSets {
+        // S8d: RustSmokeTest is always compiled alongside the standard
+        // androidTest set. The .so comes from `./gradlew :mobile:rustBuild` — a
+        // missing one usually fails the build itself (checkRustSoFresh, wired on
+        // preBuild). Where that guard does not fire the build goes through and
+        // just the Rust-dependent test fails at runtime: notably a partial
+        // checkout with no crypto-rs/stream/src/pin.rs, and an ABI-partial build
+        // — the guard only requires the arm64-v8a .so to exist, the other ABIs
+        // are byte-checked only when already present, so an arm64-only build
+        // packages no x86_64 .so and the test fails on an x86_64 emulator.
+        androidTest.java.srcDirs += 'src/androidTestRust/java'
+    }
+}
+
+// Manual task to build the Rust crypto workspace. Run explicitly:
+//   ./gradlew :mobile:rustBuild
+// The toolchain is pinned by crypto-rs/rust-toolchain.toml (1.88.0 as of today)
+// and rustup selects it on its own, so the prerequisites to install are cargo-ndk
+// and ANDROID_NDK_HOME. See crypto-rs/README.md.
+task rustBuild(type: Exec) {
+    description = 'Compile crypto-rs for Android ABIs and generate Kotlin UniFFI bindings.'
+    group = 'build'
+    workingDir = file("$rootDir/crypto-rs")
+    def isWindows = System.getProperty('os.name').toLowerCase().contains('windows')
+    commandLine = isWindows ? ['bash', './build-android.sh'] : ['./build-android.sh']
+    doFirst {
+        try {
+            def check = new ProcessBuilder(isWindows ? ['cmd', '/c', 'cargo --version'] : ['cargo', '--version'])
+                .redirectErrorStream(true).start()
+            check.waitFor()
+            if (check.exitValue() != 0) throw new Exception("cargo exit=${check.exitValue()}")
+        } catch (Exception e) {
+            throw new GradleException(
+                'cargo not found on PATH. Install Rust via https://rustup.rs/ then rerun. ' +
+                'See crypto-rs/README.md for full prerequisites.'
+            )
+        }
+    }
+}
+
+dependencies {
+    coreLibraryDesugaring "com.android.tools:desugar_jdk_libs:$versions.desugar"
+    implementation "androidx.multidex:multidex:$versions.multidex"
+    implementation fileTree(dir: 'libs', include: ['*.jar'])
+
+    // Local modules
+    implementation project(':stream-crypto')
+    implementation project(':shared-ui')
+
+    // Kotlin + Android core
+    implementation "org.jetbrains.kotlin:kotlin-stdlib:$versions.kotlin"
+    implementation "androidx.appcompat:appcompat:$versions.appcompat"
+    // GridLayout used by fragment_onboard_mnemonic_generate.xml (24-word grid).
+    implementation 'androidx.gridlayout:gridlayout:1.0.0'
+
+    // Navigation (NavController used by Extensions.kt + BaseFragment.kt)
+    api "androidx.navigation:navigation-fragment-ktx:$versions.navigationFragmentKtx"
+    api "androidx.navigation:navigation-ui-ktx:$versions.navigationUI"
+    implementation "androidx.navigation:navigation-runtime-ktx:$versions.navigationRuntime"
+    implementation "androidx.navigation:navigation-fragment-ktx:$versions.navigationFragment"
+
+    // ViewBinding
+    implementation "androidx.databinding:databinding-runtime:$versions.databindingRuntime"
+
+    // CameraX (V2 recording pipeline)
+    implementation "androidx.camera:camera-core:$versions.camerax"
+    implementation "androidx.camera:camera-camera2:$versions.camerax"
+    implementation "androidx.camera:camera-video:$versions.camerax"
+    implementation "androidx.camera:camera-extensions:$versions.camerax"
+    implementation "androidx.camera:camera-lifecycle:$versions.camerax"
+    implementation "androidx.camera:camera-view:$versions.camerax"
+
+    // androidx.lifecycle — ProcessLifecycle + DefaultLifecycleObserver.
+    // Phase 6.1.16: declared directly so V2LockTimeoutController (and
+    // MyApplication's ProcessLifecycleOwner usage) no longer rely on the
+    // transitive api dep from tella-locking-ui, which 6.1.16 removes.
+    implementation "androidx.lifecycle:lifecycle-process:$versions.lifecycleProcess"
+    implementation "androidx.lifecycle:lifecycle-common-java8:$versions.lifecycleCommonJava8"
+
+    // OkHttp (used by StreamRecordingService, ProvenanceTimestampWorker and
+    // UploadHttpClient — the latter builds the pinned upload client, so the
+    // scope of this dep covers the CertificatePinner) + Gson (Extensions.kt).
+    // Both were previously pulled transitively via retrofit; declared directly now.
+    implementation "com.squareup.okhttp3:okhttp:$versions.okhttp3LoggingInterceptor"
+    implementation "com.google.code.gson:gson:$versions.gson"
+
+    // Logging
+    implementation "com.jakewharton.timber:timber:$versions.timber"
+
+    // Hilt DI
+    implementation "com.google.dagger:hilt-android:$versions.hilt_android"
+    kapt "com.google.dagger:hilt-android-compiler:$versions.hilt_android_compiler"
+    kapt "androidx.hilt:hilt-compiler:$versions.hilt_version"
+
+    // WorkManager (ChunkUploadWorker, EnrollmentRetryWorker)
+    implementation "androidx.work:work-runtime-ktx:$versions.workermanger"
+    implementation("androidx.hilt:hilt-work:$versions.hilt_version")
+
+    testImplementation "androidx.arch.core:core-testing:2.1.0"
+    testImplementation 'org.mockito:mockito-core:3.12.4'
+    testImplementation "junit:junit:$versions.junit"
+
+    // Instrumented tests (S0 crypto-rs smoke test)
+    androidTestImplementation "junit:junit:$versions.junit"
+    androidTestImplementation 'androidx.test:runner:1.5.2'
+    androidTestImplementation 'androidx.test:core:1.5.0'
+    androidTestImplementation 'androidx.test.ext:junit:1.1.5'
+    // JNA required by UniFFI bindings at runtime for Rust-dependent tests.
+    androidTestImplementation 'net.java.dev.jna:jna:5.14.0@aar'
+    // Work-testing for instrumented Worker tests.
+    androidTestImplementation "androidx.work:work-testing:$versions.workermanger"
+}
+
+kapt {
+    correctErrorTypes true
+}
+
+import com.android.tools.profgen.ArtProfileKt
+import com.android.tools.profgen.ArtProfileSerializer
+import com.android.tools.profgen.DexFile
+
+project.afterEvaluate {
+    tasks.each { task ->
+        if (task.name.startsWith("compile") && task.name.endsWith("ReleaseArtProfile")) {
+            task.doLast {
+                outputs.files.each { file ->
+                    if (file.name.endsWith(".profm")) {
+                        println("Sorting ${file} ...")
+                        def version = ArtProfileSerializer.values().last()
+                        def profile = ArtProfileKt.ArtProfile(file)
+                        def keys = new ArrayList(profile.profileData.keySet())
+                        def sortedData = new LinkedHashMap()
+                        Collections.sort keys, new DexFile.Companion()
+                        keys.each { key -> sortedData[key] = profile.profileData[key] }
+                        new FileOutputStream(file).with {
+                            write(version.magicBytes$profgen)
+                            write(version.versionBytes$profgen)
+                            version.write$profgen(it, sortedData, "")
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

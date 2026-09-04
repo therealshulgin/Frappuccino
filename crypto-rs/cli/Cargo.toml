@@ -1,0 +1,52 @@
+[package]
+name = "frappuccino-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Command-line tool for Frappuccino — decrypt, archive, test. Replaces server-tools/*.py in S9."
+
+[[bin]]
+name = "frappuccino-cli"
+path = "src/main.rs"
+
+# RT-03 fix (Phase 4.1.4): one-shot CLI to migrate a PIN-sealed V1 ratchet
+# blob to V2. The runtime deserialize() rejects V1 outright; this binary is
+# the only audited path that still reads V1 (via migrate_from_v1).
+[[bin]]
+name = "frappuccino-migrate-v1-ratchet"
+path = "src/bin/migrate_v1_ratchet.rs"
+
+# 8.4 item 3 — differential-fuzz corpus dumper (Kotlin<->Rust FFI boundary).
+# Emits a JSONL corpus of (input, reference Rust outcome) for each FFI API;
+# the Kotlin/JVM harness replays the same inputs through the UniFFI bindings
+# and diffs. Tooling only — not shipped.
+[[bin]]
+name = "frappuccino-difffuzz-dump"
+path = "src/bin/difffuzz_dump.rs"
+
+[dependencies]
+frappuccino-crypto-core = { path = "../core" }
+# `legacy-strm`: the CLI is the escape hatch for archives written by the older
+# encoders, so it is the one consumer that still decodes V1/V2. The shipped `.so`
+# (crypto-rs/ffi) deliberately does not enable it.
+frappuccino-crypto-stream = { path = "../stream", features = ["legacy-strm"] }
+# 8.4 item 3 (diff-fuzz Kotlin<->Rust): the `difffuzz-dump` bin calls the exact
+# FFI-layer functions so the corpus reference outcomes match what the Kotlin
+# UniFFI bindings get (modulo marshalling). rlib dep only — no scaffolding used.
+frappuccino-crypto-ffi = { path = "../ffi" }
+clap       = { version = "=4.6.1", features = ["derive"] }
+anyhow     = "=1.0.103"
+hex        = "=0.4.3"
+serde      = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.149"
+# §10.11 Phase B — OpenTimestamps proof parsing/replay for `verify-provenance
+# --ots` (the trustless-timestamp check). Desktop verifier ONLY — never compiled
+# into the mobile `.so`, so it adds no APK / device dependency surface.
+opentimestamps = "=0.2.0"
+
+[lints]
+workspace = true

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  :stream-crypto instrumented tests — trust the Vultr self-signed CA + pin
+  (mirrors :mobile/src/main/res/xml/network_security_config.xml).
+-->
+<network-security-config>
+
+    <domain-config cleartextTrafficPermitted="false">
+        <domain includeSubdomains="false">136.244.101.236</domain>
+        <trust-anchors>
+            <certificates src="@raw/frappuccino_ca"/>
+            <certificates src="system"/>
+        </trust-anchors>
+        <pin-set expiration="2028-04-15">
+            <pin digest="SHA-256">mGGCWQNvYxXBlHTDUzRgdB1GSJQnnwP0gw5gUmokBOA=</pin>
+        </pin-set>
+    </domain-config>
+
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system"/>
+        </trust-anchors>
+    </base-config>
+
+</network-security-config>

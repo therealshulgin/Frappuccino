@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "description": "Canonical JSON body for POST /auth/v2/verify",
+  "endpoint": "/auth/v2/verify",
+  "body": {
+    "ed25519_pk": "f373b6de310a66e4b4f0e1ab355c89446762b59b47895d2d42ecfa5ed8d36920",
+    "ephemeral_pk": "7e8650d32c0d2797e22f8070711abdc6ddeb4e98ea1e0848f250ba845f3a17f5",
+    "batch_number": 0,
+    "key_index": 0,
+    "nonce": "0000000000000000000000000000000000000000000000000000000000000000",
+    "signature": "d3e87bfdaf807a39e7f3d824b76d38589899a73ccc50adf73884c535cfc626aee22f8cc31fa1032e3d7733c8aa20fe9cf96db1f292b86512280b8d7cebf0f207"
+  }
+}

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <dimen name="lock_password_button_margin_top">16dp</dimen>
+    <dimen name="lock_subtitle_desc_margin_top">10dp</dimen>
+    <!-- Phase 6.1.16: relocated from tella-locking-ui (module removed). Used by
+         the V2 onboarding info layouts (camera/files/recorder/lock_set). -->
+    <dimen name="hide_tella_big_margin">8dp</dimen>
+    <dimen name="hide_tella_small_margin">4dp</dimen>
+</resources>

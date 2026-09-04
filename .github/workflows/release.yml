@@ -1,0 +1,194 @@
+name: Release artefacts
+
+# Produces the binaries an auditor is handed, and the evidence tying them to a
+# public commit. It exists because the first public snapshot shipped a manifest
+# reading `git_commit=a6b81c3 / git_describe=a6b81c3-dirty` for a commit present
+# in no public history: a binary attested against source nobody can fetch is not
+# attested at all. An external auditability review (2026-08-28) filed that as
+# F-04, and this workflow is the answer to it.
+#
+# THE CHAIN IT BUILDS, and each link is a step below that can fail:
+#
+#   the tag  ->  the commit the tag names, with a clean tree
+#            ->  pinned toolchains (rustc, cargo-ndk, NDK, JDK)
+#            ->  the three .so, compiled here from that source
+#            ->  PROVENANCE.txt, written by that same build
+#            ->  the .so packaged inside the APK, digest for digest
+#
+# WHAT THE AUDITOR CAN ACTUALLY VERIFY. Take the APK that was distributed,
+# unzip lib/<abi>/libuniffi_frappuccino.so, and compare its SHA-256 to the
+# matching line in PROVENANCE.txt. APK signing does not alter entry contents, so
+# those digests survive it. This matters because the APK published here is
+# UNSIGNED: mobile/keystore.properties is absent on CI by design and the signing
+# key is not a CI secret. The signed APK is built on the release machine and its
+# own digest will differ. The .so digests are what carry across.
+#
+# WHAT IT DOES NOT CLAIM. Not bit-for-bit reproducibility. build-android.sh pins
+# neither SOURCE_DATE_EPOCH nor --remap-path-prefix, and absolute source paths
+# differ between machines, so rebuilding this commit elsewhere gives different
+# bytes. The claim is "these binaries came out of that run of that commit", and
+# the run is public. Getting from there to reproducibility is a separate piece of
+# work; do not let the presence of digests here be read as more than that.
+#
+# Attaching these artefacts to a GitHub Release, and signing the tag, stay manual
+# on purpose. Publication is a deliberate act, not a side effect of pushing a tag.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Same pins as android.yml. They are duplicated rather than shared because a
+  # release must not silently follow a change made for CI convenience; when they
+  # diverge, that should be visible in a diff.
+  NDK_VERSION: '30.0.14904198'
+  CARGO_NDK_VERSION: '4.1.2'
+  # Makes build-android.sh refuse to run against a tree that does not match HEAD,
+  # before it spends fifteen minutes compiling something it cannot attest.
+  STRICT_PROVENANCE: '1'
+  CARGO_TERM_COLOR: always
+
+jobs:
+  artefacts:
+    name: build and attest the release artefacts
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth 0: git describe walks the history, and a shallow clone would
+      # make it fall back to a bare hash.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: The checkout must be the commit under audit
+        run: |
+          set -euo pipefail
+          echo "ref:    ${GITHUB_REF}"
+          echo "commit: ${GITHUB_SHA}"
+          head="$(git rev-parse HEAD)"
+          test "$head" = "$GITHUB_SHA" \
+            || { echo "HEAD is $head but the run is for $GITHUB_SHA"; exit 1; }
+          git describe --always --dirty
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # Same shape as android.yml, and for the same reason: the install's exit
+      # code is not the evidence, the directory is. See the comment there.
+      - name: Install the pinned NDK
+        run: |
+          set -uo pipefail
+          sdk="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          test -n "$sdk" || { echo "neither ANDROID_SDK_ROOT nor ANDROID_HOME is set"; exit 1; }
+          mgr="$sdk/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$mgr" ]; then
+            mgr="$(find "$sdk/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -1)"
+          fi
+          test -n "$mgr" && test -x "$mgr" || {
+            echo "sdkmanager not found under $sdk/cmdline-tools:"
+            ls -R "$sdk/cmdline-tools" 2>/dev/null | head -40
+            exit 1
+          }
+          printf 'y\n' | "$mgr" --install "ndk;${NDK_VERSION}" || echo "sdkmanager returned $?"
+          ndk="$sdk/ndk/${NDK_VERSION}"
+          test -d "$ndk" || {
+            echo "NDK ${NDK_VERSION} is absent after the install. Present instead:"
+            ls "$sdk/ndk" 2>/dev/null || echo "  (no ndk directory at all)"
+            exit 1
+          }
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+
+      - name: Rust toolchain (pinned by crypto-rs/rust-toolchain.toml)
+        working-directory: crypto-rs
+        run: rustup show
+
+      - name: Install cargo-ndk (pinned)
+        run: cargo install cargo-ndk --version "${CARGO_NDK_VERSION}" --locked
+
+      # STRICT_PROVENANCE is in the job env, so this refuses a dirty or
+      # untracked-carrying tree rather than writing a manifest nobody can check.
+      - name: Build the three .so and write the manifest
+        run: bash crypto-rs/build-android.sh
+
+      - name: Build libtcpcc.so
+        run: bash mobile/src/main/cpp/build-tcpcc.sh
+
+      - name: The manifest must name this exact public commit
+        run: |
+          set -euo pipefail
+          m=crypto-rs/PROVENANCE.txt
+          grep -q "^strict_provenance=1$" "$m" \
+            || { echo "manifest was not written under STRICT_PROVENANCE"; exit 1; }
+          got="$(sed -n 's/^git_commit=//p' "$m")"
+          test "$got" = "$GITHUB_SHA" \
+            || { echo "manifest names $got, this run is $GITHUB_SHA"; exit 1; }
+          case "$(sed -n 's/^git_describe=//p' "$m")" in
+            *-dirty) echo "manifest describes a dirty tree"; exit 1 ;;
+          esac
+          test "$(grep -c '^sha256:' "$m")" -eq 3 \
+            || { echo "manifest does not record all three ABI digests"; cat "$m"; exit 1; }
+          cat "$m"
+
+      # Unsigned here, and that is deliberate: see the header. Release keeps
+      # minifyEnabled, so this also exercises the R8 pass the debug build skips.
+      - name: assembleRelease
+        run: ./gradlew :mobile:assembleRelease
+
+      # The link that makes the whole thing worth publishing. If the .so sitting
+      # inside the APK is not the .so the manifest describes, the manifest is
+      # decoration.
+      - name: The .so inside the APK must match the manifest, digest for digest
+        run: |
+          set -euo pipefail
+          apk="$(find mobile/build/outputs/apk/release -name '*.apk' -print -quit)"
+          test -n "$apk" || { echo "no release APK produced"; exit 1; }
+          echo "APK: $apk"
+          work="$RUNNER_TEMP/apk-extract"
+          rm -rf "$work" && mkdir -p "$work"
+          unzip -q -o "$apk" 'lib/*/libuniffi_frappuccino.so' -d "$work"
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            actual="$(sha256sum "$work/lib/$abi/libuniffi_frappuccino.so" | awk '{print $1}')"
+            expected="$(sed -n "s/^sha256:$abi=//p" crypto-rs/PROVENANCE.txt)"
+            test -n "$expected" || { echo "manifest has no digest for $abi"; exit 1; }
+            test "$actual" = "$expected" || {
+              echo "$abi: the APK carries a different .so than the manifest records"
+              echo "  manifest: $expected"
+              echo "  in APK:   $actual"
+              exit 1
+            }
+            echo "  ok  $abi"
+          done
+
+      - name: Collect the bundle and its checksums
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/release-bundle"
+          mkdir -p "$out/jniLibs"
+          cp crypto-rs/PROVENANCE.txt "$out/"
+          cp -r mobile/src/main/jniLibs/. "$out/jniLibs/"
+          find mobile/build/outputs/apk/release -name '*.apk' -exec cp {} "$out/" \;
+          {
+            echo "# SHA-256 of every file published for ${GITHUB_REF#refs/tags/} (${GITHUB_SHA})."
+            echo "# Verify with: sha256sum -c SHA256SUMS"
+            echo "#"
+            echo "# The APK here is UNSIGNED. To check a signed APK instead, unzip"
+            echo "# lib/<abi>/libuniffi_frappuccino.so out of it and compare that digest:"
+            echo "# signing does not change entry contents."
+            ( cd "$out" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum )
+          } > "$out/SHA256SUMS"
+          cat "$out/SHA256SUMS"
+          echo "BUNDLE=$out" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle
+          if-no-files-found: error
+          path: ${{ env.BUNDLE }}

@@ -1,0 +1,36 @@
+# Frappuccino : static presentation site (Zola).
+#
+# Privacy-respecting by construction: NO tracker, NO analytics, NO third-party
+# request, NO JS framework, NO external fonts. The build runs off-server; the
+# server only ever serves static files.
+#
+# ⚠️ Deploy this site SEPARATELY from the blind relay. Do NOT host the public
+# site on the relay's host: it would tie this brand to the relay endpoint that
+# the field uploads to (see docs/METADATA_EXPOSURE_MAP.md). A cheap neutral
+# static host is enough.
+
+base_url = "https://shake-document-protect.org"
+title = "Frappuccino"
+description = "Encrypted video testimony that leaves the phone while it is being filmed, toward a relay that cannot read it. The only key is twelve words on paper."
+
+default_language = "en"
+
+compile_sass = true
+build_search_index = false
+minify_html = true
+
+# French is the second language (toggle in the header). English is default.
+[languages.fr]
+title = "Frappuccino"
+description = "Témoignage vidéo chiffré qui quitte le téléphone pendant le tournage, vers un relais incapable de le lire. La seule clé : douze mots sur papier."
+
+# No RSS/Atom feed for v1 (default: none).
+
+[markdown]
+# Code highlighting stays off by default (we style <pre> ourselves).
+smart_punctuation = true
+
+[extra]
+tagline = "The phone is a transmitter. Not a safe."
+brand_color = "#c9040d"
+repo_url = "https://github.com/therealshulgin/Frappuccino"

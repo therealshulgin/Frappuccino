@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "description": "STRM blob fixtures: Kotlin-encrypted, Rust must decrypt byte-exact",
+  "mnemonic": "abaisser abandon abdiquer abeille abolir aborder aboutir aboyer abrasif abreuver abriter abroger",
+  "passphrase": "",
+  "identity_ed25519_pk_hex": "f373b6de310a66e4b4f0e1ab355c89446762b59b47895d2d42ecfa5ed8d36920",
+  "identity_x25519_pk_hex": "0c4a9eab831cf2594f1622db081b451cb1b403c9d79c6a3b3339cb15d722504f",
+  "magic": "STRM",
+  "format_version": 1,
+  "mode_single": 1,
+  "mode_chunked": 2,
+  "note_non_deterministic": "Blobs contain random session_key + nonces → regenerated on each dump. Parity = Rust decrypts Kotlin blob, not byte-exact equality.",
+  "cases": [
+    {
+      "filename": "empty.strm",
+      "description": "Edge case: empty plaintext",
+      "mode": "SINGLE",
+      "plaintext_size": 0,
+      "plaintext_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "blob_size": 160,
+      "plaintext_hex": ""
+    },
+    {
+      "filename": "single_small.strm",
+      "description": "Small plaintext mode SINGLE",
+      "mode": "SINGLE",
+      "plaintext_size": 44,
+      "plaintext_sha256": "ef537f25c895bfa782526529a9b63d97aa631564d5d789c2b765448c8635fb6c",
+      "blob_size": 232,
+      "plaintext_hex": "54686520717569636b2062726f776e20666f78206a756d7073206f76657220746865206c617a7920646f672e"
+    },
+    {
+      "filename": "single_1kb.strm",
+      "description": "1KB deterministic plaintext mode SINGLE",
+      "mode": "SINGLE",
+      "plaintext_size": 1024,
+      "plaintext_sha256": "785b0751fc2c53dc14a4ce3d800e69ef9ce1009eb327ccf458afe09c242c26c9",
+      "blob_size": 1184,
+      "plaintext_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"
+    },
+    {
+      "filename": "chunked_3mb.strm",
+      "description": "3MB plaintext mode CHUNKED (forced via fileSize=-1)",
+      "mode": "CHUNKED",
+      "plaintext_size": 3145728,
+      "plaintext_sha256": "1bbfa84542c7cc7f35122d11d54195e75d96e1dbbfa1d4d19d94e569245fa61a",
+      "blob_size": 3146004,
+      "plaintext_filename": "chunked_3mb.plaintext.bin"
+    }
+  ]
+}

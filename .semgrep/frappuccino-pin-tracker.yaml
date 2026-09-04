@@ -1,0 +1,90 @@
+# Frappuccino — semgrep rules to chase the RT-09 miswiring pattern.
+#
+# RT-09 (Blue Team counter-audit, 2026-04-21) flagged that
+# `CryptoError::WrongPin` is overloaded:
+#   * legitimate PIN unlock failure (PinUnlockActivity)
+#   * STRM blob AEAD failure (decrypt_chunked / decrypt_single — corrupted
+#     or tampered ciphertext, OR sealed envelope not for this archive)
+#   * X25519 sealed-envelope unseal failure on the in-Rust archive decrypt
+#     path (StreamServerClient.archiveDownloadAndDecrypt). The old FFI
+#     decrypt_session_key wrapper was removed by B-CR-4 (audit 2026-06-26);
+#     the unseal now happens entirely inside Rust.
+#
+# All three surface as `FfiException.WrongPin` in Kotlin. If a Kotlin
+# call-site that performs blob decryption catches this exception and feeds
+# `PinAttemptTracker.recordFailure(...)`, an attacker who can inject corrupted
+# blobs into the archive stream can drive the user toward PIN lockout without
+# any wrong-PIN attempt ever happening.
+#
+# Mitigation today: the only `PinAttemptTracker.recordFailure` call-site in
+# the codebase is `PinUnlockActivity` (verified manually 2026-05-07), which
+# is the correct path. RT-09 isn't exploitable at HEAD. This rule is
+# defensive: it fires when ANY future call-site combines
+# FfiException.WrongPin + recordFailure, so a regression cannot ship
+# silently.
+#
+# A separate follow-up (Phase 4.3, RT-09 fix) introduces a distinct
+# `CryptoError::BlobAuthFailed` variant so the two paths stop sharing
+# `WrongPin` at the type level. Once that lands, this rule can graduate
+# from "defense-in-depth" to "literal type-check".
+
+rules:
+  - id: rt09-pin-tracker-on-wrongpin-catch
+    languages: [kotlin]
+    severity: WARNING
+    message: |
+      `PinAttemptTracker.recordFailure` is being called from a `catch` block
+      that handles `FfiException.WrongPin`. This is the RT-09 miswiring
+      pattern: WrongPin is also raised by STRM blob AEAD failures and by the
+      in-Rust archive decrypt path (sealed-envelope unseal), so a
+      corrupted-blob injection can drive the user toward PIN lockout. Verify
+      this catch only fires on a true PIN unlock
+      attempt (`pin_store_open*` flow). Other decrypt paths must NOT feed
+      the tracker — they should go to a separate "blob authentication
+      failed" UX. Tracked as Phase 4.3 of ROADMAP.md.
+    patterns:
+      - pattern: PinAttemptTracker.recordFailure(...)
+      - pattern-inside: |
+          catch (...) {
+            ...
+          }
+      - metavariable-pattern:
+          metavariable: $X
+          pattern-either:
+            - pattern: WrongPin
+        # NB Kotlin AST coverage in semgrep is partial — the rule above is
+        # intentionally permissive (catches any `recordFailure` inside any
+        # catch block), erring on the side of false positives we triage by
+        # hand vs. silently missing the RT-09 miswiring.
+    paths:
+      include:
+        - mobile/src/main/
+        - stream-crypto/src/main/
+      exclude:
+        - "**/test/**"
+        - "**/androidTest/**"
+
+  # Companion rule — flag any new bare `OkHttpClient()` (no CertificatePinner)
+  # in the production sources. The Android NetworkSecurityConfig handles the
+  # pinning today, but adding an explicit `CertificatePinner.Builder()` is
+  # belt-and-braces — and we want this rule to start nagging if the
+  # NetworkSecurityConfig ever drifts (e.g. someone adds a domain with a
+  # wider trust anchor). Tracked as the Phase 7 followup mentioned in the
+  # 6840bb4 commit message.
+  - id: bare-okhttp-client-no-pinner
+    languages: [kotlin]
+    severity: INFO
+    message: |
+      Bare `OkHttpClient()` in production source — no explicit
+      CertificatePinner attached. Today the Android NetworkSecurityConfig
+      pins the relay cert, but `OkHttpClient.Builder().certificatePinner(...)`
+      is the defense-in-depth pattern preferred for clients on hostile
+      networks. Keep an eye on this if you add a new HTTP destination.
+    pattern: OkHttpClient()
+    paths:
+      include:
+        - mobile/src/main/
+        - stream-crypto/src/main/
+      exclude:
+        - "**/test/**"
+        - "**/androidTest/**"

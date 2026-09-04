@@ -1,0 +1,37 @@
+# Phase 1.x-prep (2026-05-19) — timer that schedules
+# frappuccino-backup.service. Runs daily at 03:30 UTC + 15 min jitter
+# so multiple relays sharing infra don't hammer the same wallclock
+# moment (defense in depth — only relevant if therealshulgin ever runs more
+# than one relay, but cheap to wire in).
+#
+# 03:30 UTC = 04:30 / 05:30 Europe (low-traffic window). Adjust to
+# fit your timezone if you prefer pre-dawn local.
+#
+# Install + verify :
+#   sudo systemctl enable --now frappuccino-backup.timer
+#   sudo systemctl list-timers frappuccino-backup.timer
+#   sudo systemctl status frappuccino-backup.timer
+#
+# Manual fire (for smoke-test the first time) :
+#   sudo systemctl start frappuccino-backup.service
+#   sudo journalctl -u frappuccino-backup.service -n 50
+
+[Unit]
+Description=Daily Frappuccino state backup
+Documentation=https://github.com/therealshulgin/Frappuccino
+
+[Timer]
+# OnCalendar : daily at 03:30 UTC.
+OnCalendar=*-*-* 03:30:00 UTC
+# Random delay so a server farm doesn't all-at-once stress the
+# external backup target (rsync.net / B2 / etc.). On a single-host
+# relay this is a no-op cost-wise.
+RandomizedDelaySec=15min
+# Persistent : if the host was off at 03:30, fire as soon as
+# possible after boot. Useful for VPSes that reboot for kernel
+# updates overnight.
+Persistent=true
+Unit=frappuccino-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="wa_black">#000000</color>
+    <color name="wa_white">#FFFFFF</color>
+    <color name="wa_gray">#98999B</color>
+    <color name="wa_darker_gray">#1C1C1C</color>
+    <color name="dark_purple">#0A0A0F</color>
+    <color name="wa_orange">#CC1A1A</color>
+    <!-- Vert sobre pour les badges "OK / enrôlé" -->
+    <color name="wa_green">#3FCC7A</color>
+    <color name="onboardingIndicatorInactive">#444444</color>
+    <color name="onboardingIndicatorActive">#CC1A1A</color>
+    <color name="btn_dark_letter">#FF071013</color>
+
+    <color name="colorPrimary">#0A0A0F</color>
+    <color name="colorPrimaryDark">#050508</color>
+    <color name="colorAccent">#CC1A1A</color>
+    <color name="colorPrimaryInverse">@color/wa_white</color>
+
+    <!-- Collect -->
+</resources>

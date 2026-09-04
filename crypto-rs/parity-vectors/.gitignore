@@ -1,0 +1,6 @@
+# Large STRM fixtures (>1 MB) are regenerable from ParityVectorsDumper on any
+# Android device — no need to commit them. The smaller fixtures (single_small,
+# single_1kb, empty) cover the byte-exact parity concern; chunked_3mb is for
+# mode-CHUNKED roundtrip testing and is regenerated per-dev.
+strm_blobs/chunked_*.strm
+strm_blobs/chunked_*.plaintext.bin

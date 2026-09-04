@@ -1,0 +1,67 @@
+name: Semgrep static analysis
+
+# Runs on every push/PR. Combines the public Kotlin/Java/Rust/Python rule packs
+# with our local rules under `.semgrep/`. Only WARNING and ERROR are looked at:
+# the --severity flags filter at the source, so INFO findings reach neither the
+# job output nor semgrep.sarif. A finding fails the job, and the SARIF is also
+# uploaded to the Security tab of the repo.
+#
+# The semgrep version is pinned because the rule packs are versioned-by-fetch-time
+# upstream: a drifting toolchain means the same source can pass on Tuesday and
+# fail on Wednesday with no code change. The pin is the image TAG
+# semgrep/semgrep:1.86.0, not a digest — unlike the MinIO image in
+# server/docker-compose.yml a tag can be republished upstream, so treat it as a
+# deliberate bump point, not a hard reproducibility guarantee.
+#
+# The rule scope expected of this workflow, and the commit that introduced it,
+# are written down in ROADMAP 6.2.1.
+
+on:
+  push:
+    branches: [main, claude/**]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  semgrep:
+    name: semgrep scan
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep:1.86.0
+    steps:
+      - uses: actions/checkout@v4
+
+      # `semgrep scan`, not `semgrep ci`. The `ci` subcommand targets the Semgrep
+      # AppSec Platform (token, baseline diffing) and it does NOT accept
+      # `--severity`: it exits 2 on the unknown option before scanning anything,
+      # so no semgrep.sarif is written and the upload step below finds no file.
+      # That is exactly how the first public run failed. `scan` is the plain
+      # command this workflow wants: it takes --severity, honours --config, and
+      # returns non-zero on findings.
+      - name: Run semgrep with public + local rules
+        run: |
+          semgrep scan \
+            --config p/kotlin \
+            --config p/java \
+            --config p/rust \
+            --config p/python \
+            --config .semgrep/ \
+            --severity WARNING --severity ERROR \
+            --error \
+            --sarif --output=semgrep.sarif \
+            --exclude='**/build/**' \
+            --exclude='**/target/**' \
+            --exclude='**/.gradle/**' \
+            --exclude='**/*.lock' \
+            --metrics=off
+
+      - name: Upload SARIF to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+        continue-on-error: true

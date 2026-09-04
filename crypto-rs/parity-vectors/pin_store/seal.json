@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "description": "PinProtectedStore.seal: (pin, plaintext) -> blob. Rust can parse salt+nonce from blob and reproduce byte-exact via seal_deterministic.",
+  "kdf": "Argon2id",
+  "kdf_ops_limit": 4,
+  "kdf_mem_limit_bytes": 268435456,
+  "cipher": "XChaCha20-Poly1305-IETF",
+  "aad": "frappuccino-v2-pin-store-v1",
+  "salt_bytes": 16,
+  "nonce_bytes": 24,
+  "tag_bytes": 16,
+  "version_byte": 1,
+  "cases": [
+    {
+      "pin": "123456",
+      "plaintext_hex": "73656372657420646174612031",
+      "blob_hex": "0189d4daa4dac59adb1a1d72c3dc1a8dbc14005a62ebc5e68bf8996bcd49658a0239ff69a945f5f565ce45f9d1677c40fbae1ca862353b39d36ec0f449cedba9f5fb91bf551f"
+    },
+    {
+      "pin": "998877",
+      "plaintext_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+      "blob_hex": "01ad4750c1ee70754c1259f5a5f74a234668a5aeb409c3231d8187bc60b3784a42c8877da2afd28242889d1f34bee4e4f7a589ff448c04ee68c4e9d1e0bf94ffbb53e64515678f41128fb7aa01bc46e7b60a79c576c241bbec41ef998c551e89eedf058448dcdc46bd8f3f0c62df63553551de7d9630fac462b23bbc028eef8faeaead634fcaa7c99c1f5ffb9f9b76a7a84568a98ff42467176a44130c6b2a22d680ee117127c7cc0432048461a309c5b89e854f4b7d7fd072509cbf5a78803b5fa34102296f6630f1a02de50b7bab4d3a201df6f2df2cdb0b785ef10ca2fe1c0a3ae2af2954d627e58b1424284d2431efef140ef16e5a77fc061eb27d5e9591de884fa7d8071541239b60235a060f119f1df1e415106c648f6aaac8a346c322562ee24da417cbdd5a6b4c5344c7068e6591e5d21e6903e7af"
+    },
+    {
+      "pin": "000000",
+      "plaintext_hex": "",
+      "blob_hex": "01c49c2a79b7c5290e8ea5de13d6a228b8c31e8854fe623b0a186085e3167360fa8c2aec492fb2087ba5ff69f821725f42038237a7383d0318"
+    }
+  ]
+}

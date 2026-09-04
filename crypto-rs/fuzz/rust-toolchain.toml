@@ -1,0 +1,8 @@
+[toolchain]
+# Override the workspace-wide pin (stable 1.88) — libfuzzer-sys needs the
+# `-Zsanitizer=address` flag + `-Cpasses=sancov-module`, both nightly-only.
+# We don't pin a specific nightly date: cargo-fuzz runs are reproducible by
+# pinning the Docker image digest, not the rustc nightly.
+channel = "nightly"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

@@ -1,0 +1,13 @@
+[toolchain]
+# Toolchain pinned for reproducibility. Bumped to 1.88.0 because cargo-ndk 4.x
+# and cargo-deny 0.19+ require 1.86/1.88 respectively. The workspace MSRV
+# (declared via workspace.package.rust-version in Cargo.toml) stays at 1.80 —
+# our code remains portable to older compilers, but CI/devs build with 1.88.
+channel = "1.88.0"
+components = ["rustfmt", "clippy"]
+targets = [
+    "aarch64-linux-android",
+    "armv7-linux-androideabi",
+    "x86_64-linux-android",
+]
+profile = "minimal"

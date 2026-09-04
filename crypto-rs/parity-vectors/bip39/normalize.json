@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "description": "BIP-39 normalizePhrase: input (case/whitespace) -> canonical",
+  "language": "fr",
+  "cases": [
+    {
+      "input": "Abaisser ABANDON abdiquer abeille abolir aborder aboutir aboyer abrasif abreuver abriter abroger",
+      "canonical": "abaisser abandon abdiquer abeille abolir aborder aboutir aboyer abrasif abreuver abriter abroger"
+    },
+    {
+      "input": "  abaisser   abandon  abdiquer abeille abolir aborder aboutir aboyer abrasif abreuver abriter abroger  ",
+      "canonical": "abaisser abandon abdiquer abeille abolir aborder aboutir aboyer abrasif abreuver abriter abroger"
+    }
+  ]
+}

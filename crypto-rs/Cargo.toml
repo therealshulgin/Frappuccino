@@ -1,0 +1,59 @@
+[workspace]
+resolver = "2"
+members = [
+    "core",
+    "stream",
+    "ffi",
+    "cli",
+    # Phase 3b brick 1b — server-side Salamander de-obfuscation UDP proxy that
+    # fronts the relay's QUIC endpoint. Shares `salamander` with the client.
+    "obfs-proxy",
+    # THROWAWAY Phase 2 QUIC spike (quinn userspace CC vs kernel cubic, on-device).
+    # Not shipped; ripped out after the Gate-2 decision. ROADMAP 10.9.
+    "quic-spike",
+]
+
+# Shared lints and metadata applied to every member crate.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+authors = ["Frappuccino contributors"]
+license = "Apache-2.0"
+repository = "https://github.com/therealshulgin/Frappuccino"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+missing_debug_implementations = "warn"
+# `kani` is set by the Kani model-checker (cargo kani) when it builds the
+# `#[cfg(kani)]` proof harnesses (see stream/src/kani_proofs.rs, docs/KANI_PROOFS.md).
+# Register it so `-D warnings` doesn't trip `unexpected_cfgs` on normal builds.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Allow a few pedantic lints that are noisy in practice.
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+
+[profile.release]
+opt-level = "s"          # optimize for size (APK matters more than nanoseconds)
+lto = "fat"              # link-time optimization across crates
+codegen-units = 1        # deterministic, maximum inlining
+strip = "symbols"        # strip debug symbols from release .so
+# 8.1.6 #7 — MUST stay "unwind" (not "abort") for this UniFFI cdylib:
+# uniffi_core's rust_call wraps every exported fn in catch_unwind to catch a
+# Rust panic AT the FFI boundary. panic="abort" defeats that — the process
+# aborts before any unwind, so a crypto panic SIGABRTs the whole host app
+# instead of returning a catchable FfiException, AND skips every Zeroizing Drop,
+# leaving decrypted plaintext live in the abort tombstone. unwind runs those
+# destructors during the unwind, scrubbing plaintext before the error surfaces.
+# Cost: a few tens of KB of unwind tables on the .so (acceptable for security).
+panic = "unwind"
+
+[profile.release-dev]
+inherits = "release"
+debug = true             # keep symbols for local perf debugging
+strip = "none"

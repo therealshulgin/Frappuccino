@@ -1,0 +1,6 @@
+// Phase 5 — :tella-vault retire (vault Tella legacy mort dans Frappuccino V2,
+// commit dead-code-removal precedent). Module physique laisse dans le tree
+// pour reference historique mais plus inclus dans le build.
+include ':shared-ui'
+include ':mobile'
+include ':stream-crypto'

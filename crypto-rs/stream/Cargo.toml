@@ -1,0 +1,104 @@
+[package]
+name = "frappuccino-crypto-stream"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "STRM blob encrypt/decrypt and V2 server client for Frappuccino (pure Rust)."
+
+[lib]
+name = "frappuccino_crypto_stream"
+
+[features]
+default = ["protocol"]
+# Reading the legacy STRM containers (V1, the pre-S5 Kotlin encoder; V2, the
+# previous Rust one). OFF by default, so the shipped Android `.so` decodes V3
+# only and carries no legacy parsing surface at all. The CLI turns it on: a
+# witness with a July archive still reads it on a desktop, which is the same
+# shape as `EphemeralRatchet::migrate_from_v1` for the ratchet blob (rejected in
+# the app, an explicit CLI escape hatch outside it).
+#
+# CI runs the test suite with this feature ON as well, so the Kotlin-produced
+# V1 parity fixtures keep being checked: gating the code path out of the binary
+# must not quietly gate the cross-implementation vectors out of the evidence.
+legacy-strm = []
+# `protocol` pulls in the V2 relay client (reqwest + rustls). Fuzz builds
+# disable it so the sanitizer-heavy toolchain doesn't drag the tokio/hyper
+# tree through the compiler (saves ~3 GiB of RAM during `cargo fuzz build`).
+protocol = [
+    "dep:reqwest",
+    "dep:rustls",
+    "dep:rustls-pki-types",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:base64",
+    "dep:x509-parser",
+    "dep:subtle",
+]
+# `quic` adds the Phase 3a HTTP/3 upload transport (quinn userspace BBR +
+# h3), on top of `protocol` (reuses PinnedCertVerifier + PutResult). Opt-in so
+# the DirectTls-only, fuzz, and proof builds never compile the quinn/tokio/h3
+# tree — only the shipped Android `.so` (build-android.sh `--features quic`)
+# and the local h3 integration test enable it. Transport plan §10.9 / m4.
+quic = [
+    "protocol",
+    "dep:quinn",
+    "dep:tokio",
+    "dep:h3",
+    "dep:h3-quinn",
+    "dep:bytes",
+    "dep:http",
+]
+
+[dependencies]
+frappuccino-crypto-core = { path = "../core" }
+# Exact versions pinned per Rust_guidelines.md.
+chacha20poly1305 = { version = "=0.10.1", features = ["alloc"] }  # XChaCha20-Poly1305-IETF for chunks
+rand_core        = { version = "=0.6.4", features = ["std"] }     # OsRng for session key + nonces
+thiserror        = "=1.0.69"                                      # typed error enums
+zeroize          = { version = "=1.8.2", features = ["derive"] }
+hex              = "=0.4.3"
+sha2             = "=0.10.9"
+blake2           = "=0.10.6"                                      # Salamander obfs keystream (shared client + server proxy, Phase 3b)
+
+# S7 — V2 server client (blocking HTTP + custom rustls ServerCertVerifier).
+# Pulled in by the `protocol` feature (on by default).
+reqwest          = { version = "=0.12.28", default-features = false, features = ["blocking", "json", "rustls-tls-manual-roots"], optional = true }
+rustls           = { version = "=0.23.38", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls-pki-types = { version = "=1.14.0", optional = true }
+serde            = { version = "=1.0.228", features = ["derive"], optional = true }
+serde_json       = { version = "=1.0.149", optional = true }
+base64           = { version = "=0.22.1", optional = true }
+x509-parser      = { version = "=0.18.1", optional = true }       # SPKI extraction for SHA-256 pinning
+subtle           = { version = "=2.6.1", optional = true }        # constant-time pin comparison
+
+# Phase 3a (transport plan §10.9) — HTTP/3 upload transport. Pulled only by the
+# `quic` feature. Versions match the workspace lock (quinn/tokio/rustls/bytes/
+# http already present, dragged un-compiled by reqwest); h3/h3-quinn are new.
+quinn            = { version = "=0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"], optional = true }
+tokio            = { version = "=1.52.1", default-features = false, features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "time"], optional = true }
+h3               = { version = "=0.0.8", optional = true }
+h3-quinn         = { version = "=0.0.10", optional = true }
+bytes            = { version = "=1.11.1", optional = true }
+http             = { version = "=1.4.0", optional = true }
+
+[dev-dependencies]
+hex        = "=0.4.3"
+serde      = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.149"
+sha2       = "=0.10.9"
+# RT-01 regression test (pin.rs) — generate a *wrong* P-256 key to sign a
+# forged CertificateVerify in an in-memory TLS handshake. Same ring version
+# as the one rustls pulls (0.17.14) so there's no duplicate in the tree.
+ring       = "=0.17.14"
+proptest   = "=1.8.0"   # property-based STRM encrypt/decrypt round-trip tests
+# Phase 3a — self-signed cert for the local h3 integration test (quic.rs
+# `#[cfg(all(test, feature = "quic"))]`). Test-only; never ships. Same pin as
+# the Phase 2 spike.
+rcgen      = { version = "=0.13.2", default-features = false, features = ["crypto", "ring", "pem"] }
+
+[lints]
+workspace = true

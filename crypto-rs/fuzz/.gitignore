@@ -1,0 +1,14 @@
+# cargo-fuzz build artifacts
+target
+Cargo.lock
+
+# Coverage / sanitizer runtime output
+coverage
+*.profraw
+
+# Crash-reproducers and corpora generated at runtime. The seeded corpus
+# under corpus/<target>/ is committed (one file per target = `0000_seed`),
+# everything else is reproducer noise.
+artifacts
+corpus/**/*
+!corpus/**/0000_seed

@@ -1,0 +1,500 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/dark_purple">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="24dp">
+
+        <!-- Titre -->
+        <TextView
+            style="@style/OsintTitle"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="32dp"
+            android:layout_gravity="center_horizontal"
+            android:text="@string/stream_settings_title" />
+
+        <!-- Section : IDENTITÉ -->
+        <TextView
+            style="@style/OsintSubtitle"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="32dp"
+            android:text="@string/stream_settings_section_identity" />
+
+        <TextView
+            android:id="@+id/settingsFingerprint"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:textColor="@color/wa_white"
+            android:textSize="14sp"
+            android:fontFamily="monospace"
+            android:letterSpacing="0.1"
+            android:text="—" />
+
+        <!-- Statut enrôlement serveur (lisible en un coup d'œil).
+             Couleur : vert (enrôlé), orange (en attente), gris (pas encore). -->
+        <TextView
+            android:id="@+id/settingsEnrollmentStatus"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:textSize="13sp"
+            android:fontFamily="monospace"
+            android:letterSpacing="0.05"
+            android:text="—" />
+
+        <!-- Section : SERVEUR -->
+        <TextView
+            style="@style/OsintSubtitle"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:text="@string/stream_settings_section_server" />
+
+        <TextView
+            android:id="@+id/settingsServerUrl"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:textColor="@color/wa_gray"
+            android:textSize="12sp"
+            android:fontFamily="monospace" />
+
+        <!-- Section : ENREGISTREMENT (Phase 7.3) — plafond qualité + shake. -->
+        <TextView
+            style="@style/OsintSubtitle"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="32dp"
+            android:text="@string/stream_settings_section_recording" />
+
+        <!-- Plafond qualité max. Texte set programmatically
+             ("Qualité max : Auto (jusqu'à 1080p)"). Clic → dialog
+             Auto/720p/480p. L'adaptatif ajuste toujours SOUS le plafond. -->
+        <TextView
+            android:id="@+id/settingsQualityCapBtn"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:layout_marginTop="12dp"
+            android:gravity="center"
+            android:textColor="@color/wa_white"
+            android:textSize="14sp"
+            android:fontFamily="@font/impact"
+            android:letterSpacing="0.15"
+            android:background="@color/wa_darker_gray"
+            android:clickable="true"
+            android:focusable="true" />
+
+        <!-- Shake-to-record ON/OFF toggle. Texte set
+             programmatically ("SECOUER POUR FILMER : ON/OFF"). -->
+        <TextView
+            android:id="@+id/settingsShakeBtn"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:layout_marginTop="8dp"
+            android:gravity="center"
+            android:textColor="@color/wa_white"
+            android:textSize="14sp"
+            android:fontFamily="@font/impact"
+            android:letterSpacing="0.15"
+            android:background="@color/wa_darker_gray"
+            android:clickable="true"
+            android:focusable="true" />
+
+        <!-- Sensibilité du shake (Faible/Moyenne/Élevée). Grisée
+             quand le toggle est OFF. Texte set programmatically. -->
+        <TextView
+            android:id="@+id/settingsShakeSensitivityBtn"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:layout_marginTop="8dp"
+            android:gravity="center"
+            android:textColor="@color/wa_white"
+            android:textSize="14sp"
+            android:fontFamily="@font/impact"
+            android:letterSpacing="0.15"
+            android:background="@color/wa_darker_gray"
+            android:clickable="true"
+            android:focusable="true" />
+
+        <!-- §10.11 — toggle provenance (sceller un manifeste vérifiable).
+             Texte set programmatically (ON/OFF). Défaut OFF (opt-in). -->
+        <TextView
+            android:id="@+id/settingsProvenanceBtn"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:layout_marginTop="8dp"
+            android:gravity="center"
+            android:textColor="@color/wa_white"
+            android:textSize="14sp"
+            android:fontFamily="@font/impact"
+            android:letterSpacing="0.15"
+            android:background="@color/wa_darker_gray"
+            android:clickable="true"
+            android:focusable="true" />
+
+        <!-- §10.11 Phase B — toggle horodatage OTS (opt-in, défaut OFF).
+             Visible uniquement quand provenance est ON. Texte programmatique. -->
+        <TextView
+            android:id="@+id/settingsProvenanceTimestampBtn"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:layout_marginTop="8dp"
+            android:gravity="center"
+            android:textColor="@color/wa_white"
+            android:textSize="14sp"
+            android:fontFamily="@font/impact"
+            android:letterSpacing="0.15"
+            android:background="@color/wa_darker_gray"
+            android:clickable="true"
+            android:focusable="true" />
+
+        <!-- Actions -->
+        <TextView
+            style="@style/OsintSubtitle"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="32dp"
+            android:text="@string/stream_settings_section_actions" />
+
+        <!-- Retry manuel de l'enrôlement serveur. Visible
+             uniquement si une preuve d'enrôlement est en attente
+             (cf. StreamPreferences.hasPendingEnrollment). -->
+        <TextView
+            android:id="@+id/settingsRetryEnrollmentBtn"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:layout_marginTop="12dp"
+            android:gravity="center"
+            android:text="@string/stream_settings_retry_enrollment"
+            android:textColor="@color/wa_white"
+            android:textSize="14sp"
+            android:fontFamily="@font/impact"
+            android:letterSpacing="0.15"
+            android:background="@color/wa_orange"
+            android:clickable="true"
+            android:focusable="true"
+            android:visibility="gone" />
+
+        <TextView
+            android:id="@+id/settingsArchiveBtn"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:layout_marginTop="12dp"
+            android:gravity="center"
+            android:text="@string/stream_settings_archive_mode"
+            android:textColor="@color/wa_white"
+            android:textSize="14sp"
+            android:fontFamily="@font/impact"
+            android:letterSpacing="0.15"
+            android:background="@color/wa_darker_gray"
+            android:clickable="true"
+            android:focusable="true" />
+
+        <!-- Toggle "auto-upload des chunks orphelins". Texte
+             set programmatically (ON/OFF). Le clic flip le flag dans
+             StreamPreferences ; le OrphanSweepWorker check le flag à
+             chaque tick. -->
+        <TextView
+            android:id="@+id/settingsAutoUploadBtn"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:layout_marginTop="12dp"
+            android:gravity="center"
+            android:textColor="@color/wa_white"
+            android:textSize="14sp"
+            android:fontFamily="@font/impact"
+            android:letterSpacing="0.15"
+            android:background="@color/wa_darker_gray"
+            android:clickable="true"
+            android:focusable="true" />
+
+        <!-- Phase 6 — ratchet inactivity auto-lock delay (re-PIN). Text set
+             programmatically ("Auto-lock : 15 minutes"). -->
+        <TextView
+            android:id="@+id/settingsAutoLockBtn"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:layout_marginTop="12dp"
+            android:gravity="center"
+            android:textColor="@color/wa_white"
+            android:textSize="14sp"
+            android:fontFamily="@font/impact"
+            android:letterSpacing="0.15"
+            android:background="@color/wa_darker_gray"
+            android:clickable="true"
+            android:focusable="true" />
+
+        <TextView
+            android:id="@+id/settingsLockBtn"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:layout_marginTop="12dp"
+            android:gravity="center"
+            android:text="@string/stream_settings_lock"
+            android:textColor="@color/wa_white"
+            android:textSize="14sp"
+            android:fontFamily="@font/impact"
+            android:letterSpacing="0.15"
+            android:background="@color/wa_darker_gray"
+            android:clickable="true"
+            android:focusable="true" />
+
+        <TextView
+            android:id="@+id/settingsPanicBtn"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:layout_marginTop="24dp"
+            android:gravity="center"
+            android:text="@string/stream_settings_wipe"
+            android:textColor="@color/wa_white"
+            android:textSize="14sp"
+            android:fontFamily="@font/impact"
+            android:letterSpacing="0.15"
+            android:background="@color/wa_orange"
+            android:clickable="true"
+            android:focusable="true" />
+
+        <!-- Section : DEBUG (CALIBRATION) — bitrate fixe pour tester la
+             lisibilité visage à différents paliers (300/500/800/1200/
+             1800/2500 kbps × 720p|480p). Pendant la session calibration
+             l'AdaptiveQualityManager est verrouillé.
+             WHOLE SECTION is dev-only: StreamSettingsActivity gates this
+             container's visibility (and its listeners) behind BuildConfig.DEBUG
+             so it is unreachable in release — audit R-E-1/R-G-1, roadmap §8.2.8. -->
+        <LinearLayout
+            android:id="@+id/settingsDebugSection"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+        <TextView
+            style="@style/OsintSubtitle"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="32dp"
+            android:text="@string/stream_settings_section_debug" />
+
+        <TextView
+            android:id="@+id/settingsDebugBitrateBtn"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:layout_marginTop="12dp"
+            android:gravity="center"
+            android:textColor="@color/wa_white"
+            android:textSize="14sp"
+            android:fontFamily="@font/impact"
+            android:letterSpacing="0.15"
+            android:background="@color/wa_darker_gray"
+            android:clickable="true"
+            android:focusable="true" />
+
+        <TextView
+            android:id="@+id/settingsDebugQualityBtn"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:layout_marginTop="8dp"
+            android:gravity="center"
+            android:textColor="@color/wa_white"
+            android:textSize="14sp"
+            android:fontFamily="@font/impact"
+            android:letterSpacing="0.15"
+            android:background="@color/wa_darker_gray"
+            android:clickable="true"
+            android:focusable="true" />
+
+        <TextView
+            android:id="@+id/settingsDebugKbpsBtn"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:layout_marginTop="8dp"
+            android:gravity="center"
+            android:textColor="@color/wa_white"
+            android:textSize="14sp"
+            android:fontFamily="@font/impact"
+            android:letterSpacing="0.15"
+            android:background="@color/wa_darker_gray"
+            android:clickable="true"
+            android:focusable="true" />
+
+        <!-- Probe and HEVC test buttons (2026-05-16). -->
+        <TextView
+            android:id="@+id/settingsDebugCodecProbeBtn"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:layout_marginTop="16dp"
+            android:gravity="center"
+            android:text="@string/stream_settings_debug_codec_probe"
+            android:textColor="@color/wa_white"
+            android:textSize="14sp"
+            android:fontFamily="@font/impact"
+            android:letterSpacing="0.15"
+            android:background="@color/wa_darker_gray"
+            android:clickable="true"
+            android:focusable="true" />
+
+        <TextView
+            android:id="@+id/settingsDebugHevcTestBtn"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:layout_marginTop="8dp"
+            android:gravity="center"
+            android:text="@string/stream_settings_debug_hevc_test"
+            android:textColor="@color/wa_white"
+            android:textSize="14sp"
+            android:fontFamily="@font/impact"
+            android:letterSpacing="0.15"
+            android:background="@color/wa_darker_gray"
+            android:clickable="true"
+            android:focusable="true" />
+
+        <TextView
+            android:id="@+id/settingsDebugHevcGridBtn"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:layout_marginTop="8dp"
+            android:gravity="center"
+            android:text="@string/stream_settings_debug_hevc_grid"
+            android:textColor="@color/wa_white"
+            android:textSize="14sp"
+            android:fontFamily="@font/impact"
+            android:letterSpacing="0.15"
+            android:background="@color/wa_darker_gray"
+            android:clickable="true"
+            android:focusable="true" />
+
+        <!-- Phase H2-B.2 (2026-05-16) — HEVC + AAC audio bundled test.
+             Uses ChunkEncoderBundle to mux a video track (HEVC via
+             MediaCodec + GL wedge) and an audio track (AudioRecord
+             VOICE_RECOGNITION → AAC) into one MP4. -->
+        <TextView
+            android:id="@+id/settingsDebugHevcAudioTestBtn"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:layout_marginTop="8dp"
+            android:gravity="center"
+            android:text="@string/stream_settings_debug_hevc_audio_test"
+            android:textColor="@color/wa_white"
+            android:textSize="14sp"
+            android:fontFamily="@font/impact"
+            android:letterSpacing="0.15"
+            android:background="@color/wa_darker_gray"
+            android:clickable="true"
+            android:focusable="true" />
+
+        <!-- Rolling chunk recorder test (2026-05-16).
+             Records 4 successive 5s chunks (HEVC+AUDIO) via
+             RollingChunkRecorder. Camera + GL pipeline + PCM capture
+             stay live across rotations; only encoders/muxer are
+             recreated per chunk. -->
+        <TextView
+            android:id="@+id/settingsDebugRollingTestBtn"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:layout_marginTop="8dp"
+            android:gravity="center"
+            android:text="@string/stream_settings_debug_rolling_test"
+            android:textColor="@color/wa_white"
+            android:textSize="14sp"
+            android:fontFamily="@font/impact"
+            android:letterSpacing="0.15"
+            android:background="@color/wa_darker_gray"
+            android:clickable="true"
+            android:focusable="true" />
+
+        <!-- Debug A/B (2026-06-02) — aspect root-cause toggle : config A
+             (4:3 + 0.75 anamorphic) vs config B (16:9 identity GL). Text
+             set programmatically. Default A. -->
+        <TextView
+            android:id="@+id/settingsDebugAspectBtn"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:layout_marginTop="8dp"
+            android:gravity="center"
+            android:textColor="@color/wa_white"
+            android:textSize="14sp"
+            android:fontFamily="@font/impact"
+            android:letterSpacing="0.15"
+            android:background="@color/wa_darker_gray"
+            android:clickable="true"
+            android:focusable="true" />
+
+        <!-- Phase 3a (2026-06-20) — QUIC/h3 (quinn-BBR) vs DirectTls transport
+             A/B toggle. Text set programmatically. Default DirectTls. -->
+        <TextView
+            android:id="@+id/settingsDebugQuicBtn"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:layout_marginTop="8dp"
+            android:gravity="center"
+            android:textColor="@color/wa_white"
+            android:textSize="14sp"
+            android:fontFamily="@font/impact"
+            android:letterSpacing="0.15"
+            android:background="@color/wa_darker_gray"
+            android:clickable="true"
+            android:focusable="true" />
+
+        </LinearLayout>
+
+        <!-- Section : À PROPOS (Phase 7.3) — version + commit hash + AGPLv3.
+             Lien AGPLv3 ouvre le navigateur vers la licence GNU. -->
+        <TextView
+            style="@style/OsintSubtitle"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="32dp"
+            android:text="@string/stream_settings_section_about" />
+
+        <TextView
+            android:id="@+id/settingsAboutVersion"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:textColor="@color/wa_white"
+            android:textSize="13sp"
+            android:fontFamily="monospace" />
+
+        <TextView
+            android:id="@+id/settingsAboutCommit"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:textColor="@color/wa_gray"
+            android:textSize="12sp"
+            android:fontFamily="monospace" />
+
+        <TextView
+            android:id="@+id/settingsAboutLicense"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:padding="4dp"
+            android:text="@string/stream_settings_about_license"
+            android:textColor="@color/wa_orange"
+            android:textSize="13sp"
+            android:fontFamily="monospace"
+            android:clickable="true"
+            android:focusable="true" />
+
+        <TextView
+            android:id="@+id/settingsCloseBtn"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center_horizontal"
+            android:layout_marginTop="32dp"
+            android:padding="12dp"
+            android:text="@string/stream_settings_close"
+            android:textColor="@color/wa_gray"
+            android:textSize="13sp"
+            android:fontFamily="monospace" />
+
+    </LinearLayout>
+</ScrollView>

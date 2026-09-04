@@ -1,0 +1,323 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    StreamActivity layout — minimal Blackmagic-camera-style recording UI.
+
+    This screen is deliberately bare, and the list of what was taken out is
+    written down here so that none of it gets added back as a forgotten
+    feature: flip camera, quality label, ratchet batch info, "TAP TO STREAM"
+    caption, stop square. Flip camera was meant to move into Settings as a
+    follow-up; it never did, and capture still requires the back lens.
+
+    At idle the preview is not merely dimmed. `idleScrim`, a full-screen
+    opaque View, hides it entirely, and the camera is not even live at that
+    point — it only runs inside the recording service. The scrim goes GONE
+    when recording starts and comes back on stop.
+
+    One single REC button at the bottom center, tap to start and tap to stop;
+    the state lives on the view itself as `isActivated` (bright vs dim red
+    disc inside a white ring). Only three HUD elements while recording: timer
+    (top center), chunk counter (top right), REC dot that pulses (top left).
+    Idle adds a 6-group fingerprint at the bottom (confidence signal) and a
+    settings gear. No wordmark: it was taken off this screen, see the comment
+    above the REC button section.
+-->
+<!-- id streamRoot conservé pour le layout ; la capture des taps stealth ne
+     passe PAS par une vue. Depuis la Phase 7.13 v2.2 elle se fait dans
+     StreamActivity.dispatchTouchEvent(), au niveau Activity, en amont du
+     dispatching aux vues — l'attache sur la PreviewView (qui consume le DOWN)
+     comme sur streamRoot n'a pas fonctionné sur Seeker. Voir
+     StreamActivity.setupStealthGestures / dispatchTouchEvent. -->
+<androidx.constraintlayout.widget.ConstraintLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:id="@+id/streamRoot"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#0A0A0F">
+
+    <!-- On-screen preview for the HEVC pipeline, the sole capture path.
+         SurfaceView and not TextureView, for hardware compositing: the swap
+         looks harmless and compiles cleanly, but it changes the render path
+         and the SurfaceHolder.Callback contract the activity relies on to
+         forward the Holder's Surface to StreamRecordingService
+         (setHevcPreviewSurface).
+
+         match_parent here is NOT a framing choice. The GL pipeline applies an
+         aspect-correct letterbox/cover fit per frame, so pinning a ratio or
+         fixed dimensions on this view to "fix" a badly framed preview applies
+         the fit a second time and gives a squashed or over-cropped picture,
+         with nothing visibly broken on the Kotlin side. See
+         GlVideoPipeline.drawFullscreenQuad. -->
+    <SurfaceView
+        android:id="@+id/hevcPreviewSurfaceView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:visibility="gone" />
+
+    <!-- Opaque idle backdrop. At idle the camera is NOT live
+         (it runs only inside the recording service), so after a stop the
+         preview SurfaceView would otherwise show a FROZEN last frame. A
+         fully-opaque dark fill (matches the root #0A0A0F) gives a clean idle
+         screen and hides any frozen frame during the screen-off transition,
+         instead of the "dim preview that vanishes" glitch. During recording
+         this scrim is GONE (startRecording), so the live preview is unaffected. -->
+    <View
+        android:id="@+id/idleScrim"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#FF0A0A0F" />
+
+    <!-- =============================================================== -->
+    <!-- Top HUD                                                         -->
+    <!-- =============================================================== -->
+
+    <!-- Settings gear (top-left; visible both states). -->
+    <ImageView
+        android:id="@+id/settingsBtn"
+        android:layout_width="40dp"
+        android:layout_height="40dp"
+        android:layout_marginStart="16dp"
+        android:layout_marginTop="48dp"
+        android:src="@drawable/ic_settings_white"
+        android:padding="8dp"
+        android:contentDescription="Settings"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
+
+    <!-- Blinking REC dot (top-left, only during recording). Sits next to
+         the settings gear — the settings gear stays because users need
+         access to server config / identity at any time. -->
+    <TextView
+        android:id="@+id/recIndicator"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="8dp"
+        android:text="●"
+        android:textColor="#CC1A1A"
+        android:textSize="14sp"
+        android:visibility="gone"
+        app:layout_constraintStart_toEndOf="@+id/settingsBtn"
+        app:layout_constraintTop_toTopOf="@+id/settingsBtn"
+        app:layout_constraintBottom_toBottomOf="@+id/settingsBtn"
+        tools:visibility="visible"
+        tools:ignore="HardcodedText" />
+
+    <!-- Timer (top-center, only during recording).
+         Monospace for stable glyph width. -->
+    <TextView
+        android:id="@+id/timerText"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="48dp"
+        android:text="00:00:00"
+        android:textColor="#FFFFFFFF"
+        android:textSize="20sp"
+        android:fontFamily="monospace"
+        android:visibility="gone"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintTop_toTopOf="parent"
+        tools:visibility="visible"
+        tools:ignore="HardcodedText" />
+
+    <!-- Chunks counter (top-right, only during recording). Format
+         uploaded↑/encrypted, replaced by "N↑ ✓" once the upload has caught
+         up with the encryption; turns orange when the backlog goes past 5
+         chunks. The text is set in code (StreamActivity.chunkUpdateReceiver);
+         the "0↑" below is only a starting value. -->
+    <TextView
+        android:id="@+id/chunkStatus"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginEnd="16dp"
+        android:layout_marginTop="48dp"
+        android:text="0↑"
+        android:textColor="#AAFFFFFF"
+        android:textSize="16sp"
+        android:fontFamily="monospace"
+        android:visibility="gone"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintTop_toTopOf="parent"
+        tools:visibility="visible"
+        tools:ignore="HardcodedText" />
+
+    <!-- Adaptive quality indicator (top-right, just under
+         chunk counter). Updated by ACTION_QUALITY_UPDATE broadcast. -->
+    <TextView
+        android:id="@+id/qualityIndicator"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginEnd="16dp"
+        android:layout_marginTop="2dp"
+        android:text="720p"
+        android:textColor="#88FFFFFF"
+        android:textSize="11sp"
+        android:fontFamily="monospace"
+        android:visibility="gone"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintTop_toBottomOf="@+id/chunkStatus"
+        tools:visibility="visible"
+        tools:ignore="HardcodedText" />
+
+    <!-- The Frappuccino wordmark has been taken off the recording screen (the
+         camera app is meant to feel like a tool, not a brand surface). It is
+         not on the PIN screens either, which were stripped down on their own
+         side; the only layout still carrying it is onboard_all_done_fragment
+         (hdpi and xhdpi variants), through the FrappuccinoBrandText style. -->
+
+    <!-- =============================================================== -->
+    <!-- Center / bottom — the REC button                                -->
+    <!-- =============================================================== -->
+
+    <!-- One button for both start and stop. `isActivated` drives the
+         dim→bright transition in rec_button_bg.xml.
+
+         Keep the bottom anchor in dp, never %-based: that is what keeps the
+         margin clearing the system nav bar on edge-to-edge screens across
+         devices. Turning it into a layout_constraintVertical_bias to make the
+         layout "responsive" pushes the button under the system bar on part of
+         the fleet only, so testing on one phone will not show it.
+
+         The 72dp size and the 56dp bottom margin are not cosmetic either:
+         together they sit the button in the bottom letterbox bar (H2-B.20/22),
+         under the picture, instead of overlapping the live content. Growing the
+         button or shaving the margin brings it back over the footage — and 88dp
+         with a 64dp margin is precisely what was tried and abandoned, phase
+         H2-B.24 (2026-05-24) having brought both down to today's values. The
+         drawable follows the size (the oval fills the bounds; only the 3dp ring
+         stroke and the 10dp disc inset are fixed), and that is what bounds the
+         range of sizes where the button still reads as a clean ring. -->
+    <View
+        android:id="@+id/recButton"
+        android:layout_width="72dp"
+        android:layout_height="72dp"
+        android:layout_marginBottom="56dp"
+        android:background="@drawable/rec_button_bg"
+        android:clickable="true"
+        android:focusable="true"
+        android:contentDescription="@string/action_rec_stop"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintBottom_toBottomOf="parent" />
+
+    <!-- =============================================================== -->
+    <!-- Bottom — fingerprint (idle only)                                -->
+    <!-- =============================================================== -->
+
+    <!-- Barely-visible 6-group fingerprint. Confidence signal for the
+         user: "this device is the one that enrolled the identity you
+         see on paper". 12sp monospace so the groups line up. -->
+    <TextView
+        android:id="@+id/fingerprintText"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="16dp"
+        android:text="— — — — — —"
+        android:textColor="#33FFFFFF"
+        android:textSize="12sp"
+        android:fontFamily="monospace"
+        app:layout_constraintBottom_toTopOf="@+id/recButton"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        tools:ignore="HardcodedText" />
+
+    <!-- Bandeau orphelins (in-app, PAS de notif : furtivité).
+         Visible en idle quand des fragments d'enregistrement attendent
+         l'envoi depuis trop longtemps (risque de purge 48h = ambre) ou ont
+         été supprimés faute d'avoir atteint le serveur (= rouge). Tap →
+         dialog détail + bouton réessayer. Texte + couleur fixés en code dans
+         StreamActivity.refreshOrphanBanner(). Empilé au-dessus du bandeau
+         enrollment (les deux idle-only ; coexistence rare mais propre). -->
+    <TextView
+        android:id="@+id/orphanBanner"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="16dp"
+        android:layout_marginEnd="16dp"
+        android:layout_marginBottom="8dp"
+        android:padding="12dp"
+        android:gravity="center"
+        android:textColor="@color/wa_white"
+        android:textSize="13sp"
+        android:fontFamily="@font/impact"
+        android:letterSpacing="0.1"
+        android:background="@color/wa_orange"
+        android:clickable="true"
+        android:focusable="true"
+        android:visibility="gone"
+        app:layout_constraintBottom_toTopOf="@+id/enrollmentBanner"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        tools:text="2 fragments en attente d'envoi — appuyer"
+        tools:visibility="visible" />
+
+    <!-- Bandeau de l'enrôlement serveur en attente : l'identité locale
+         existe, mais le serveur ne la connaît pas encore. Un tap ouvre
+         Settings, où se trouvent la fiche statut et le bouton RÉESSAYER
+         MANUEL.
+
+         Il reste caché pendant un enregistrement, et c'est délibéré : l'écran
+         de capture reste épuré. Ne pas le rendre visible en cours de capture
+         au motif qu'il faudrait prévenir l'utilisateur tout de suite. Sans
+         enrôlement serveur, le streaming n'uploade rien du tout — c'est la
+         première cause à regarder devant un compteur de chunks bloqué à
+         zéro. -->
+    <TextView
+        android:id="@+id/enrollmentBanner"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="16dp"
+        android:layout_marginEnd="16dp"
+        android:layout_marginBottom="8dp"
+        android:padding="12dp"
+        android:gravity="center"
+        android:text="@string/enrollment_pending_banner"
+        android:textColor="@color/wa_white"
+        android:textSize="13sp"
+        android:fontFamily="@font/impact"
+        android:letterSpacing="0.1"
+        android:background="@color/wa_orange"
+        android:clickable="true"
+        android:focusable="true"
+        android:visibility="gone"
+        app:layout_constraintBottom_toTopOf="@+id/fingerprintText"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        tools:visibility="visible" />
+
+    <!-- Overlay noir du mode stealth. Ne jamais revenir à ce que faisait la
+         v1, qui forçait la luminosité à zéro (BRIGHTNESS_OVERRIDE_OFF) en
+         gardant l'écran allumé : cet état hybride "écran on mais noir" était
+         traité comme inactif par Doze, qui gelait les uploads. La capture,
+         elle, continuait pendant que la vidéo cessait de quitter le
+         téléphone. "Il suffit de couper la luminosité" est le premier réflexe
+         de qui veut rendre le stealth plus convaincant ; c'est celui-là qu'il
+         ne faut pas suivre.
+
+         Ce que fait l'overlay à la place : il masque la preview et tout le HUD
+         d'un coup, pendant que clearFlags(FLAG_KEEP_SCREEN_ON) rend la main au
+         timer système (15 s sur Seeker) pour que l'écran s'éteigne vraiment.
+         Sans lui, ces secondes-là donneraient à l'utilisateur l'impression que
+         son tap n'a rien fait.
+
+         elevation=100dp pour passer au-dessus de toutes les autres vues,
+         recButton et idleScrim compris ; sinon l'écran n'a pas l'air éteint
+         pendant l'attente du timeout. clickable=true pour consumer les taps
+         destinés aux vues en dessous — ce qui n'empêche pas
+         dispatchTouchEvent de les voir passer en amont. D'où deux sorties du
+         stealth : le power button (l'écran s'allume → onResume →
+         exitStealthMode) et un simple tap, que le gesture detector traduit
+         lui aussi en exitStealthMode. -->
+    <View
+        android:id="@+id/stealthOverlay"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="@android:color/black"
+        android:clickable="true"
+        android:focusable="true"
+        android:elevation="100dp"
+        android:visibility="gone"
+        tools:ignore="KeyboardInaccessibleWidget" />
+
+</androidx.constraintlayout.widget.ConstraintLayout>

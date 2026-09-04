@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "description": "EnrollmentKit.fromMnemonic derivation: (mnemonic, passphrase) -> (ed_pk, x_pk, chain_0, fingerprint)",
+  "hkdf_ctx_identity": "stream.identity.ed25519.v1",
+  "hkdf_ctx_encryption": "stream.encryption.x25519.v1",
+  "hkdf_ctx_chain0": "stream.ratchet.chain0.v2",
+  "cases": [
+    {
+      "mnemonic": "abaisser abandon abdiquer abeille abolir aborder aboutir aboyer abrasif abreuver abriter abroger",
+      "passphrase": "",
+      "ed25519_pk_hex": "f373b6de310a66e4b4f0e1ab355c89446762b59b47895d2d42ecfa5ed8d36920",
+      "x25519_pk_hex": "0c4a9eab831cf2594f1622db081b451cb1b403c9d79c6a3b3339cb15d722504f",
+      "chain_0_hex": "5d6962cb98a47d2a2d9bbdd163d40b982ebba8e27897efd071f1a9748c44d6c6",
+      "fingerprint": "559f 0303 d56e 320f 815e c1b2"
+    },
+    {
+      "mnemonic": "abaisser abandon abdiquer abeille abolir aborder aboutir aboyer abrasif abreuver abriter abroger",
+      "passphrase": "motdepasse",
+      "ed25519_pk_hex": "27dabdeec7d93ac3fe104f25f1d9ed9954b1c1e17216786cd3293198f8defdb0",
+      "x25519_pk_hex": "0072160f6d3121882b24dab996b133bf75d1caa924b998e03c621d4714d9a368",
+      "chain_0_hex": "9424cd1abf3ac4f2cfbe76c22d0ced9a730fc0b9944b4c6a9888c6c203e81ecd",
+      "fingerprint": "23d6 b1d7 7b2a 5e9a c4e2 0d03"
+    },
+    {
+      "mnemonic": "évoquer jardin guitare soutirer mondial limonade homogène émulsion tenir xénon massif kiosque",
+      "passphrase": "",
+      "ed25519_pk_hex": "38c8c202a9927aa54ce4e64d83c64d170241f2aad8e6cd8e64852e1bdc3da325",
+      "x25519_pk_hex": "6ff28518d15f5d3f13586c0fba01ee983176742c2ee2aeacd675974a26ae990d",
+      "chain_0_hex": "ffb03835dd64c79e2fdfc22aafe2d9967b20d61471baccfaf29751e33d3e4780",
+      "fingerprint": "f33d d9b9 aa5e 99ac 68fe b4f2"
+    },
+    {
+      "mnemonic": "évoquer jardin guitare soutirer mondial limonade homogène émulsion tenir xénon massif kiosque",
+      "passphrase": "motdepasse",
+      "ed25519_pk_hex": "6ffc59e553f09c4619a44c7213c63f4bea838e7cd3e880deae4427ae26ff85a3",
+      "x25519_pk_hex": "5b08be074a75948bf1ab69858ef7e08611e6fdf99690924b7e57f6f4ca05c90c",
+      "chain_0_hex": "cf305362f365d868d8bf4420583043d59e9b4d02f2e0eb94c409e0288611b4f4",
+      "fingerprint": "e209 baea 302c d32e 73fd e548"
+    },
+    {
+      "mnemonic": "voguer noirceur boulon sublime gruger écluse vaseux abrupt moulin recevoir chéquier bassin",
+      "passphrase": "",
+      "ed25519_pk_hex": "0aeac8a9717694ac8448e55d89e6fac55c49e6fb880ded0f8dc406d3cf4b138e",
+      "x25519_pk_hex": "1278b6c6ef00e00d1e637126a6fd0d6777ac6814ae1a5f60f5f5e1952f37fe26",
+      "chain_0_hex": "e2be9fa7533baa45c74eeaf60a665f5ca9a4b34ba4bf607405b9d7b984189ac9",
+      "fingerprint": "a1a3 dae4 912f f243 9ed8 93f7"
+    },
+    {
+      "mnemonic": "voguer noirceur boulon sublime gruger écluse vaseux abrupt moulin recevoir chéquier bassin",
+      "passphrase": "motdepasse",
+      "ed25519_pk_hex": "916e54092025efa6cf959413cea7d94ec368452f98a84d1cf4750f2d62101775",
+      "x25519_pk_hex": "57633e650c01bc228ca7e674d7a8b1180f80aec1d47b56d46570068d03535174",
+      "chain_0_hex": "b8e0b784ddf080122835a4e5777291ce09b5c7bacc021d4168db1972c99df3ed",
+      "fingerprint": "bddc c0bb 0a12 fd4e 2070 cbaf"
+    }
+  ]
+}

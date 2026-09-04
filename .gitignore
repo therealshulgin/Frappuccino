@@ -1,0 +1,145 @@
+*.iml
+.gradle
+/local.properties
+/.idea/workspace.xml
+/.idea/libraries
+/.idea/
+/projectFilesBackup/
+.DS_Store
+/build
+/captures
+
+# Rust crypto-rs — generated Android native libs + UniFFI Kotlin bindings
+/mobile/src/main/jniLibs/
+/mobile/build/generated/source/uniffi/
+/crypto-rs/target/
+# The .so provenance manifest describes those untracked binaries, so it cannot be
+# a source file: a committed copy only ever describes whichever machine last ran
+# build-android.sh. That is how the first public snapshot came to ship a manifest
+# naming a private -dirty commit (audit 2026-08-28, F-04). It is regenerated on
+# every build and published as an artifact of the release run, next to the .so.
+/crypto-rs/PROVENANCE.txt
+# cargo-mutants run output (mutation-testing reports) — regenerated, not tracked
+/crypto-rs/mutants.out/
+/crypto-rs/mutants.out.old/
+java_pid18084.hprof
+/mobile/release/
+
+# Google Maps API keys
+/mobile/src/debug/res/values/google_maps_api.xml
+/mobile/src/main/res/values/google_maps_api.xml
+/mobile/src/release/res/values/google_maps_api.xml
+
+# Google services configuration
+/mobile/src/debug/google-services.json
+/mobile/src/main/google-services.json
+/mobile/src/release/google-services.json
+
+mobile/google-services.json
+
+# Build outputs
+**/build/
+
+# Secrets
+.jwt_secret
+.authorized_keys.json
+.invite_codes.json
+
+# Release signing — keystore + passwords NEVER committed (transport flip §10.7).
+# The .jks lives outside the repo; keystore.properties (git-ignored) points to it.
+mobile/keystore.properties
+*.jks
+*.keystore
+
+# SSH keys — never commit
+server/keys
+server/keys.pub
+**/id_rsa
+**/id_ed25519
+**/*_vultr
+**/authorized_keys
+
+# V2 server state
+server/.ratchet_registry.json
+server/.env
+
+# server/deploy/ runtime secrets — env file + TLS material never committed
+server/deploy/.env
+server/deploy/**/.env
+server/deploy/tls/*.crt
+server/deploy/tls/*.key
+server/deploy/tls/*.pem
+server/deploy/tls/spki_sha256.txt
+
+# Break-glass TLS key material — NEVER commit (Lot 3 D-2). The encrypted private
+# key + its passphrase live OFF-host; only the PUBLIC next cert is embedded, as a
+# fixture under crypto-rs/.../assets and mobile/.../res/raw (those keep the name
+# frappuccino_ca_next.crt and are NOT matched here). The loose repo-root copies,
+# any age ciphertext, and any passphrase file are ignored as belt-and-suspenders.
+/next.crt
+/next.key
+/next.key.age
+/next2.crt
+/next2.key
+/next2.key.age
+*.age
+passphrase*.txt
+
+# Temporary / debug files (adb dumps, local registry copies, etc.)
+_*.json
+_*.xml
+
+# MinIO data
+minio-data/
+
+# Python
+__pycache__/
+*.pyc
+
+# Test artifacts
+test_blob.strm
+test_real_blob.strm
+*.tmp
+
+# Claude plans
+.claude/
+
+# Local scratch — adb pulls, debug captures, field/telemetry logs, tool caches
+# (ROADMAP 7.18e). *.md scratch (session compacts, old audit prompts, superseded tech docs) was triaged 2026-06-05 into OLD/ (ROADMAP 7.18) -- see /OLD/ below.
+.tmp_*
+pulled_*/
+*.log
+.nonce_cache.json
+server/.nonce_cache.json
+.serena/
+blue_team_semgrep_1/
+
+# Phase 7.18 (2026-06-05) -- archived scratch .md moved to OLD/ (session compacts,
+# old audit prompts, superseded tech docs). Preserved locally, OUT OF SCOPE for
+# sessions (ripgrep skips it). See OLD/README.md.
+/OLD/
+
+# Copies de travail d'audits externes (passes de relecture faites hors du depot
+# sur une copie du code, ex. nettoyage de commentaires). Chaque copie duplique
+# des centaines de fichiers sources aux memes chemins relatifs : sans cette
+# regle, un `git add -A` distrait les commiterait en double. Les copies restent
+# en local, seules leurs conclusions remontent dans le depot.
+/codex_audit*/
+# Brouillons de courriers : portent le nom civil du mainteneur, qui doit
+# signer ces envois. Le depot etant public, le fichier reste local.
+docs/OUTREACH_DRAFTS_2026-07.md
+# index temporaire de tools/publication/build-publication.py
+/tools/publication/index-tmp
+
+# Rapports d audit adverses : PRIVES (decision du mainteneur, 2026-09-04).
+# Ils enumerent des faiblesses et se lisent comme une carte d attaque.
+/blue_report.md
+/red_report.md
+
+# Audits adverses et passe commentaires : PRIVES (decision du mainteneur, 2026-09-04).
+# Les rapports red/blue enumerent des faiblesses et se lisent comme une carte
+# d attaque ; la passe commentaires est du process interne sans valeur externe.
+/docs/audit-2026-06-26/
+/docs/audit-code-2026-06-28/
+/docs/red-team-2026-06-28/
+/docs/COMMENT_PASS_*.md

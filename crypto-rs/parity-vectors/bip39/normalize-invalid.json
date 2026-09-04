@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "description": "BIP-39 normalizeWord: inputs that MUST throw IllegalArgumentException (BT-HIGH-10)",
+  "language": "fr",
+  "invalid_words": [
+    {
+      "word": "xyz"
+    },
+    {
+      "word": "abandn"
+    },
+    {
+      "word": "hello"
+    },
+    {
+      "word": "notaword"
+    }
+  ]
+}

@@ -1,0 +1,101 @@
+name: Rust crypto-rs
+
+on:
+  # WP-E2 — `server/**` is included because the V2 signature-domain contract
+  # (tags 0x01-0x08) is mirrored across crypto-rs (the source of truth) and the
+  # Python relay. The cross-language KATs pin the same bytes on both sides, so a
+  # server-side change to a domain tag / signed-message layout must re-run the
+  # Rust producer suite (cargo test runs auth_sig_kat + the report KAT). The
+  # Python verifier side runs in server.yml (which mirrors this and also triggers
+  # on crypto-rs/**).
+  push:
+    paths:
+      - 'crypto-rs/**'
+      - 'server/**'
+      - '.github/workflows/rust.yml'
+  pull_request:
+    paths:
+      - 'crypto-rs/**'
+      - 'server/**'
+      - '.github/workflows/rust.yml'
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: crypto-rs
+
+jobs:
+  check:
+    name: cargo check/clippy/fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (pinned via rust-toolchain.toml)
+        run: rustup show
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crypto-rs/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('crypto-rs/Cargo.lock', 'crypto-rs/**/Cargo.toml') }}
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --workspace -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --locked
+
+      # The legacy STRM decoder (V1/V2) is behind `legacy-strm`, off by default so
+      # the shipped .so carries no legacy parsing surface. The four STRM parity
+      # fixtures are V1 blobs written by the old Kotlin encoder, and they are the
+      # only STRM vectors in the tree produced by a different implementation.
+      # Gating the decoder out of the binary must not gate that evidence out of
+      # CI, so the legacy tests run here explicitly.
+      - name: cargo test (legacy STRM decoder, the CLI configuration)
+        run: cargo test -p frappuccino-crypto-stream --locked --features legacy-strm
+
+  supply-chain:
+    name: cargo-deny + cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # cargo-deny is installed here rather than through
+      # EmbarkStudios/cargo-deny-action, which shipped a cargo-deny too old to
+      # read this deny.toml: the `[graph]` section and `allow-wildcard-paths`
+      # both arrived in 0.14, and the action's v1 predates them. It failed on the
+      # config rather than on the dependencies, which is the same failure mode as
+      # the `--all-features` argument it replaced, one layer further down.
+      #
+      # Pinning the exact version also means CI runs the tool that was actually
+      # run locally. `cargo deny check` takes no feature flags: the scope lives in
+      # crypto-rs/deny.toml, which sets `all-features = true` under [graph].
+      - name: Cache cargo-deny and cargo-audit
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin
+          key: ${{ runner.os }}-cargo-supply-chain-deny-0.20.2
+
+      - name: Install cargo-deny (pinned) and cargo-audit
+        run: |
+          set -euo pipefail
+          have="$(cargo deny --version 2>/dev/null | awk '{print $2}' || true)"
+          if [ "$have" != "0.20.2" ]; then
+            cargo install cargo-deny --version 0.20.2 --locked
+          fi
+          command -v cargo-audit > /dev/null || cargo install cargo-audit --locked
+
+      # The workflow-level `defaults.run.working-directory` already puts every
+      # step in crypto-rs, so deny.toml is found without a manifest path.
+      - name: cargo deny check
+        run: cargo deny check
+
+      - name: cargo audit
+        run: cargo audit

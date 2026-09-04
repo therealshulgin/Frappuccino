@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "description": "Ratchet V2 blob after initialize(chain_0) + 2 signs",
+  "chain_0_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "blob_v2_filename": "blob_v2.bin",
+  "blob_v2_size": 4876,
+  "blob_v1_legacy_filename": "blob_v1_legacy.bin",
+  "blob_v1_legacy_size": 4844,
+  "consumed_slots": "0,1",
+  "batch_number": 0
+}

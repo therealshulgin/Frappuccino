@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <dimen name="lock_password_button_margin_top">35dp</dimen>
+    <dimen name="lock_subtitle_desc_margin_top">17dp</dimen>
+</resources>
