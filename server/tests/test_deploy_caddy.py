@@ -7,7 +7,8 @@ The relay keeps no trace of the requests it carries: nginx runs with
 deploy/caddy/Caddyfile) is the third component on the request path, and Caddy
 writes an access log as soon as a site block holds a `log` directive. An
 earlier, unversioned copy of that file had one. These checks read the
-versioned file and the script that runs it.
+versioned file and the script that runs it, and the kernel UDP buffers the
+front and the de-obfuscation proxy depend on (deploy/sysctl/).
 """
 
 import re
@@ -70,3 +71,26 @@ def test_the_run_script_refuses_a_caddyfile_that_logs():
     # The script carries its own guard, for a file edited on the host.
     script = RUN_SCRIPT.read_text(encoding="utf-8")
     assert "refusing to start a front that logs requests" in script
+
+
+SYSCTL = DEPLOY.parent / "sysctl" / "90-frappuccino-udp.conf"
+# quic-go's recommendation for its receive and send buffers.
+_QUIC_GO_BUFFER = 7_500_000
+
+
+def _sysctl_values(text: str) -> dict[str, int]:
+    values = {}
+    for line in _directives(text):
+        key, _, value = line.partition("=")
+        values[key.strip()] = int(value.strip())
+    return values
+
+
+def test_the_udp_buffers_let_quic_go_have_what_it_asks_for():
+    values = _sysctl_values(SYSCTL.read_text(encoding="utf-8"))
+    assert values["net.core.rmem_max"] >= _QUIC_GO_BUFFER
+    assert values["net.core.wmem_max"] >= _QUIC_GO_BUFFER
+    # The de-obfuscation proxy asks for no size: it gets the default, which
+    # must be well above Ubuntu's 212992.
+    assert values["net.core.rmem_default"] > 212_992
+    assert values["net.core.rmem_default"] <= values["net.core.rmem_max"]

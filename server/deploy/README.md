@@ -564,3 +564,20 @@ de lancement refuse un fichier qui en contient une).
   ```
 
   Supprimer l'ancien conteneur supprime aussi son journal Docker, définitivement.
+
+### Tampons UDP du noyau
+
+Le front QUIC et le proxy de désobfuscation reçoivent en UDP. Avec les valeurs
+par défaut d'Ubuntu, le noyau jette des datagrammes faute de place (compteur
+`RcvbufErrors` de `/proc/net/snmp`) et quic-go le signale au démarrage de
+Caddy. Le réglage est versionné : `deploy/sysctl/90-frappuccino-udp.conf`.
+Installé à `/etc/sysctl.d/`, il survit aux redémarrages ; après l'avoir appliqué,
+redémarrer Caddy et le proxy pour qu'ils rouvrent leurs sockets :
+
+```bash
+sysctl -p /etc/sysctl.d/90-frappuccino-udp.conf
+```
+
+```bash
+docker restart frappuccino-quic-front && systemctl restart frappuccino-obfs-proxy
+```
