@@ -2,7 +2,13 @@ package rs.readahead.washington.mobile.util.jobs
 
 import android.content.Context
 import androidx.hilt.work.HiltWorker
+import androidx.work.BackoffPolicy
+import androidx.work.Constraints
 import androidx.work.Data
+import androidx.work.ExistingWorkPolicy
+import androidx.work.NetworkType
+import androidx.work.OneTimeWorkRequest
+import androidx.work.WorkManager
 import androidx.work.Worker
 import androidx.work.WorkerParameters
 import dagger.assisted.Assisted
@@ -10,12 +16,20 @@ import dagger.assisted.AssistedInject
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.stream.crypto.SecureWipe
+import org.stream.crypto.upload.EnvelopeQueue
+import org.stream.crypto.upload.LegacyReportMigration
+import org.stream.crypto.upload.QueueKeyStore
+import org.stream.crypto.upload.StreamUploadManager
+import org.stream.crypto.upload.TimestampTicketPolicy
 import timber.log.Timber
+import uniffi.frappuccino.FfiException
 import java.io.File
+import java.util.concurrent.TimeUnit
 
 /**
- * Submits a recording's salted OTS commitment to the relay for trustless
- * timestamping (§10.11).
+ * Gets a closed report's opt-in OTS timestamp (§10.11) and turns it into a
+ * queue envelope.
  *
  * Never make the device submit the commitment straight to the `OpenTimestamps`
  * calendars, even though it would be one hop shorter: those calendars are third
@@ -23,26 +37,28 @@ import java.io.File
  * witness's IP. The device only ever talks to the relay it already trusts, and
  * the relay submits on its behalf.
  *
- * Opt-in per recording, default OFF ([org.stream.crypto.StreamPreferences.
- * isProvenanceTimestampEnabled]): a `.ots` is a permanent PUBLIC Bitcoin
- * breadcrumb. What is submitted is a salted commitment over the media Merkle
- * root — `SHA-256(salt ‖ chunk_merkle_root(chunk hashes))`, salt =
- * HKDF(provenance seed, recording_id). No signature and no manifest are
- * committed. The salt is what stops the relay from linking the stamp to a
- * stored report, and it is re-derived at rescue (never uploaded).
+ * Opt-in, default OFF: a `.ots` is a permanent PUBLIC Bitcoin breadcrumb. What
+ * is submitted is a salted commitment over the hashes of the chunks the
+ * closure lists; the salt stops the relay from linking the stamp to a stored
+ * report, and it is re-derived at rescue, never uploaded.
  *
- * The POST goes to `POST /api/v2/timestamp` and comes back with a detached
- * `.ots` proof, written to the `otsFilePath`
- * (`filesDir/stream_provenance/<sessionId>.ots`); a CHAINED
- * [ProvenanceUploadWorker] (WorkManager `.then`) then makes it durable on the
- * relay and secure-deletes the local copy — same survive-process-death +
- * survive-reboot + auto-retry guarantees as the `.fpm` and the video chunks.
+ * The job gets the path of a TICKET only (written by Rust at the report's
+ * closure, sealed under the queue key: the proof's name in the directory and
+ * the commitment). On a 2xx, ONE Rust call checks that the proof stamps the
+ * ticket's commitment, encrypts it to the witness's identity, signs it with
+ * the directory key and writes the envelope: the `.ots` bytes never reach the
+ * disk in clear. That call reads the report state, so the submission is only
+ * attempted while the PIN session is open; a locked device waits. The POST
+ * needs the upload bearer: without one, the worker gets it itself
+ * ([ensureBearer], one ratchet slot at most per need).
  *
- * Unlike the heap-0 chunk PUT path, this reads the bearer from
- * [UploadAuthHolder] into the JVM because the `.ots` response body must be read
- * back. Accepted for a rare opt-in POST — but since the chunk PUT moved into
- * Rust this is the only OkHttp path still carrying the bearer, which is what
- * [UploadAuthHolder.clear]'s connection-pool eviction is there for.
+ * The ticket is written once and nothing writes it again, so it is deleted
+ * only when it can never serve ([TimestampTicketPolicy]); a read that fails
+ * for another reason keeps it.
+ *
+ * The proof's bytes do pass through the JVM (OkHttp reads the response), and
+ * so does the bearer for the POST: accepted for a rare opt-in request. The
+ * proof array is wiped after sealing.
  */
 @HiltWorker
 class ProvenanceTimestampWorker @AssistedInject constructor(
@@ -51,126 +67,207 @@ class ProvenanceTimestampWorker @AssistedInject constructor(
 ) : Worker(context, workerParams) {
 
     companion object {
-        const val KEY_COMMITMENT_HEX = "commitmentHex"
+        const val KEY_TICKET_PATH = "ticketPath"
+        const val KEY_ENVELOPE_PATH = "envelopePath"
         const val KEY_SERVER_URL = "serverUrl"
-        const val KEY_SESSION_ID = "sessionId"
-        const val KEY_OTS_FILE_PATH = "otsFilePath"
+        const val TAG = "stream_provenance_ticket"
 
-        fun buildInputData(
-            commitmentHex: String,
-            serverUrl: String,
-            sessionId: String,
-            otsFilePath: String,
-        ): Data = Data.Builder()
-            .putString(KEY_COMMITMENT_HEX, commitmentHex)
-            .putString(KEY_SERVER_URL, serverUrl)
-            .putString(KEY_SESSION_ID, sessionId)
-            .putString(KEY_OTS_FILE_PATH, otsFilePath)
-            .build()
+        fun buildInputData(ticketPath: String, envelopePath: String, serverUrl: String): Data =
+            Data.Builder()
+                .putString(KEY_TICKET_PATH, ticketPath)
+                .putString(KEY_ENVELOPE_PATH, envelopePath)
+                .putString(KEY_SERVER_URL, serverUrl)
+                .build()
+
+        /**
+         * Schedule the submission of [ticket] (unique per ticket, KEEP), unless
+         * an emergency wipe began since [wipeGeneration] (the job's row names
+         * the session). Returns whether it was scheduled.
+         */
+        fun enqueue(context: Context, ticket: File, envelope: File, serverUrl: String, wipeGeneration: Int): Boolean {
+            val request = OneTimeWorkRequest.Builder(ProvenanceTimestampWorker::class.java)
+                .setConstraints(
+                    Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
+                )
+                .setInputData(buildInputData(ticket.absolutePath, envelope.absolutePath, serverUrl))
+                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 10, TimeUnit.SECONDS)
+                .addTag(TAG)
+                .build()
+            return StreamUploadManager.unlessWipedSince(wipeGeneration) {
+                WorkManager.getInstance(context)
+                    .enqueueUniqueWork(ticket.name, ExistingWorkPolicy.KEEP, request)
+            } != null
+        }
     }
 
     override fun doWork(): Result {
-        val commitmentHex = inputData.getString(KEY_COMMITMENT_HEX) ?: return Result.failure()
+        val wipeAtStart = StreamUploadManager.wipeGeneration()
+        // A job from before the tickets carries no ticket path. It stays
+        // pending until the legacy migration has counted it (and told the
+        // witness its timestamp was cancelled), then ends.
+        val ticketPath = inputData.getString(KEY_TICKET_PATH) ?: return when (
+            TimestampTicketPolicy.forLegacyJob(LegacyReportMigration.isNeeded(applicationContext))
+        ) {
+            TimestampTicketPolicy.Outcome.RETRY -> Result.retry()
+            else -> Result.failure()
+        }
+        val envelopePath = inputData.getString(KEY_ENVELOPE_PATH) ?: return Result.failure()
         val serverUrl = inputData.getString(KEY_SERVER_URL) ?: return Result.failure()
-        val sessionId = inputData.getString(KEY_SESSION_ID) ?: return Result.failure()
-        val otsFilePath = inputData.getString(KEY_OTS_FILE_PATH) ?: return Result.failure()
+        val ticket = File(ticketPath)
+        val envelope = File(envelopePath)
+        val queue = EnvelopeQueue.get(applicationContext)
 
-        // The .ots response body must be read → JVM OkHttp path (not heap-0).
+        if (!ticket.exists()) {
+            if (envelope.exists()) ChunkUploadWorker.enqueue(applicationContext, envelope, serverUrl, wipeAtStart)
+            return Result.success()
+        }
+        if (envelope.exists() && queue.isQueued(envelope)) {
+            // Sealed by an earlier run that died before removing the ticket.
+            EnvelopeQueue.secureDelete(ticket)
+            ChunkUploadWorker.enqueue(applicationContext, envelope, serverUrl, wipeAtStart)
+            return Result.success()
+        }
+
+        val manager = StreamUploadManager.getInstance(applicationContext)
+        if (!manager.isUnlocked()) {
+            Timber.tag("StreamMetrics").i("provenance_ts retry reason=locked")
+            return Result.retry()
+        }
+        if (!QueueKeyStore.ensureInstalled(applicationContext)) {
+            Timber.tag("StreamMetrics").i("provenance_ts retry reason=no_queue_key")
+            return Result.retry()
+        }
+        val commitmentHex = try {
+            uniffi.frappuccino.otsTicketCommitment(ticket.absolutePath)
+                .joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+        } catch (e: Exception) {
+            return when (TimestampTicketPolicy.forReadFailure(e)) {
+                TimestampTicketPolicy.Outcome.DROP_TICKET -> {
+                    Timber.w(e, "ProvenanceTimestampWorker: unreadable ticket, dropped")
+                    EnvelopeQueue.secureDelete(ticket)
+                    Result.failure()
+                }
+                else -> {
+                    Timber.w(e, "ProvenanceTimestampWorker: ticket not read, retry")
+                    Result.retry()
+                }
+            }
+        }
+
+        // Nothing else obtains a bearer for a ticket: the sweep only does so
+        // for queued envelopes, and the lock-timeout controller drops the
+        // bearer once no envelope needs it. Without this, a ticket whose first
+        // attempt failed waited for the next recording. One slot at most per
+        // need, shared with every other authentication of the process.
+        if (!UploadAuthHolder.isPresent() && !ensureBearer(applicationContext, serverUrl)) {
+            Timber.tag("StreamMetrics").i("provenance_ts retry reason=no_auth_token")
+            return Result.retry()
+        }
         val authToken = UploadAuthHolder.get() ?: run {
-            Timber.tag("StreamMetrics").i("provenance_ts retry reason=no_auth_token session=%s", sessionId)
+            Timber.tag("StreamMetrics").i("provenance_ts retry reason=no_auth_token")
             return Result.retry()
         }
-        // Coordinate with the chunk cohort's circuit breaker: if the relay is
-        // already known-down, defer rather than add noise.
         if (UploadCircuitBreaker.isOpen()) {
-            Timber.tag("StreamMetrics").i("provenance_ts retry reason=circuit_open session=%s", sessionId)
+            Timber.tag("StreamMetrics").i("provenance_ts retry reason=circuit_open")
             return Result.retry()
         }
 
-        val url = "$serverUrl/api/v2/timestamp"
-        val body = "{\"commitment\":\"$commitmentHex\"}"
-            .toRequestBody("application/json".toMediaType())
+        val body = "{\"commitment\":\"$commitmentHex\"}".toRequestBody("application/json".toMediaType())
         return try {
             val request = Request.Builder()
-                .url(url)
+                .url("$serverUrl/api/v2/timestamp")
                 .header("Authorization", authToken)
                 .post(body)
                 .build()
             UploadHttpClient.instance.newCall(request).execute().use { resp ->
-                mapResponse(resp.code, resp.body?.bytes(), otsFilePath, sessionId)
+                if (resp.code in 200..299) {
+                    UploadCircuitBreaker.reportSuccess()
+                    sealProof(resp.body?.bytes(), ticket, envelope, serverUrl, wipeAtStart)
+                } else {
+                    mapFailure(resp.code, ticket)
+                }
             }
         } catch (e: Exception) {
             UploadCircuitBreaker.reportServerError(0)
-            Timber.w(e, "ProvenanceTimestampWorker: network error for %s, will retry", sessionId)
+            Timber.w(e, "ProvenanceTimestampWorker: network error, will retry")
             Result.retry()
         }
     }
 
-    /**
-     * Map the relay's response. On 2xx the `.ots` body is written to
-     * `otsFilePath` (the chained upload worker makes it durable). The rest
-     * broadly follows the chunk worker's retry/failure policy, with these
-     * divergences:
-     *  - 503 → relay timestamping is dormant (config, not transient) → give up.
-     *  - 502 → calendars unreachable (transient upstream) → retry.
-     *  - 429 has no branch of its own here, unlike the chunk path, so it falls
-     *    into the 4xx case and gives up for good.
-     */
-    private fun mapResponse(
-        code: Int,
-        otsBytes: ByteArray?,
-        otsFilePath: String,
-        sessionId: String,
+    /** Seal the received proof into its envelope, then queue it. */
+    private fun sealProof(
+        proof: ByteArray?,
+        ticket: File,
+        envelope: File,
+        serverUrl: String,
+        wipeAtStart: Int,
     ): Result {
-        return when {
-            code in 200..299 -> {
-                if (otsBytes == null || otsBytes.isEmpty()) {
-                    Timber.w("ProvenanceTimestampWorker: empty .ots body for %s — retry", sessionId)
-                    return Result.retry()
-                }
-                UploadCircuitBreaker.reportSuccess()
-                val otsFile = File(otsFilePath)
-                otsFile.parentFile?.mkdirs()
-                otsFile.writeBytes(otsBytes)
-                Timber.i(
-                    "Provenance .ots received: %s (%d bytes) → chained durable upload",
-                    otsFile.name, otsBytes.size
-                )
-                Result.success()
-            }
-            code == 401 -> {
-                Timber.w("ProvenanceTimestampWorker: 401 — clearing JWT and retrying %s", sessionId)
-                UploadAuthHolder.clear()
-                Result.retry()
-            }
-            code == 503 -> {
-                // Relay timestamping not enabled. It's a relay config state, not a
-                // transient blip — retrying won't help. The opt-in user simply gets
-                // no stamp until the operator turns OTS on (separate deploy).
-                Timber.w("ProvenanceTimestampWorker: 503 — relay timestamping disabled, giving up for %s", sessionId)
-                Timber.tag("StreamMetrics").i("provenance_ts fail reason=ots_disabled session=%s", sessionId)
-                Result.failure()
-            }
-            code == 502 -> {
-                Timber.w("ProvenanceTimestampWorker: 502 — calendars unreachable for %s, will retry", sessionId)
-                Timber.tag("StreamMetrics").i("provenance_ts retry reason=calendars_unreachable session=%s", sessionId)
-                Result.retry()
-            }
-            code in 400..499 -> {
-                Timber.e("ProvenanceTimestampWorker: permanent failure %d for %s", code, sessionId)
-                Result.failure()
-            }
-            code >= 500 -> {
-                UploadCircuitBreaker.reportServerError(code)
-                Timber.w("ProvenanceTimestampWorker: temporary failure %d for %s, will retry", code, sessionId)
-                Result.retry()
-            }
-            else -> {
-                // code == 0 — transport error (no HTTP response).
-                UploadCircuitBreaker.reportServerError(0)
-                Timber.tag("StreamMetrics").i("provenance_ts retry reason=transport_error session=%s", sessionId)
-                Result.retry()
-            }
+        if (proof == null || proof.isEmpty()) {
+            Timber.w("ProvenanceTimestampWorker: empty proof, retry")
+            return Result.retry()
         }
+        val manager = StreamUploadManager.getInstance(applicationContext)
+        val author = manager.authorIdentity() ?: run {
+            SecureWipe.wipe(proof)
+            return Result.retry()
+        }
+        return try {
+            uniffi.frappuccino.pinSessionSealOtsProof(
+                manager.reportStatePath(), ticket.absolutePath, proof, author, envelope.absolutePath
+            )
+            EnvelopeQueue.secureDelete(ticket)
+            EnvelopeQueue.get(applicationContext).invalidate()
+            ChunkUploadWorker.enqueue(applicationContext, envelope, serverUrl, wipeAtStart)
+            Timber.i("Provenance proof sealed and queued")
+            Result.success()
+        } catch (e: FfiException.ReportRefused) {
+            // The proof stamps something else than this ticket's commitment.
+            Timber.e(e, "ProvenanceTimestampWorker: proof does not match its ticket, dropped")
+            EnvelopeQueue.secureDelete(ticket)
+            Result.failure()
+        } catch (e: FfiException.InvalidBlob) {
+            Timber.e(e, "ProvenanceTimestampWorker: not a timestamp proof, retry")
+            Result.retry()
+        } catch (e: FfiException) {
+            // No PIN session any more (locked meanwhile), no key, I/O: the
+            // ticket stays and a later run asks again.
+            Timber.w(e, "ProvenanceTimestampWorker: seal deferred")
+            Result.retry()
+        } finally {
+            SecureWipe.wipe(proof)
+            author.destroy()
+        }
+    }
+
+    /**
+     * The relay's non-2xx answers. Mostly the chunk policy, with these
+     * differences:
+     *  - 503: relay timestamping is disabled (configuration, not a blip): give up.
+     *  - 502: the calendars are unreachable (transient upstream): retry.
+     *  - 401: the bearer was refused: drop it and retry.
+     *  - any other 4xx gives up, 429 included.
+     * Giving up deletes the ticket: nothing would ever read it again.
+     */
+    private fun mapFailure(code: Int, ticket: File): Result = when {
+        code == 401 -> {
+            UploadAuthHolder.clear()
+            Result.retry()
+        }
+        code == 503 -> {
+            Timber.tag("StreamMetrics").i("provenance_ts fail reason=ots_disabled")
+            EnvelopeQueue.secureDelete(ticket)
+            Result.failure()
+        }
+        code == 502 -> Result.retry()
+        code in 400..499 -> {
+            Timber.e("ProvenanceTimestampWorker: permanent failure %d", code)
+            EnvelopeQueue.secureDelete(ticket)
+            Result.failure()
+        }
+        code >= 500 -> {
+            UploadCircuitBreaker.reportServerError(code)
+            Result.retry()
+        }
+        else -> Result.retry()
     }
 }

@@ -10,21 +10,38 @@
 #
 #   - has_content        : report_id in reports.json AND >= 1 blob in MinIO
 #                          — a normal, populated report.
-#   - blobless_records   : report_id in reports.json but 0 blobs in MinIO.
-#                          VIOLATES the Phase C blob-first invariant (a
-#                          record is written ONLY after >= 1 durable blob,
-#                          reports.py create_or_verify_report), so this
-#                          MUST be ~0. A non-zero count is a real bug
-#                          (a record written without a durable blob) — not
-#                          a benign "user tapped REC + close" any more.
+#   - blobless_records   : report_id in reports.json but 0 blobs in MinIO,
+#                          tombstones aside. VIOLATES the Phase C blob-first
+#                          invariant (a record is written ONLY after >= 1
+#                          durable blob, reports.py create_or_verify_report),
+#                          so this MUST be ~0. The only benign case is an open
+#                          report whose blobs the TTL purged since the last
+#                          reaper pass (hourly). Anything else is a real bug
+#                          (a record written without a durable blob).
+#   - tombstones         : closed reports whose objects (manifest included)
+#                          were all purged at the TTL. Kept on purpose: the
+#                          reaper keeps a closed record as a tombstone that
+#                          refuses every write, so the closure is never
+#                          forgotten (reports.py reap_blobless_reports).
+#                          Grows by one per closed report, never shrinks.
 #   - orphan_minio       : blobs in MinIO with NO matching report_id record
 #                          — the EXPECTED residual (a crash between
 #                          store-blob and write-record leaves a blob with
 #                          no record, §6; reaped by blob_cleanup on
 #                          last_modified TTL). Informational, not alarming.
+#   - without_write_sig  : report objects (closure `manifest` objects aside)
+#                          stored WITHOUT the `report-write-sig` user
+#                          metadata. Objects uploaded before the relay kept
+#                          the signature have none, and the count of those
+#                          only goes down. A rise means objects lost their
+#                          metadata, typically a storage copy or migration
+#                          that did not preserve user metadata: for a report
+#                          that was never closed, that metadata is what lets
+#                          the rescue verify an object at all.
 #
-# Integrity ratio = has_content / total_records, target ~100 % (blob-first
-# makes "record without blobs" an invariant violation, not a normal state).
+# Integrity ratio = has_content / (total_records - tombstones), target ~100 %
+# (blob-first makes "record without blobs" an invariant violation, not a
+# normal state; a tombstone is a closed record outliving its blobs by design).
 #
 # No createdAt / title / age is read any more — those fields were removed
 # so a seizure of reports.json reveals no `identity -> report -> when` map.
@@ -57,7 +74,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --json) MODE="json"; shift ;;
         --csv) MODE="csv"; shift ;;
-        -h|--help) sed -n '1,40p' "$0" | sed 's/^# \?//' ; exit 0 ;;
+        -h|--help) sed -n '2,60p' "$0" | sed 's/^# \?//' ; exit 0 ;;
         *) echo "Unknown arg: $1" >&2; exit 2 ;;
     esac
 done
@@ -94,6 +111,33 @@ docker exec "${MINIO_CTR}" sh -c '
 
 docker exec "${SERVER_CTR}" cat /state/reports.json > "$TMP/reports.json"
 
+# Objects without the write-signature metadata. MinIO keeps user metadata inside
+# its own on-disk format, which the directory walk above cannot read, so this
+# asks MinIO itself (listing with user metadata, a MinIO extension) through the
+# client and credentials the server container already has. Code passed with
+# `-c`, not on stdin, for the reason given in the implementation note above.
+# Best effort: if it fails, the rest of the audit still runs and this line says
+# "unavailable" rather than a number.
+if ! docker exec "${SERVER_CTR}" python -c '
+from app import config, paths, storage
+total = missing = 0
+listing = storage.get_client().list_objects(
+    config.MINIO_BUCKET, recursive=True, include_user_meta=True
+)
+for obj in listing:
+    name = obj.object_name or ""
+    rid, sep, base = name.partition("/")
+    if not sep or base == paths.MANIFEST_NAME:
+        continue
+    total += 1
+    keys = [str(k).lower() for k in (obj.metadata or {})]
+    if not any(k.endswith("report-write-sig") for k in keys):
+        missing += 1
+print(f"{total}|{missing}")
+' > "$TMP/meta.txt" 2> "$TMP/meta.err"; then
+    echo "unavailable" > "$TMP/meta.txt"
+fi
+
 # Host-side Python does the analysis. Tries `python3` first, falls
 # back to `python` if a minimal Ubuntu image is missing the `python3`
 # alias (Ubuntu 24.04 ships it by default but some custom images skip).
@@ -110,7 +154,7 @@ if [[ -z "$PYTHON_BIN" ]]; then
 fi
 
 MODE="$MODE" MINIO_FILE="$TMP/minio.txt" REPORTS_FILE="$TMP/reports.json" \
-    "$PYTHON_BIN" <<'PYEOF'
+    META_FILE="$TMP/meta.txt" "$PYTHON_BIN" <<'PYEOF'
 import json
 import os
 from datetime import datetime, timezone
@@ -118,6 +162,16 @@ from datetime import datetime, timezone
 mode = os.environ.get("MODE", "human")
 minio_file = os.environ["MINIO_FILE"]
 reports_file = os.environ["REPORTS_FILE"]
+meta_file = os.environ["META_FILE"]
+
+# "total|missing" from the metadata listing, or None if it was unavailable.
+write_sig_meta = None
+try:
+    with open(meta_file) as f:
+        checked, without = f.read().strip().split("|")
+    write_sig_meta = (int(checked), int(without))
+except (OSError, ValueError):
+    pass
 
 # Parse MinIO listing ("rid|n|bytes").
 minio = {}
@@ -137,7 +191,9 @@ with open(minio_file) as f:
             minio[rid] = (n, b)
 
 # Load reports.json. Phase C relay-blind schema:
-#   { report_id : { "report_id": <hex>, "report_pk": <64 hex> } }
+#   { report_id : { "report_id": <hex>, "report_pk": <64 hex>,
+#                   "closure": {...},        # once closed
+#                   "tombstone": true } }    # once closed and emptied
 # No owner, no createdAt, no title -- a seizure reveals no identity->report
 # ->when map, only opaque report_id->report_pk bindings.
 try:
@@ -151,10 +207,13 @@ now = datetime.now(timezone.utc)
 
 has_content = []        # record + >=1 blob (normal)
 blobless_records = []   # record + 0 blobs -- VIOLATES the blob-first invariant
-for rid in reports:
+tombstones = []         # closed record + 0 blobs -- kept on purpose
+for rid, record in reports.items():
     blob_count, _ = minio.get(rid, (0, 0))
     if blob_count > 0:
         has_content.append((rid, *minio[rid]))
+    elif isinstance(record, dict) and record.get("tombstone") is True:
+        tombstones.append(rid)
     else:
         blobless_records.append(rid)
 
@@ -166,7 +225,7 @@ for rid, (n, b) in minio.items():
 
 total_blobs = sum(n for n, _ in minio.values())
 total_bytes = sum(b for _, b in minio.values())
-integrity = 100.0 * len(has_content) / max(len(reports), 1)
+integrity = 100.0 * len(has_content) / max(len(reports) - len(tombstones), 1)
 
 if mode == "json":
     out = {
@@ -177,15 +236,25 @@ if mode == "json":
             "has_content": len(has_content),
             "blobless_records": len(blobless_records),
             "orphan_minio": len(orphan_minio),
+            "tombstones": len(tombstones),
         },
         "blobs_total": total_blobs,
         "bytes_total": total_bytes,
         "integrity_pct": round(integrity, 1),
+        # null when the metadata listing was unavailable.
+        "write_sig_metadata": (
+            None if write_sig_meta is None
+            else {"objects_checked": write_sig_meta[0],
+                  "without_write_sig": write_sig_meta[1]}
+        ),
     }
     print(json.dumps(out, indent=2))
 elif mode == "csv":
-    # Columns (Phase C): ts, records, minio_dirs, has_content,
-    # blobless_records, orphan_minio, blobs, bytes.
+    # Columns: ts, records, minio_dirs, has_content, blobless_records,
+    # orphan_minio, blobs, bytes, objects_checked, without_write_sig,
+    # tombstones. The last three were appended later (older rows have 8 or 10
+    # columns); the two metadata ones are empty when the metadata listing was
+    # unavailable.
     print(",".join([
         now.isoformat(),
         str(len(reports)),
@@ -195,6 +264,9 @@ elif mode == "csv":
         str(len(orphan_minio)),
         str(total_blobs),
         str(total_bytes),
+        "" if write_sig_meta is None else str(write_sig_meta[0]),
+        "" if write_sig_meta is None else str(write_sig_meta[1]),
+        str(len(tombstones)),
     ]))
 else:
     print(f"=== Frappuccino reports/blobs audit (relay-blind) @ {now.isoformat()} ===")
@@ -208,7 +280,13 @@ else:
     print(f"    has_content       : {len(has_content)}")
     print(f"    blobless_records  : {len(blobless_records)}  (invariant: MUST be 0)")
     print(f"    orphan_minio      : {len(orphan_minio)}  (expected residual)")
-    print(f"  Integrity ratio     : {integrity:.1f} % (target ~100 %, blob-first)")
+    print(f"    tombstones        : {len(tombstones)}  (closed, all objects expired; kept)")
+    print(f"  Integrity ratio     : {integrity:.1f} % (target ~100 %, blob-first, tombstones aside)")
+    if write_sig_meta is None:
+        print("  Write-sig metadata  : unavailable (metadata listing failed)")
+    else:
+        print(f"  Write-sig metadata  : {write_sig_meta[1]} of {write_sig_meta[0]} objects "
+              f"without it (stored before the relay kept it; a rise means lost metadata)")
     print()
     if has_content:
         print(f"  Top reports by blob count :")

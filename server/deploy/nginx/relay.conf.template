@@ -104,6 +104,25 @@ server {
         proxy_buffering         off;
         proxy_read_timeout      120s;
     }
+
+    # A closure's body is its manifest: 8 bytes + 36 per object, so up to
+    # about 36 MB for the largest report the sequence space allows, above the
+    # 32m of the chunk PUTs. The relay route caps it at MAX_MANIFEST_SIZE
+    # (40 MiB, app/routes/upload.py); this front must not refuse less, or the
+    # closure of a long report is refused here with a 413 and the report stays
+    # open on the relay. Same proxying as `location /`.
+    location ^~ /close/ {
+        client_max_body_size 40m;
+        proxy_pass         http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Forwarded-For   $remote_addr;
+        proxy_set_header   X-Forwarded-Proto https;
+        proxy_set_header   Connection        "";
+        proxy_request_buffering off;
+        proxy_buffering         off;
+        proxy_read_timeout      120s;
+    }
 }
 
 # Bloc HTTP pour challenge ACME Let's Encrypt — uniquement actif si tu utilises

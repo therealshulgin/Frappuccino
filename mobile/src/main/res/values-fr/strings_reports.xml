@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Chaînes du côté enregistrement des rapports : notification d'enregistrement,
+  HUD et bandeau des rapports dans l'app. Uniquement dans l'app : aucune n'est
+  jamais montrée par une notification système autre que celle de
+  l'enregistrement lui-même.
+-->
+<resources>
+    <string name="stream_recording_finalizing">Finalisation de l\'enregistrement…</string>
+    <string name="stream_previous_session_finalizing">L\'enregistrement précédent est encore en cours de finalisation. Réessayez dans un instant.</string>
+
+    <plurals name="stream_chunks_lost">
+        <item quantity="one">%d fragment perdu</item>
+        <item quantity="other">%d fragments perdus</item>
+        <item quantity="many">%d fragments perdus</item>
+    </plurals>
+
+    <plurals name="report_banner_lost">
+        <item quantity="one">%d fragment d\'enregistrement perdu — appuyer</item>
+        <item quantity="other">%d fragments d\'enregistrements perdus — appuyer</item>
+        <item quantity="many">%d fragments d\'enregistrements perdus — appuyer</item>
+    </plurals>
+    <string name="report_banner_attention">Il s\'est passé quelque chose avec vos enregistrements — appuyer</string>
+    <plurals name="report_banner_waiting">
+        <item quantity="one">%d élément encore sur ce téléphone — appuyer</item>
+        <item quantity="other">%d éléments encore sur ce téléphone — appuyer</item>
+        <item quantity="many">%d éléments encore sur ce téléphone — appuyer</item>
+    </plurals>
+
+    <string name="report_dialog_title">Vos enregistrements</string>
+    <plurals name="report_dialog_waiting">
+        <item quantity="one">%1$d élément n\'a pas atteint le serveur depuis plus d\'un jour (le plus ancien date du %2$s). Il reste sur ce téléphone jusqu\'à son envoi : rien n\'est supprimé parce qu\'il est ancien, mais il est exposé si le téléphone est saisi. Reconnectez-vous, ou appuyez sur Réessayer.</item>
+        <item quantity="other">%1$d éléments n\'ont pas atteint le serveur depuis plus d\'un jour (le plus ancien date du %2$s). Ils restent sur ce téléphone jusqu\'à leur envoi : rien n\'est supprimé parce qu\'il est ancien, mais ils sont exposés si le téléphone est saisi. Reconnectez-vous, ou appuyez sur Réessayer.</item>
+        <item quantity="many">%1$d éléments n\'ont pas atteint le serveur depuis plus d\'un jour (le plus ancien date du %2$s). Ils restent sur ce téléphone jusqu\'à leur envoi : rien n\'est supprimé parce qu\'il est ancien, mais ils sont exposés si le téléphone est saisi. Reconnectez-vous, ou appuyez sur Réessayer.</item>
+    </plurals>
+    <plurals name="report_dialog_failed_kept">
+        <item quantity="one">%d élément a été refusé définitivement par le serveur. Il est gardé sur ce téléphone, ne sera pas renvoyé, et part avec l\'effacement d\'urgence.</item>
+        <item quantity="other">%d éléments ont été refusés définitivement par le serveur. Ils sont gardés sur ce téléphone, ne seront pas renvoyés, et partent avec l\'effacement d\'urgence.</item>
+        <item quantity="many">%d éléments ont été refusés définitivement par le serveur. Ils sont gardés sur ce téléphone, ne seront pas renvoyés, et partent avec l\'effacement d\'urgence.</item>
+    </plurals>
+
+    <plurals name="report_alert_capture_lost">
+        <item quantity="one">%d fragment n\'a pas pu être protégé pendant un enregistrement : sa vidéo est perdue.</item>
+        <item quantity="other">%d fragments n\'ont pas pu être protégés pendant des enregistrements : leur vidéo est perdue.</item>
+        <item quantity="many">%d fragments n\'ont pas pu être protégés pendant des enregistrements : leur vidéo est perdue.</item>
+    </plurals>
+    <plurals name="report_alert_failed">
+        <item quantity="one">%d élément a été refusé par le serveur, ou ne pouvait plus être vérifié, et a été mis de côté.</item>
+        <item quantity="other">%d éléments ont été refusés par le serveur, ou ne pouvaient plus être vérifiés, et ont été mis de côté.</item>
+        <item quantity="many">%d éléments ont été refusés par le serveur, ou ne pouvaient plus être vérifiés, et ont été mis de côté.</item>
+    </plurals>
+    <plurals name="report_alert_directory_refused">
+        <item quantity="one">Le serveur indique que l\'annuaire de vos rapports est clos, et a refusé %d entrée. Cette application ne le clôt jamais : le clore demande une copie des données de ce téléphone ou votre phrase de récupération. Les enregistrements eux-mêmes sont toujours envoyés.</item>
+        <item quantity="other">Le serveur indique que l\'annuaire de vos rapports est clos, et a refusé %d entrées. Cette application ne le clôt jamais : le clore demande une copie des données de ce téléphone ou votre phrase de récupération. Les enregistrements eux-mêmes sont toujours envoyés.</item>
+        <item quantity="many">Le serveur indique que l\'annuaire de vos rapports est clos, et a refusé %d entrées. Cette application ne le clôt jamais : le clore demande une copie des données de ce téléphone ou votre phrase de récupération. Les enregistrements eux-mêmes sont toujours envoyés.</item>
+    </plurals>
+    <plurals name="report_alert_closure_abandoned">
+        <item quantity="one">%d enregistrement n\'a pas pu être clos : le serveur n\'en a jamais reçu le début.</item>
+        <item quantity="other">%d enregistrements n\'ont pas pu être clos : le serveur n\'en a jamais reçu le début.</item>
+        <item quantity="many">%d enregistrements n\'ont pas pu être clos : le serveur n\'en a jamais reçu le début.</item>
+    </plurals>
+    <plurals name="report_alert_interrupted">
+        <item quantity="one">%d enregistrement s\'est terminé sans son acte de clôture. Chacun de ses fragments reste vérifiable, mais l\'endroit où il s\'arrête ne peut pas être certifié.</item>
+        <item quantity="other">%d enregistrements se sont terminés sans leur acte de clôture. Chacun de leurs fragments reste vérifiable, mais l\'endroit où ils s\'arrêtent ne peut pas être certifié.</item>
+        <item quantity="many">%d enregistrements se sont terminés sans leur acte de clôture. Chacun de leurs fragments reste vérifiable, mais l\'endroit où ils s\'arrêtent ne peut pas être certifié.</item>
+    </plurals>
+    <plurals name="report_alert_migration_lost">
+        <item quantity="one">%d fragment en attente d\'avant la mise à jour n\'a pas pu être converti et a été supprimé.</item>
+        <item quantity="other">%d fragments en attente d\'avant la mise à jour n\'ont pas pu être convertis et ont été supprimés.</item>
+        <item quantity="many">%d fragments en attente d\'avant la mise à jour n\'ont pas pu être convertis et ont été supprimés.</item>
+    </plurals>
+    <plurals name="report_alert_timestamps_cancelled">
+        <item quantity="one">%d demande d\'horodatage d\'avant la mise à jour a été annulée. La vidéo n\'est pas touchée.</item>
+        <item quantity="other">%d demandes d\'horodatage d\'avant la mise à jour ont été annulées. Les vidéos ne sont pas touchées.</item>
+        <item quantity="many">%d demandes d\'horodatage d\'avant la mise à jour ont été annulées. Les vidéos ne sont pas touchées.</item>
+    </plurals>
+</resources>

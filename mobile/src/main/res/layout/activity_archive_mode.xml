@@ -7,9 +7,9 @@
   demande : la liste rend alors 1 item au lieu de N.
 
   Le pendant de ce choix est `android:nestedScrollingEnabled="false"` posé sur
-  la RecyclerView plus bas, qui fait du NestedScrollView l'unique scroller de
-  l'écran. Retirer l'un sans l'autre redonne deux scrollers qui se disputent
-  le geste.
+  chacune des deux RecyclerView plus bas (rapports, section « non
+  vérifiable »), qui fait du NestedScrollView l'unique scroller de l'écran.
+  Retirer l'un sans l'autre redonne deux scrollers qui se disputent le geste.
 -->
 <androidx.core.widget.NestedScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
@@ -41,7 +41,7 @@
             android:gravity="center"
             android:text="@string/archive_prompt" />
 
-        <!-- Warning -->
+        <!-- Avertissement : ce qui reste sur le téléphone et quand c'est effacé. -->
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -52,7 +52,10 @@
             android:background="#22CC1A1A"
             android:text="@string/archive_warning" />
 
-        <!-- Input phrase -->
+        <!-- Saisie de la phrase. `saveEnabled="false"` : sans lui, l'EditText
+             range son texte dans l'état sauvegardé de l'activité, un Bundle
+             confié au système, et la phrase quitterait l'écran. Pour la même
+             raison, pas d'autofill. -->
         <EditText
             android:id="@+id/archiveMnemonicInput"
             android:layout_width="match_parent"
@@ -62,6 +65,8 @@
             android:maxLines="4"
             android:inputType="textMultiLine|textNoSuggestions|textVisiblePassword"
             android:imeOptions="actionDone"
+            android:saveEnabled="false"
+            android:importantForAutofill="no"
             android:textColor="@color/wa_white"
             android:textSize="14sp"
             android:fontFamily="monospace"
@@ -71,7 +76,6 @@
             android:textColorHint="#55FFFFFF"
             android:gravity="top|start" />
 
-        <!-- Unlock button -->
         <TextView
             android:id="@+id/archiveUnlockBtn"
             android:layout_width="match_parent"
@@ -87,7 +91,6 @@
             android:clickable="true"
             android:focusable="true" />
 
-        <!-- Status -->
         <TextView
             android:id="@+id/archiveStatus"
             android:layout_width="wrap_content"
@@ -98,7 +101,6 @@
             android:textSize="12sp"
             android:fontFamily="monospace" />
 
-        <!-- Fingerprint -->
         <TextView
             android:id="@+id/archiveFingerprint"
             android:layout_width="wrap_content"
@@ -111,7 +113,6 @@
             android:letterSpacing="0.1"
             android:visibility="gone" />
 
-        <!-- Streams info -->
         <TextView
             android:id="@+id/archiveStreamsInfo"
             android:layout_width="match_parent"
@@ -124,7 +125,8 @@
             android:fontFamily="monospace"
             android:visibility="gone" />
 
-        <!-- Phase 4.4.2 — Retrieve streams button (visible post-unlock). -->
+        <!-- Lance la recherche des rapports ; après une recherche incomplète
+             ou arrêtée, le même bouton la relance. -->
         <TextView
             android:id="@+id/archiveRetrieveBtn"
             android:layout_width="match_parent"
@@ -141,20 +143,40 @@
             android:focusable="true"
             android:visibility="gone" />
 
-        <!-- Bulk "DOWNLOAD ALL" button.
-             Visible right after the reports list shows up. Tap → loop
-             through every pending report and download it sequentially,
-             skipping the ones already marked as downloaded. Stays
-             visible while a batch is running (disabled) and after a
-             partial / full completion so the user can re-tap to
-             resume if some failed mid-way. -->
+        <!-- État de la recherche : progression, attente sur 429, fin
+             complète ou INCOMPLÈTE. Une recherche incomplète doit se lire
+             comme telle, jamais comme une liste courte. -->
         <TextView
-            android:id="@+id/archiveDownloadAllBtn"
+            android:id="@+id/archiveEnumStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:textColor="@color/wa_white"
+            android:textSize="12sp"
+            android:fontFamily="monospace"
+            android:visibility="gone" />
+
+        <!-- Anomalies de l'annuaire (clos, absent, entrées inconnues). -->
+        <TextView
+            android:id="@+id/archiveAnomalies"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:padding="8dp"
+            android:background="#22CC1A1A"
+            android:textColor="@color/wa_orange"
+            android:textSize="11sp"
+            android:fontFamily="monospace"
+            android:visibility="gone" />
+
+        <!-- Vérifie, l'un après l'autre, les rapports pas encore vérifiés. -->
+        <TextView
+            android:id="@+id/archiveVerifyAllBtn"
             android:layout_width="match_parent"
             android:layout_height="48dp"
             android:layout_marginTop="16dp"
             android:gravity="center"
-            android:text="@string/archive_download_all_btn"
+            android:text="@string/archive_verify_all_btn"
             android:textColor="@color/wa_white"
             android:textSize="13sp"
             android:fontFamily="@font/impact"
@@ -164,20 +186,12 @@
             android:focusable="true"
             android:visibility="gone" />
 
-        <!-- Liste des rapports (visible pendant et après la récupération).
-             `nestedScrollingEnabled="false"` n'est pas un réglage à retirer en
-             faisant le ménage : c'est la moitié du montage décrit en tête de
-             fichier, sans laquelle la liste ne rend qu'un item. En
-             contrepartie, toutes les lignes sont mesurées et conservées, il
-             n'y a plus de recyclage, et rien ne plafonne la liste. Le montage
-             a été éprouvé à 69 rapports scrollables : c'est l'échelle validée.
-
-             Une ligne téléchargée ne quitte jamais la liste. L'adapter la
-             marque (✓ vert + opacité 0.55) et la laisse en place, pour que
-             l'utilisateur puisse continuer à taper les restantes une par une,
-             relancer TOUT TÉLÉCHARGER ci-dessus, ou re-télécharger celle-là.
-             La supprimer paraîtrait plus propre et casserait ce choix, sans
-             qu'aucun test ne le signale. -->
+        <!-- Liste des rapports. `nestedScrollingEnabled="false"` n'est pas un
+             réglage à retirer en faisant le ménage : c'est la moitié du
+             montage décrit en tête de fichier, sans laquelle la liste ne rend
+             qu'un item. En contrepartie, toutes les lignes sont mesurées et
+             conservées, il n'y a plus de recyclage, et rien ne plafonne la
+             liste. -->
         <androidx.recyclerview.widget.RecyclerView
             android:id="@+id/archiveReportsList"
             android:layout_width="match_parent"
@@ -186,36 +200,47 @@
             android:nestedScrollingEnabled="false"
             android:visibility="gone" />
 
-        <!-- Phase 4.4.2 — Per-blob download progress text. -->
-        <TextView
-            android:id="@+id/archiveProgressText"
+        <!-- Section « non vérifiable » : les objets legacy stockés sans
+             signature, gardés à part, jamais mêlés au témoignage vérifié. On
+             peut les regarder et les exporter d'ici, sous leur propre
+             étiquette. Sa liste suit la même règle que celle des rapports
+             (`nestedScrollingEnabled="false"`, cf. l'en-tête). -->
+        <LinearLayout
+            android:id="@+id/archiveUnverifiableSection"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:padding="8dp"
-            android:textColor="@color/wa_white"
-            android:textSize="11sp"
-            android:fontFamily="monospace"
-            android:visibility="gone" />
-
-        <!-- Phase 4.4.2 — Open folder button (visible after download done). -->
-        <TextView
-            android:id="@+id/archiveOpenFolderBtn"
-            android:layout_width="match_parent"
-            android:layout_height="44dp"
-            android:layout_marginTop="12dp"
-            android:gravity="center"
-            android:text="@string/archive_open_folder"
-            android:textColor="@color/wa_white"
-            android:textSize="13sp"
-            android:fontFamily="@font/impact"
-            android:letterSpacing="0.15"
+            android:layout_marginTop="16dp"
+            android:orientation="vertical"
+            android:padding="12dp"
             android:background="@color/wa_darker_gray"
-            android:clickable="true"
-            android:focusable="true"
-            android:visibility="gone" />
+            android:visibility="gone">
 
-        <!-- Close button -->
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/archive_unverifiable_title"
+                android:textColor="@color/wa_orange"
+                android:textSize="13sp"
+                android:textStyle="bold"
+                android:fontFamily="monospace" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="@string/archive_unverifiable_explain"
+                android:textColor="@color/wa_gray"
+                android:textSize="11sp"
+                android:fontFamily="monospace" />
+
+            <androidx.recyclerview.widget.RecyclerView
+                android:id="@+id/archiveUnverifiableList"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:nestedScrollingEnabled="false" />
+        </LinearLayout>
+
         <TextView
             android:id="@+id/archiveCloseBtn"
             android:layout_width="wrap_content"

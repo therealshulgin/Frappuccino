@@ -1,83 +1,164 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Per-report row layout for the archive retrieval RecyclerView. Tap =
-  download all blobs of this report. Monospace + dark theme to match the rest
-  of the archive mode UI.
+  One report of the rescue list. Monospace and dark, like the rest of the
+  archive screens.
 
-  Never hardcode `visibility` or `alpha` in this row, and never move that
-  logic to the view side. The checkmark ships GONE and this layout sets no
-  `alpha` at all; the adapter repositions both on every bind, on both
-  branches, and a value fixed here would fight it.
+  Never hardcode `visibility` on the lines and buttons below other than the
+  GONE they ship with: ArchiveReportsAdapter sets every one of them on every
+  bind, on both branches, and a value fixed here would fight it.
 
-  And never remove a row from the list once its report has been downloaded.
-  The "✓ + faded" cue exists precisely so the row can stay: the user can then
-  re-download it, or explicitly pick the ones still remaining.
+  A row never leaves the list once its report is verified: the status, the
+  counters and the WATCH / EXPORT buttons live on it.
 -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
-    android:orientation="horizontal"
-    android:gravity="center_vertical"
+    android:orientation="vertical"
     android:padding="12dp"
     android:layout_marginBottom="8dp"
-    android:background="@color/wa_darker_gray"
-    android:clickable="true"
-    android:focusable="true"
-    android:foreground="?attr/selectableItemBackground">
+    android:background="@color/wa_darker_gray">
+
+    <TextView
+        android:id="@+id/reportTitle"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:textColor="@color/wa_white"
+        android:textSize="14sp"
+        android:fontFamily="monospace"
+        android:textStyle="bold"
+        tools:text="Report 1" />
+
+    <TextView
+        android:id="@+id/reportSubtitle"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:textColor="@color/wa_gray"
+        android:textSize="11sp"
+        android:fontFamily="monospace"
+        tools:text="Signed while recording · index 0" />
+
+    <TextView
+        android:id="@+id/reportStatus"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:textColor="@color/wa_white"
+        android:textSize="12sp"
+        android:fontFamily="monospace"
+        tools:text="COMPLETE: the recording was closed and every one of its objects verified." />
+
+    <TextView
+        android:id="@+id/reportCounters"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:textColor="@color/wa_gray"
+        android:textSize="11sp"
+        android:fontFamily="monospace"
+        android:visibility="gone"
+        tools:visibility="visible"
+        tools:text="42 verified · 0 missing" />
+
+    <TextView
+        android:id="@+id/reportDates"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:textColor="@color/wa_gray"
+        android:textSize="11sp"
+        android:fontFamily="monospace"
+        android:visibility="gone"
+        tools:visibility="visible"
+        tools:text="Stored between 2026-05-15 12:34 UTC and 2026-05-15 12:40 UTC (relay clock)." />
+
+    <TextView
+        android:id="@+id/reportOts"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:textColor="@color/wa_gray"
+        android:textSize="11sp"
+        android:fontFamily="monospace"
+        android:visibility="gone" />
+
+    <TextView
+        android:id="@+id/reportAnomaly"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:textColor="@color/wa_orange"
+        android:textSize="11sp"
+        android:fontFamily="monospace"
+        android:visibility="gone" />
+
+    <TextView
+        android:id="@+id/reportExportState"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:textColor="@color/wa_white"
+        android:textSize="11sp"
+        android:fontFamily="monospace"
+        android:visibility="gone" />
 
     <LinearLayout
-        android:layout_width="0dp"
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_weight="1"
-        android:orientation="vertical">
+        android:layout_marginTop="8dp"
+        android:orientation="horizontal">
 
         <TextView
-            android:id="@+id/reportTitle"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
+            android:id="@+id/reportVerifyBtn"
+            android:layout_width="0dp"
+            android:layout_height="40dp"
+            android:layout_weight="1"
+            android:layout_marginEnd="6dp"
+            android:gravity="center"
             android:textColor="@color/wa_white"
-            android:textSize="14sp"
-            android:fontFamily="monospace"
-            android:textStyle="bold"
-            tools:text="Report ABC123" />
+            android:textSize="12sp"
+            android:fontFamily="@font/impact"
+            android:letterSpacing="0.1"
+            android:background="@color/wa_orange"
+            android:clickable="true"
+            android:focusable="true"
+            android:text="@string/archive_verify_btn"
+            android:visibility="gone" />
 
         <TextView
-            android:id="@+id/reportSummary"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:textColor="@color/wa_gray"
-            android:textSize="11sp"
-            android:fontFamily="monospace"
-            tools:text="12 blobs • 24 MB" />
+            android:id="@+id/reportPlayBtn"
+            android:layout_width="0dp"
+            android:layout_height="40dp"
+            android:layout_weight="1"
+            android:layout_marginEnd="6dp"
+            android:gravity="center"
+            android:textColor="@color/wa_white"
+            android:textSize="12sp"
+            android:fontFamily="@font/impact"
+            android:letterSpacing="0.1"
+            android:background="@color/wa_orange"
+            android:clickable="true"
+            android:focusable="true"
+            android:text="@string/archive_play_btn"
+            android:visibility="gone" />
 
         <TextView
-            android:id="@+id/reportCreatedAt"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="2dp"
-            android:textColor="@color/wa_gray"
-            android:textSize="10sp"
-            android:fontFamily="monospace"
-            tools:text="2026-05-15T12:34:00Z" />
-
+            android:id="@+id/reportExportBtn"
+            android:layout_width="0dp"
+            android:layout_height="40dp"
+            android:layout_weight="1"
+            android:layout_marginEnd="6dp"
+            android:gravity="center"
+            android:textColor="@color/wa_white"
+            android:textSize="12sp"
+            android:fontFamily="@font/impact"
+            android:letterSpacing="0.1"
+            android:background="@color/wa_orange"
+            android:clickable="true"
+            android:focusable="true"
+            android:text="@string/archive_export_btn"
+            android:visibility="gone" />
     </LinearLayout>
-
-    <!-- Checkmark slot, GONE by default, set to VISIBLE
-         by ArchiveReportsAdapter.markDownloaded(). Big and green so
-         it stands out at a glance ; the colored hex is inline to
-         avoid yet another color resource for a one-off accent. -->
-    <TextView
-        android:id="@+id/reportDownloadedCheck"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginStart="12dp"
-        android:text="@string/archive_report_downloaded"
-        android:textSize="24sp"
-        android:textStyle="bold"
-        android:textColor="#3FE36B"
-        android:visibility="gone"
-        tools:visibility="visible" />
 
 </LinearLayout>

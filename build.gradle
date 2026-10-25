@@ -51,7 +51,6 @@ buildscript {
     versions.javarosa = '2.6.0'
     versions.kxml2 = '2.3.0'
     versions.commonsIo = '2.16.1'  // BT-HIGH-14 bump from 2.6 (CVE-2021-29425)
-    versions.exoplayer = '2.19.1'  // BT-HIGH-14 bump from 2.18.2 (CVE-2021-21159, LOW). Media3 migration = follow-up
     versions.camerax = '1.3.4'
     versions.exifinterface = '1.3.3'
     versions.simplifyInk = '1.0.3'

@@ -188,6 +188,27 @@ cd crypto-rs
 cargo test --release -p frappuccino-crypto-stream --test e2e_protocol -- --ignored --test-threads=1
 ```
 
+### Ordre de déploiement : le relais avant l'APK
+
+Une APK qui ferme ses rapports (`POST /close/{report_id}`, signature 0x09)
+suppose un relais qui connaît cette route et la règle d'écriture après
+clôture. **Déployer le relais d'abord**, le sonder, et seulement ensuite
+diffuser l'APK :
+
+```bash
+# Depuis ta machine : un POST nu sur /close, sans en-têtes.
+curl -sk -o /dev/null -w '%{http_code}
+' -X POST   "https://<IP>:8443/close/$(printf 'a%.0s' $(seq 32))"
+# → 400 attendu (en-têtes absents) : la route existe.
+# → 404 : route absente, relais pas à jour. NE PAS diffuser l'APK.
+```
+
+Côté client, un 404 sur `/close` veut dire « route absente » : l'APK réessaie
+avec recul et n'abandonne jamais une clôture. Une APK arrivée avant le relais
+ne perd donc rien, mais ses rapports restent ouverts (non figés) tant que le
+relais n'est pas déployé. Le test `test_close_without_headers_is_400_not_404`
+(`server/tests/test_report_close.py`) fige la réponse attendue de la sonde.
+
 ## Passer en mode domaine (flip Phase 6.1.2 — quand tu n'es plus seul à tester)
 
 Le mode solo (IP + cert auto-signé) suffit tant que tu testes seul. Pour ouvrir
@@ -309,6 +330,13 @@ Quand tu quittes Vultr pour Greenhost / 1984 / autre :
      blobs MinIO — toutes les vidéos uploadées étaient perdues.
    - Le script `restore-state.sh` refuse d'écraser un volume non-vide sans
      `--force`, donc tu ne peux pas accidentellement écraser une prod live.
+   - Le tarball de volume copie les objets MinIO tels quels, **métadonnées
+     utilisateur comprises**, dont `report-write-sig` (la signature d'écriture
+     de chaque objet). C'est une donnée d'intégrité : sans elle, le secours ne
+     peut plus vérifier les objets d'un rapport jamais clos. Toute autre voie
+     de copie (S3 vers S3, changement de backend de stockage) doit préserver
+     les métadonnées utilisateur. Vérifier avant et après avec
+     `audit-reports-vs-blobs.sh` : `without_write_sig` ne doit pas augmenter.
 4. **Update DNS** (si domaine) ou le `PINNED_HOST` du client Rust pointant sur
    le nouveau IP.
 5. **Régénère le cert TLS** sur la nouvelle VM (Étape 2 Option A), update le
@@ -333,7 +361,7 @@ que les users updatent l'APK avec le nouveau SPKI pin.
 
 ## Cutover relais-aveugle (Phase C — clean break, DESTRUCTIF, GO requis)
 
-> ⚠️ **Opération destructive sur le relais PROD (`136.244.101.236`, PAS
+> ⚠️ **Opération destructive sur le relais PROD (`<IP>`, PAS
 > l'hote du site, qui est une autre machine).** Elle **efface tout l'état de test** (reports +
 > blobs MinIO + registre d'enrôlement + logs) et exige un **re-enroll** des
 > devices. À exécuter **uniquement sous GO explicite, étape par étape**.
@@ -352,14 +380,14 @@ d'où le clean break plutôt qu'une migration de schéma.
 
 ```bash
 # 0. CONFIRME l'IP — c'est bien le relais, pas l'hote du site.
-ssh root@136.244.101.236 -i ~/.ssh/id_ed25519 'hostname && curl -ksf https://localhost:8443/health'
+ssh root@<IP> -i ~/.ssh/id_ed25519 'hostname && curl -ksf https://localhost:8443/health'
 
 # 1. Backup de SÛRETÉ (rollback) AVANT de toucher quoi que ce soit. Même si on
 #    wipe tout, un backup horodaté permet de revenir en arrière si besoin.
 #    WP-A3 : le backup est age-chiffré OBLIGATOIRE — exporte le recipient
 #    (clé publique age1…, clé privée gardée HORS relais) sinon le script
 #    refuse d'écrire en clair.
-ssh root@136.244.101.236 -i ~/.ssh/id_ed25519 \
+ssh root@<IP> -i ~/.ssh/id_ed25519 \
   'sudo FRAPPUCCINO_BACKUP_AGE_RECIPIENT=age1REMPLACER /opt/frappuccino/deploy/backup-state.sh'
 #    → note le chemin/sha256 du tarball .tar.gz.age affiché (pour le rollback).
 ```
@@ -369,15 +397,15 @@ ssh root@136.244.101.236 -i ~/.ssh/id_ed25519 \
 ```bash
 # Depuis le repo local (worktree à jour) — recopie l'app Phase C + rebuild.
 scp -r server/app server/Dockerfile server/docker-compose.yml server/requirements.txt \
-  root@136.244.101.236:/opt/frappuccino/
-ssh root@136.244.101.236 -i ~/.ssh/id_ed25519 \
+  root@<IP>:/opt/frappuccino/
+ssh root@<IP> -i ~/.ssh/id_ed25519 \
   'cd /opt/frappuccino && docker compose up -d --build && docker compose logs --tail=20 server'
 ```
 
 ### Étape 2 — clean-break wipe (état + blobs + logs)
 
 ```bash
-ssh root@136.244.101.236 -i ~/.ssh/id_ed25519 '
+ssh root@<IP> -i ~/.ssh/id_ed25519 '
   cd /opt/frappuccino
   # down -v retire conteneurs + réseaux + les volumes nommés (server_state +
   # minio_data) en un coup ⇒ wipe reports.json + .ratchet_registry.json +
@@ -394,7 +422,7 @@ ssh root@136.244.101.236 -i ~/.ssh/id_ed25519 '
 ### Étape 3 — vérifier l'état vierge + le code relais-aveugle
 
 ```bash
-ssh root@136.244.101.236 -i ~/.ssh/id_ed25519 '
+ssh root@<IP> -i ~/.ssh/id_ed25519 '
   curl -ksf https://localhost:8443/health                       # → {"status":"ok"}
   # reports.json vide (ou absent jusquau 1er upload) :
   docker exec frappuccino-server-1 sh -c "cat /state/reports.json 2>/dev/null || echo VIDE"
@@ -403,7 +431,7 @@ ssh root@136.244.101.236 -i ~/.ssh/id_ed25519 '
 '
 ```
 
-### Étape 4 — re-enroll des devices (gestes therealshulgin)
+### Étape 4 — re-enroll des devices (gestes du mainteneur)
 
 Sur **Seeker** puis **OnePlus** : ouvrir l'app, déverrouiller (PIN) — l'app
 ré-enregistre l'identité (dérivée de la phrase, donc identique) + un batch frais
@@ -413,7 +441,7 @@ contre le relais vierge. Vérifier dans logcat : `V2 server enrollment OK` puis
 ### Étape 5 — vérification post-cutover (le test du motto)
 
 ```bash
-ssh root@136.244.101.236 -i ~/.ssh/id_ed25519 '
+ssh root@<IP> -i ~/.ssh/id_ed25519 '
   # (a) reports.json = report_id -> report_pk SEUL (0 owner/createdAt/author/title) :
   docker exec frappuccino-server-1 sh -c "cat /state/reports.json" \
     | grep -iE "owner|createdAt|author|title" && echo "!! FUITE IDENTITE" || echo "OK 0 identite"
@@ -437,7 +465,7 @@ ssh root@136.244.101.236 -i ~/.ssh/id_ed25519 '
 > (au build) ; ceci en est le pendant terrain au repos.
 
 ```bash
-ssh root@136.244.101.236 -i ~/.ssh/id_ed25519 '
+ssh root@<IP> -i ~/.ssh/id_ed25519 '
   PK_HEX="REMPLACER_par_la_cle_ed25519_hex_du_temoin"
   # MinIO stocke les objets sous /data (volume minio_data) dans le conteneur minio.
   docker exec -i frappuccino-minio-1 python3 - "$PK_HEX" <<"PY"
@@ -458,12 +486,12 @@ PY
 
 ```bash
 # (e1) sur le relais : les ports app n'ecoutent QUE sur loopback.
-ssh root@136.244.101.236 -i ~/.ssh/id_ed25519 \
+ssh root@<IP> -i ~/.ssh/id_ed25519 \
   "ss -ltn | grep -E ':(8000|9000)\b' || echo 'aucun listener 8000/9000'"
 #   -> attendu : 127.0.0.1:8000 et 127.0.0.1:9000 (JAMAIS 0.0.0.0:…)
 # (e2) depuis l'EXTERIEUR (ton poste) : le port app doit etre injoignable.
-nc -z -w3 136.244.101.236 8000 && echo '!! 8000 EXPOSE' || echo 'OK 8000 ferme'
-nc -z -w3 136.244.101.236 8443 && echo 'OK 8443 ouvert (nginx TLS)' || echo '!! 8443 injoignable'
+nc -z -w3 <IP> 8000 && echo '!! 8000 EXPOSE' || echo 'OK 8000 ferme'
+nc -z -w3 <IP> 8443 && echo 'OK 8443 ouvert (nginx TLS)' || echo '!! 8443 injoignable'
 ```
 
 Puis **T5 field-test** : sur un device, enregistrer (dont **background +
@@ -473,7 +501,7 @@ reviennent (énumération id-free). C'est la validation terrain finale de Phase 
 ### Rollback (si l'étape 3/5 échoue)
 
 ```bash
-ssh root@136.244.101.236 -i ~/.ssh/id_ed25519 '
+ssh root@<IP> -i ~/.ssh/id_ed25519 '
   cd /opt/frappuccino && docker compose down -v
   # Re-déployer l ANCIEN code (git checkout de la révision pré-Phase-C côté repo,
   # re-scp server/app) PUIS restaurer l état sauvegardé en pré-flight :
@@ -493,7 +521,7 @@ ssh root@136.244.101.236 -i ~/.ssh/id_ed25519 '
 
 | Fichier | Module | Contenu post-cutover |
 |---|---|---|
-| `data/reports.json` (`REPORTS_DB_PATH`) | `routes/reports.py` | `report_id → report_pk` (0 identité) |
+| `data/reports.json` (`REPORTS_DB_PATH`) | `routes/reports.py` | `report_id → report_pk`, plus la clôture signée `{seq_limit, manifest_sha256, sig}` d'un rapport clos (0 identité). Fichier illisible ou mal formé : le relais **refuse de démarrer** (restaurer depuis une sauvegarde), au lieu de repartir vide et d'oublier les clôtures |
 | `/state/ratchet_registry.json` (`RATCHET_REGISTRY_FILE` ; le nom à point est le défaut du code, que le compose surcharge) | `ratchet_registry.py` | pks enrôlés + compteurs batch/création (résidu §6 ; **seul** index d'identité au repos depuis le retrait de `.authorized_keys.json`, 2026-06-29) |
 | `/state/nonce_cache.json` (`NONCE_CACHE_FILE` ; idem) | `auth.py` | nonces one-shot (transitoire) |
 | `.jwt_blacklist.json` (`JWT_BLACKLIST_FILE` ; celui-ci n'est **pas** surchargé par le compose, il garde le défaut à point) | `jwt_blacklist.py` | hashes de tokens révoqués |

@@ -90,7 +90,7 @@ jobs:
           done
           echo "::error::Kani install failed three times; the proofs did not run"
           exit 1
-      - name: Kani proofs (parse_header no-panic + postconditions)
+      - name: Kani proofs (8 harnesses, count asserted by the runner)
         run: bash crypto-rs/run-kani.sh
 
   tamarin:

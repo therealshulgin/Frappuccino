@@ -23,9 +23,74 @@ pub fn is_safe_blob_filename(name: &str) -> bool {
     )
 }
 
+/// Longest object name the relay accepts.
+const MAX_RELAY_NAME_BYTES: usize = 128;
+
+/// True iff `byte` belongs to the alphabet of relay object names,
+/// `[A-Za-z0-9._-]`. Every such byte is ASCII, so a run of them is valid UTF-8
+/// and spells one character per byte.
+#[must_use]
+pub(crate) fn is_relay_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+}
+
+/// True iff `name` is an object name the relay accepts: 1 to 128 characters
+/// from `[A-Za-z0-9._-]`, not `.`, and no `..` anywhere. Mirrors
+/// `server/app/paths.py::validate_filename`, so a client never builds a URL
+/// or an envelope for a name the relay would refuse, and never sends a
+/// relay-supplied name back in a URL without checking it. Every such name is
+/// also a safe path component ([`is_safe_blob_filename`]).
+///
+/// The rule is checked on the bytes ([`is_relay_object_name_bytes`]). The
+/// alphabet is ASCII, so this is the same rule as on characters.
+#[must_use]
+pub fn is_relay_object_name(name: &str) -> bool {
+    is_relay_object_name_bytes(name.as_bytes())
+}
+
+/// [`is_relay_object_name`] on raw bytes. It uses plain loops and no string
+/// search, which the Kani harness over the envelope decoder relies on.
+#[must_use]
+pub(crate) fn is_relay_object_name_bytes(name: &[u8]) -> bool {
+    (1..=MAX_RELAY_NAME_BYTES).contains(&name.len())
+        && name.iter().all(|&byte| is_relay_name_byte(byte))
+        && name != b"."
+        && !name.windows(2).any(|pair| pair == b"..")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_safe_blob_filename;
+    use super::{is_relay_object_name, is_safe_blob_filename};
+
+    #[test]
+    fn relay_object_names_mirror_the_relay_rule() {
+        for good in [
+            "000001.strm",
+            "manifest",
+            "a6c2f8e53532333e878cce6644f0a419",
+            "sid_000001.strm",
+            "a-b_c.d",
+            &"a".repeat(128),
+        ] {
+            assert!(is_relay_object_name(good), "{good:?}");
+            assert!(is_safe_blob_filename(good), "{good:?}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a..b",
+            "a/b",
+            "a\\b",
+            "a b",
+            "é",
+            "a?b",
+            "%2e%2e",
+            &"a".repeat(129),
+        ] {
+            assert!(!is_relay_object_name(bad), "{bad:?}");
+        }
+    }
 
     #[test]
     fn accepts_real_blob_names_rejects_traversal() {

@@ -93,8 +93,10 @@ pub fn encrypt_single(plaintext: &[u8], author: &StreamIdentity) -> Result<Vec<u
 /// `MAX_CHUNK_LEN = 2 MiB`, which fits in `u32`.
 pub fn encrypt_chunked(plaintext: &[u8], author: &StreamIdentity) -> Result<Vec<u8>, EncryptError> {
     // chunk_count is part of the AAD, so it must be known before encrypting
-    // the first chunk. ceil(len / CHUNK_SIZE) — zero for empty plaintext.
-    let chunks_u64 = (plaintext.len() as u64).div_ceil(CHUNK_SIZE as u64);
+    // the first chunk. ceil(len / CHUNK_SIZE), and never less than one: an
+    // empty plaintext still gets one (empty) authenticated chunk, because the
+    // decoder refuses a CHUNKED body that carries no tag to verify.
+    let chunks_u64 = (plaintext.len() as u64).div_ceil(CHUNK_SIZE as u64).max(1);
     let chunk_count = u32::try_from(chunks_u64).map_err(|_| EncryptError::TooLarge {
         chunks: chunks_u64,
         max: MAX_CHUNK_COUNT,
@@ -123,7 +125,8 @@ pub fn encrypt_chunked(plaintext: &[u8], author: &StreamIdentity) -> Result<Vec<
     let mut chunks_bytes = Vec::new();
     let mut chunk_index: u32 = 0;
     let mut offset = 0;
-    while offset < plaintext.len() {
+    // At least one pass, so an empty plaintext yields one empty chunk.
+    loop {
         let end = (offset + CHUNK_SIZE).min(plaintext.len());
         let plain = &plaintext[offset..end];
 
@@ -151,6 +154,9 @@ pub fn encrypt_chunked(plaintext: &[u8], author: &StreamIdentity) -> Result<Vec<
 
         chunk_index += 1;
         offset = end;
+        if offset >= plaintext.len() {
+            break;
+        }
     }
     debug_assert_eq!(chunk_index, chunk_count);
     session_key.zeroize();

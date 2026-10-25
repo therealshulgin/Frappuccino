@@ -2,6 +2,8 @@
 
 > Model: claude-opus-4-8[1m]. Date: 2026-06-28. Scope: the on-the-wire transport for chunk upload — Salamander/QUIC obfuscation, SPKI pinning that bypasses CA validation, the 3-pin break-glass set, the QUIC→DirectTls fallback, and the SNI/domain trade-off — defended choice-by-choice for a state adversary doing DPI + seizure.
 
+> **Later change (2026-10-25).** `ChunkUploadWorker` now sends queue envelopes signed at production through `upload_send_envelope`; the transport decisions reviewed here (Salamander, QUIC with fallback, SPKI pinning) are unchanged, and the closure route `POST /close` uses the same transport primitive.
+
 This document is a **design defense**, not a vulnerability hunt. For each choice it makes the affirmative case, justifies the specific implementation against the alternatives, states the sharpest hostile objection and either rebuts or concedes it, then names the assumptions and the questions for a future audit. Every claim is cited to the code as read on the `xenodochial-morse` worktree on 2026-06-28.
 
 ---

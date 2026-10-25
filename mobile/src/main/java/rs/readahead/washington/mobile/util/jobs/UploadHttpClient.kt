@@ -11,10 +11,11 @@ import java.util.concurrent.TimeUnit
  * Shared OkHttpClient for the Frappuccino V2 calls that still go through the
  * JVM HTTP stack.
  *
- * Chunk PUTs are not among them, and must not be moved back here. Every PUT
- * needs capability headers signed by the reportKeyring, which is the FFI, so
- * [ChunkUploadWorker] uploads through `uniffi.frappuccino.uploadPutReportChunk`
- * and deliberately has no OkHttp fallback that could sign. What is left on this
+ * Report uploads are not among them, and must not be moved back here. Every
+ * queue envelope is verified by Rust before it is sent (trailer, payload hash,
+ * signatures), and Rust builds the request from it, so [ChunkUploadWorker]
+ * sends through `uniffi.frappuccino.uploadSendEnvelope` and deliberately has no
+ * OkHttp fallback that would skip that check. What is left on this
  * client is the provenance timestamp POST, whose `.ots` response body has to be
  * read in the JVM ([ProvenanceTimestampWorker]), and the `/health` reachability
  * probe, which derives a 3 s-callTimeout client from this one

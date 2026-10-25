@@ -91,8 +91,9 @@ object UploadCircuitBreaker {
      * The gate lets exactly ONE worker through at a time after the
      * cooldown ; others see isOpen()=true until that worker reports. No
      * ratchet auth slot is at stake here : the fallback re-auth is
-     * serialised by ChunkUploadWorker.authFallbackLock, it runs before
-     * this gate, and only the creation chunk needs a bearer
+     * single-flight with every authentication of the process
+     * (ensureBearer → StreamUploadManager.authenticateIfAbsent), it runs
+     * before this gate, and only the creation chunk needs a bearer
      * (Blue HIGH-5 fix, Phase H2-B.13).
      */
     private val halfOpenProbeInFlight = AtomicBoolean(false)

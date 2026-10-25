@@ -198,7 +198,8 @@
             android:clickable="true"
             android:focusable="true" />
 
-        <!-- Toggle "auto-upload des chunks orphelins". Texte
+        <!-- Toggle "auto-upload des enveloppes en attente" (la file
+             d'envoi laissée par une session arrêtée hors ligne). Texte
              set programmatically (ON/OFF). Le clic flip le flag dans
              StreamPreferences ; le OrphanSweepWorker check le flag à
              chaque tick. -->

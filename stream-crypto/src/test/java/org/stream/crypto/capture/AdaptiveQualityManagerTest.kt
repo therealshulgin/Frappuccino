@@ -61,7 +61,7 @@ class AdaptiveQualityManagerTest {
 
     @Test
     fun fast_streak_survives_mid_band_during_recovery() {
-        // Repro of the bug therealshulgin reported 2026-05-10 : after a downgrade
+        // Repro of a bug reported on 2026-05-10 : after a downgrade
         // to SD, network recovers but stays just below the wifi burst
         // (some chunks land in 0.60..0.80 mid-band), and the previous
         // logic would reset fastTicks on every mid-band tick — silently

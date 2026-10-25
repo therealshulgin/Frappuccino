@@ -182,6 +182,15 @@ fn decrypt_chunked(
             "chunk_count {chunk_count} exceeds cap {MAX_CHUNK_COUNT}"
         )));
     }
+    // Every accepted CHUNKED body carries at least one AEAD-verified chunk:
+    // with zero chunks the loop below would verify no tag at all, and the
+    // result would rest on nothing but the sealed envelope. The encoder always
+    // emits at least one chunk, even for an empty plaintext.
+    if chunk_count == 0 {
+        return Err(DecryptError::Malformed(
+            "CHUNKED body declares zero chunks".into(),
+        ));
+    }
 
     // RT-02 fix: V1 CHUNKED is now rejected outright. The V1 AAD did not bind
     // `chunk_count`, so an attacker controlling the wire could drop trailing

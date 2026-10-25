@@ -90,10 +90,159 @@ namespace frappuccino {
     [Throws=FfiError]
     ProvenanceSigner pin_session_open_provenance_signer([ByRef] bytes sealed_blob);
 
-    /// Unlock reload (OPTION B): unseal the report master with the held key and
-    /// reconstruct the keyring in-crate. The master never crosses the FFI.
+    /// MIGRATION ONLY: unseal the legacy report master with the held key and
+    /// rebuild the legacy keyring in-crate, for the legacy_convert_* and
+    /// legacy_write_closure calls. The master never crosses the FFI. A device
+    /// enrolled under the chained scheme has no master and never calls this.
     [Throws=FfiError]
     ReportKeyring pin_session_open_report_keyring([ByRef] bytes sealed_blob);
+
+    // -------- Report state (Rust-owned file, process-wide lock) -------------
+    // The state file (filesDir/report_state.bin) holds the index and chain
+    // link of the NEXT report plus the directory seed, sealed with the
+    // PIN-session key. Its plaintext never crosses the FFI. Every transition
+    // runs under one process-wide lock. All of these need the PIN session.
+
+    /// Enrollment: derive the state at index 0 from the phrase and write it,
+    /// sealed, to `state_path` (replacing any file there: enrollment is a
+    /// fresh start). The report master is never stored. Call after
+    /// pin_session_populate. A failure must abort the enrollment.
+    [Throws=FfiError]
+    void pin_session_create_report_state([ByRef] bytes mnemonic, [ByRef] bytes passphrase, [ByRef] string state_path);
+
+    /// Start a recording: open the next report and return its writer. The
+    /// advanced state is durably written BEFORE the writer is returned; on any
+    /// error there is no writer. The file is then unchanged, or, if only the
+    /// final directory flush failed, holds the advanced state (the index is
+    /// skipped; its key signed nothing). `author` is the
+    /// identity every object is encrypted to. The report's directory entry is
+    /// signed in this same call (written later by seal_directory_entry).
+    /// Throws WriterBusy while another writer is live in the process.
+    [Throws=FfiError]
+    ReportWriter pin_session_open_report([ByRef] string state_path, StreamIdentity author);
+
+    /// Migration: create the state at index `k` from the legacy master
+    /// (unsealed in-crate from `master_sealed`, never crossing the FFI) and
+    /// return the state's next index. Idempotent: an existing state is left
+    /// untouched and its next index returned (recordings may have advanced
+    /// it); one BEHIND `k` is refused (ReportRefused). k <= 1 000 000.
+    [Throws=FfiError]
+    u32 pin_session_migrate_report_state([ByRef] bytes master_sealed, u32 k, [ByRef] string state_path);
+
+    /// Emergency wipe: abort the live writer, then securely delete the state
+    /// file and any leftover `.part`. Idempotent.
+    [Throws=FfiError]
+    void report_state_wipe([ByRef] string state_path);
+
+    /// Abort the live writer from anywhere in the process (emergency wipe,
+    /// synchronous): its key is wiped, no closure is written. Waits for an
+    /// opening in progress. Returns whether a writer was open.
+    boolean report_writer_abort_live();
+
+    /// Whether a writer is live (opened, neither closed nor aborted).
+    boolean report_writer_is_live();
+
+    // -------- Queue key -----------------------------------------------------
+    // 32 random bytes per installation, persisted by Kotlin in its protected
+    // storage (read back as a ByteArray, never a String) and installed at
+    // process start; the caller's array is then wiped. Other copies the JVM
+    // made on the way (stream buffers, the buffers carrying the bytes across
+    // this boundary) are not. Without it no envelope can be written,
+    // inspected or sent; the files stay.
+
+    /// 32 fresh random bytes. NOT installed: persist them, then
+    /// queue_key_install, then wipe the array.
+    [Throws=FfiError]
+    bytes queue_key_generate();
+
+    /// Install the queue key for this process (replaces any installed key).
+    [Throws=FfiError]
+    void queue_key_install([ByRef] bytes key);
+
+    /// Drop and wipe the installed queue key. Idempotent.
+    void queue_key_clear();
+
+    boolean queue_key_present();
+
+    // -------- Queue envelopes -----------------------------------------------
+
+    /// Decode an envelope's trailer without reading its payload (cheap enough
+    /// for a whole queue). Throws EnvelopeCorrupt for a damaged envelope:
+    /// move it to the failed directory, never retry it.
+    [Throws=FfiError]
+    EnvelopeInfo envelope_inspect([ByRef] string path);
+
+    /// Send one envelope. Never throws. The envelope is verified in full
+    /// (trailer, payload re-hash, report_id = H(pk), signatures) before
+    /// anything goes on the network; the URL (PUT /file/{rid}/{name} or POST
+    /// /close/{rid}), the headers and the body all come from it. Nothing is
+    /// signed. `use_creation` adds X-Report-Create-Sig and the held bearer; it
+    /// is ignored for a closure. Tags when http_status == 0, besides the
+    /// transport's: no_queue_key, file_missing (no envelope at `path`, and only
+    /// that), envelope_corrupt (permanent: failed directory), envelope_io,
+    /// no_bearer, no_create_sig. With a response, error_detail is null except
+    /// report_closed: a 409 whose body is the relay's {"detail":"Report
+    /// closed"} (the closure does not cover this name); any other 409 has none.
+    PutOutcome upload_send_envelope([ByRef] string base_url, [ByRef] string path, TransportMode mode, boolean use_creation);
+
+    // -------- Migration of legacy files -------------------------------------
+    // Each appends a trailer to the existing file and renames it (no copy),
+    // signing NOW with the legacy key. Idempotent: an already converted source
+    // is only renamed; a missing source whose destination is already an
+    // envelope is reported as done. Resumable after a power cut during the
+    // append: a marker `<dst_path>.conv` (not an envelope) records the payload
+    // (length and hash) beside the destination until the envelope is in
+    // place, and the next call cuts whatever the append left before
+    // converting again.
+
+    /// A pending legacy object of report `n`: kind Chunk (a `.strm`) or
+    /// TimestampProof (a `.ots` already received). `filename` is its relay
+    /// name, as the legacy upload used it. A chunk whose framing is not a
+    /// whole STRM blob (cut short, bytes after the last chunk) throws
+    /// InvalidBlob before anything is signed; a SINGLE blob cut short is not
+    /// detectable without the archive key.
+    [Throws=FfiError]
+    EnvelopeInfo legacy_convert_report_object(ReportKeyring keyring, u32 n, EnvelopeKind kind, [ByRef] string filename, [ByRef] string src_path, [ByRef] string dst_path);
+
+    /// The pending legacy directory entry of report `n` (relay name derived
+    /// here from `n`).
+    [Throws=FfiError]
+    EnvelopeInfo legacy_convert_directory_entry(ReportKeyring keyring, u32 n, [ByRef] string src_path, [ByRef] string dst_path);
+
+    /// The closure of legacy report `n` (empty manifest, seq_limit 0). Its
+    /// info says needs_drain: send it only once no other envelope of the same
+    /// report_id is queued.
+    [Throws=FfiError]
+    EnvelopeInfo legacy_write_closure(ReportKeyring keyring, u32 n, [ByRef] string out_path);
+
+    // -------- Timestamp proof (opt-in) --------------------------------------
+
+    /// Write the timestamp ticket of a closed report (CloseInfo.ots_name +
+    /// the commitment from provenance_ots_commitment over
+    /// CloseInfo.plaintext_hashes), sealed under the queue key. Workers get
+    /// the ticket's path only.
+    [Throws=FfiError]
+    void ots_ticket_write([ByRef] string ticket_path, [ByRef] string ots_name, [ByRef] bytes commitment);
+
+    /// The commitment a ticket asks to timestamp (public: sent to calendars).
+    [Throws=FfiError]
+    bytes ots_ticket_commitment([ByRef] string ticket_path);
+
+    /// One call for a received proof: it must timestamp the ticket's
+    /// commitment; it is STRM-encrypted to `author` in memory, signed with the
+    /// directory key (needs the PIN session), and written as a timestamp-proof
+    /// envelope at `out_path`. The proof never reaches the disk in clear.
+    /// The ticket is deleted by this call once the envelope is written, so a
+    /// run started again after a crash finds no ticket rather than sealing a
+    /// second, different envelope under the same relay name.
+    [Throws=FfiError]
+    EnvelopeInfo pin_session_seal_ots_proof([ByRef] string state_path, [ByRef] string ticket_path, [ByRef] bytes proof, StreamIdentity author, [ByRef] string out_path);
+
+    /// Rescue: compare a DECRYPTED proof file with the commitment recomputed
+    /// from the verified objects. null = no proof. The Bitcoin anchoring is
+    /// checked on a desktop with the CLI.
+    [Throws=FfiError]
+    OtsStatus ots_proof_status(string? decrypted_proof_path, [ByRef] bytes commitment);
 
     /// Zeroize + drop the cached PIN-session key. Idempotent. Wired to lock /
     /// panic-wipe / drain-safe auto-lock; NEVER to a 401 (not re-derivable
@@ -108,32 +257,20 @@ namespace frappuccino {
     /// joining them onto a local output dir. The download FFIs also enforce it.
     boolean archive_blob_filename_is_safe([ByRef] string name);
 
-    /// Encrypt `plaintext` as a self-sealed STRM blob for `author`. Picks
-    /// SINGLE (<= 10 MiB) or CHUNKED automatically.
-    [Throws=FfiError]
-    bytes strm_encrypt([ByRef] bytes plaintext, StreamIdentity author);
-
-    /// Phase 6.1.4-C — `strm_encrypt` qui prend des paths au lieu de
-    /// buffers. Le plaintext ne touche jamais la JVM heap : Rust ouvre
-    /// `input_path`, lit en `Zeroizing<Vec<u8>>`, chiffre, écrit
-    /// `output_path`. Retourne la taille du blob (octets).
-    [Throws=FfiError]
-    u64 strm_encrypt_file([ByRef] string input_path, [ByRef] string output_path, StreamIdentity author);
-
     // Phase 8.1.6 (forensic finding #2, 2026-06-03) — the heap-returning
     // `strm_decrypt` is REMOVED from the FFI: it copied decrypted plaintext
     // into a non-Zeroizing JVM ByteArray that lingered on the heap.
-    // Decryption never crosses this boundary at all: the live archive path is
-    // `archive_download_and_decrypt` below, which decrypts and writes the file
-    // inside Rust. (The Rust `strm_decrypt` survives `#[cfg(test)]` only, for
-    // the in-memory roundtrip tests.)
+    // Decrypted plaintext never crosses this boundary: `strm_decrypt_to_file`
+    // below decrypts and writes the file inside Rust. (The Rust `strm_decrypt`
+    // survives `#[cfg(test)]` only, for the in-memory roundtrip tests.)
 
-    // `strm_decrypt_to_file` REMOVED from the FFI (2026-09-03). It was the
-    // path-based decrypt exported for Kotlin, and it never acquired a Kotlin
-    // caller: `archive_download_and_decrypt` calls `strm_core_decrypt` directly
-    // and does its own file write. The Rust fn SURVIVES in lib.rs and must stay
-    // — two tests are the only end-to-end coverage of encrypt-to-file then
-    // decrypt-to-file, including the wrong-recipient rejection.
+    /// Decrypt the STRM blob at `input_path` to `output_path`. The rescue's
+    /// decryption step, which comes AFTER verification: only a file a
+    /// ReportCheck kept is decrypted. The plaintext never crosses the FFI;
+    /// only the non-secret metadata does. A partial output is deleted on a
+    /// write failure. Secure-delete `output_path` after use.
+    [Throws=FfiError]
+    BlobMetadata strm_decrypt_to_file([ByRef] string input_path, [ByRef] string output_path, ArchiveIdentity archive);
 
     /// Phase 6.1.4-D — secure-delete d'un fichier temporaire contenant
     /// des secrets (MP4 plaintext, blob STRM intermédiaire). Overwrite
@@ -177,23 +314,9 @@ namespace frappuccino {
     // entry points are `pub` and re-exported, so the compiler emits no dead-code
     // warning and the shipped .so would have kept carrying them.
 
-    /// Phase C (relay-blind reports) — PUT a chunk authorized by the per-report
-    /// capability key R_n (not the identity). EVERY chunk carries X-Report-PK +
-    /// X-Report-Write-Sig (0x08); the creating chunk (is_creation=true) also
-    /// carries X-Report-Create-Sig (0x07) + the stream JWT bearer. The .strm is
-    /// hashed + signed INSIDE Rust (report_id == H(report_pk) by construction;
-    /// no secret crosses the FFI). Never throws — failures are in PutOutcome.
-    PutOutcome upload_put_report_chunk([ByRef] string url, [ByRef] string blob_path, TransportMode mode, ReportKeyring keyring, u32 n, [ByRef] string filename, boolean is_creation);
-
-    /// Phase C (relay-blind reports) — PUT one report-DIRECTORY entry (filename =
-    /// the opaque directory_entry_name_hex(n), M-1) to the witness's singleton
-    /// directory report, so the rescue device recovers the authoritative n_max by
-    /// re-deriving + matching the entry names (derive-and-match, NOT max of the
-    /// names) and enumerates reports EXACTLY. Same capability contract + transport
-    /// as upload_put_report_chunk, but addressed/signed by the directory key.
-    /// is_creation=true only for the entry that lazily creates the directory.
-    /// Never throws — failures are in PutOutcome.
-    PutOutcome upload_put_directory_entry([ByRef] string url, [ByRef] string blob_path, TransportMode mode, ReportKeyring keyring, [ByRef] string filename, boolean is_creation);
+    // `upload_put_report_chunk` and `upload_put_directory_entry` REMOVED. They
+    // signed at SEND time from a keyring kept live for the session; every
+    // object is now signed when produced and sent with upload_send_envelope.
 
     /// Re-arm the QUIC transport at the start of a recording. Releases the
     /// "QUIC cannot establish on this network" latch so a recovered network gets
@@ -226,21 +349,19 @@ namespace frappuccino {
     );
 };
 
-/// Transport selector for upload_put_report_chunk and
-/// upload_put_directory_entry. DirectTls = pinned reqwest over
-/// TCP (Phase 1). ObfQuic = pinned HTTP/3 over QUIC + BBR (Phase 3a) with an
-/// automatic QUIC->DirectTls fallback (Phase 3b brick 3): a QUIC transport
-/// failure routes the chunk over DirectTls for the same bearer (heap-0), and
-/// latches so subsequent chunks skip QUIC until the next recording start (or auth
-/// clear). A .so built without the `quic` feature behaves as DirectTls.
+/// Transport selector for upload_send_envelope. DirectTls = pinned TLS over
+/// TCP. ObfQuic = pinned HTTP/3 over obfuscated QUIC + BBR, with an automatic
+/// fallback: a QUIC attempt that fails without an HTTP status is re-sent over
+/// DirectTls in the same call, and a connection that cannot be established
+/// latches QUIC off until upload_transport_rearm or an auth clear. A .so built
+/// without the `quic` feature behaves as DirectTls.
 enum TransportMode {
     "DirectTls",
     "ObfQuic",
 };
 
-/// Result of upload_put_report_chunk and upload_put_directory_entry.
-/// http_status 0 = no HTTP response; error_detail
-/// is a short tag ("no_bearer"/"file_missing"/"timeout"/"network"/"client_build").
+/// Result of upload_send_envelope. http_status 0 = no HTTP response;
+/// error_detail is then a short tag (see upload_send_envelope).
 dictionary PutOutcome {
     u16 http_status;
     u64 upload_ms;
@@ -274,6 +395,23 @@ interface FfiError {
     /// Phase 6.1.4-D : I/O error during secure_delete_file
     /// (permission denied, file gone, disk full, etc.).
     Io(string detail);
+    /// The report writer was closed or aborted: it seals nothing more.
+    WriterClosed();
+    /// A report writer is already live in this process.
+    WriterBusy();
+    /// No queue key installed: no envelope can be written or read (the files
+    /// stay).
+    NoQueueKey();
+    /// The envelope is damaged or does not verify. Never send it, never
+    /// re-sign it: move it to the failed directory.
+    EnvelopeCorrupt(string detail);
+    /// The report layer refused the call (seq order, duplicate seq, chunk
+    /// before metadata, migration point behind the state...). Retrying the
+    /// same call fails the same way.
+    ReportRefused(string detail);
+    /// The relay answered 429: wait at least `retry_after_secs`, then retry
+    /// the same request.
+    RateLimited(u64 retry_after_secs);
 };
 
 // ============================================================================
@@ -299,21 +437,154 @@ dictionary RotationProof {
     bytes signature;
 };
 
-/// Phase 4.4.2 — per-blob metadata returned by
-/// `StreamServerClient.archive_list_blobs`.
+/// One object of an ArchiveListing (relay-supplied, unverified).
 dictionary ArchiveBlobInfo {
     string filename;
     u64 size;
     string? last_modified;
 };
 
-/// Phase 4.4.2 — result of `archive_download_and_decrypt`. Carries the
-/// network-side download byte count plus the decrypted plaintext size
-/// and the non-secret blob metadata.
-dictionary ArchiveDownloadResult {
-    u64 downloaded_bytes;
-    u64 plaintext_bytes;
-    BlobMetadata metadata;
+/// A closure as the relay recorded it (unverified).
+dictionary ArchiveClosureInfo {
+    u32 seq_limit;
+    bytes manifest_sha256;   // 32 bytes
+    bytes sig;               // 64 bytes
+};
+
+/// Result of StreamServerClient.archive_list (relay-supplied, unverified).
+dictionary ArchiveListing {
+    sequence<ArchiveBlobInfo> blobs;
+    ArchiveClosureInfo? closure;
+};
+
+enum ArchiveFetchStatus {
+    "Stored",
+    "NotFound",
+};
+
+/// The write-signature header of a fetched object.
+enum WriteSigState {
+    "Absent",
+    "Present",
+    "Malformed",
+};
+
+/// Result of StreamServerClient.archive_fetch_object. The object is on disk,
+/// still encrypted; this only says what was fetched, not whether to keep it.
+dictionary ArchiveObjectResult {
+    ArchiveFetchStatus status;
+    u64 size;
+    bytes? blob_sha256;      // 32 bytes, null when not found
+    WriteSigState write_sig_state;
+    bytes? write_sig;        // 64 bytes when Present
+};
+
+// ---- Report pipeline -------------------------------------------------------
+
+/// What a queue envelope carries.
+enum EnvelopeKind {
+    "Chunk",
+    "DirectoryEntry",
+    "Closure",
+    "TimestampProof",
+};
+
+/// What Kotlin needs to schedule an envelope, from its trailer. No signature
+/// and no key.
+dictionary EnvelopeInfo {
+    EnvelopeKind kind;
+    string report_id_hex;    // groups a report's envelopes
+    string filename;         // relay object name, empty for a closure
+    boolean needs_drain;     // legacy closure: send only once nothing else of the report is queued
+    boolean has_create_sig;  // can be sent in creation mode
+    u32 seq_limit;           // closure only, else 0
+    u64 payload_len;
+};
+
+/// Result of ReportWriter.seal_chunk_file.
+dictionary SealedChunk {
+    u32 seq;
+    u64 blob_bytes;          // size of the encrypted object
+};
+
+/// Result of a successful ReportWriter.close_report.
+dictionary CloseInfo {
+    u32 index;
+    string report_id_hex;
+    u32 seq_limit;
+    u32 object_count;                  // metadata included
+    sequence<bytes> plaintext_hashes;  // seq >= 1, increasing seq: OTS commitment leaves
+    string ots_name;                   // for ots_ticket_write
+};
+
+enum OtsStatus {
+    "Match",
+    "Mismatch",
+    "Absent",
+};
+
+// ---- Rescue ----------------------------------------------------------------
+
+enum ReportScheme {
+    "Legacy",
+    "Chain",
+    "Directory",
+};
+
+/// A report to probe. Keys and ids are always re-derived by Rust from these;
+/// `index` is ignored for the directory.
+dictionary RescueTarget {
+    ReportScheme scheme;
+    u32 index;
+};
+
+/// The verdict on one fetched object.
+enum ObjectStatus {
+    "Verified",          // kept: part of the verified testimony
+    "Foreign",           // listed by the valid closure, other bytes: excluded
+    "Missing",           // listed (by the closure or the relay) but not stored
+    "Unexpected",        // outside the valid closure, unsigned: excluded
+    "UnexpectedSigned",  // outside the valid closure, validly signed: excluded, report ALTERED
+    "Unverifiable",      // legacy/directory object without a stored signature: kept APART
+    "Invalid",           // no valid signature where one is required: excluded
+};
+
+enum ClosureState {
+    "Absent",
+    "Unchecked",
+    "Valid",
+    "Invalid",
+};
+
+enum ReportStatus {
+    "Complete",      // chained, validly closed, everything verified
+    "Incomplete",    // chained, validly closed, only missing (or unfetched) objects
+    "Altered",       // chained, validly closed, a foreign object or a second signer
+    "Interrupted",   // chained, no valid closure: objects verified one by one
+    "Legacy",
+    "Directory",
+};
+
+/// Everything shown for one report.
+dictionary ReportVerdict {
+    ReportScheme scheme;
+    u32? index;
+    ReportStatus status;
+    ClosureState closure;            // Valid on a legacy report = frozen on the relay
+    boolean closure_anomaly;         // an invalid closure, or any closure of the directory
+    u32 verified;
+    u32 foreign;
+    u32 missing;
+    u32 unexpected;
+    u32 unexpected_signed;
+    u32 unverifiable;
+    u32 invalid;
+    u32 unchecked;                   // listed objects not fetched yet
+    sequence<string> verified_names; // reading order (increasing seq)
+    sequence<string> unverifiable_names;
+    sequence<u32> missing_seqs;
+    string? first_modified;          // date range of the listing (relay clock)
+    string? last_modified;
 };
 
 /// Non-secret metadata accompanying a decrypted STRM blob. F-C1: no author
@@ -417,8 +688,7 @@ interface ArchiveIdentity {
     // B-CR-4 (audit 2026-06-26) — the heap-returning `decrypt_session_key` is
     // REMOVED from the FFI surface. It returned the 32-byte STRM session key
     // into a non-Zeroizing JVM ByteArray (the R-CR-1 class), and it had ZERO
-    // production callers: the live archive path decrypts inside Rust via
-    // `StreamServerClient.archive_download_and_decrypt` →
+    // production callers: the rescue decrypts inside Rust via
     // `strm_decrypt_to_file`, so the session key never crosses the boundary.
     // The Rust unseal lives on at `core::identity::ArchiveIdentity::
     // decrypt_session_key`, used by the in-Rust `stream::decrypt` path.
@@ -456,58 +726,131 @@ interface ProvenanceSigner {
     bytes ots_salt([ByRef] bytes recording_id);
 };
 
-/// Phase C relay-blind reports — the witness's per-report capability keyring
-/// (`core::report::ReportKeyring`). Derives a per-report key `R_n` from the
-/// BIP-39 seed under a dedicated HKDF context; the relay stores
-/// `report_id → report_pk` and never the identity, so a seizure of the relay
-/// disk reveals no `identity → report` link. Derived once at enrollment
-/// (`from_mnemonic`); the caller PIN-seals it in-crate via `seal_with_session`
-/// and reloads it at unlock (`pin_session_open_report_keyring`) so it is live
-/// during recording — the master never crosses the FFI; its lifecycle mirrors
-/// `ProvenanceSigner` (survives background recording, wiped only at lock).
+/// The LEGACY per-index report keyring, for the migration only. Obtained from
+/// pin_session_open_report_keyring and passed to legacy_convert_* /
+/// legacy_write_closure, which sign the legacy objects still pending and close
+/// the legacy reports. Deliberately opaque: no constructor and no method, so a
+/// migrated device cannot keep producing legacy addresses or signatures.
+/// (Its constructor from the phrase, seal_with_session, report_id_hex,
+/// directory_id_hex and directory_entry_name_hex are REMOVED: enrollment now
+/// creates the report state, and the rescue uses ReportRescue.)
 interface ReportKeyring {
-    /// Enrollment-time: derive from the mnemonic (UTF-8 bytes, like
-    /// ProvenanceSigner.from_mnemonic — never touches the Java intern pool).
+};
+
+/// The writer of one open report (from pin_session_open_report). Every object
+/// is encrypted, signed and written as a queue envelope in ONE call, and
+/// recorded only once that envelope is durably on disk. Run every call from
+/// one FIFO executor. After close_report or abort, every call throws
+/// WriterClosed.
+interface ReportWriter {
+    u32 index();
+    string report_id_hex();
+
+    /// Neither closed nor aborted.
+    boolean is_open();
+
+    /// Write the report's directory entry envelope (signed by the directory
+    /// key at opening). First thing to write. Rewriting replaces the file.
+    [Throws=FfiError]
+    void seal_directory_entry([ByRef] string out_path);
+
+    /// Seal the metadata JSON as seq 0. Mandatory before any chunk.
+    [Throws=FfiError]
+    void seal_metadata([ByRef] bytes json, [ByRef] string out_path);
+
+    /// Seal media chunk `seq` (capture number >= 1, gaps allowed) from the MP4
+    /// at `input_path`. Transactional: on error the table is unchanged,
+    /// nothing is left at `out_path`, the MP4 is untouched; delete the MP4 only
+    /// after success. A seq already sealed is refused (ReportRefused).
+    [Throws=FfiError]
+    SealedChunk seal_chunk_file(u32 seq, [ByRef] string input_path, [ByRef] string out_path);
+
+    /// Sign the closure over every sealed object, write its envelope durably,
+    /// then wipe the key. A failed write is retried by calling again (same
+    /// manifest and signature); from the first call on, no object is accepted.
+    /// Refused (ReportRefused, writer left open) if the metadata was never
+    /// sealed. Not named `close`: the generated class already has an
+    /// AutoCloseable close() that frees the handle.
+    [Throws=FfiError]
+    CloseInfo close_report([ByRef] string out_path);
+
+    /// Wipe the key without a closure. Idempotent.
+    void abort();
+};
+
+/// Rescue: everything derived from the phrase (both schemes, the directory).
+/// Usage: open_directory -> planner -> loop { next, open_report, record } ->
+/// for each ReportCheck found: verify_closure (if has_closure), fetch_object
+/// for each object_names, verdict. A RateLimited error means: wait, then
+/// repeat the same call.
+interface ReportRescue {
+    /// Validates the phrase (words AND checksum) first.
     [Throws=FfiError, Name=from_mnemonic]
     constructor([ByRef] bytes mnemonic, [ByRef] bytes passphrase);
 
-    // `from_seed` REMOVED from the surface (2026-09-03): no Kotlin caller. The
-    // Rust fn SURVIVES and is load-bearing — `pin_session_open_report_keyring`
-    // calls it, and that is the only way the keyring is reloaded after unlock.
-
-    /// Lot 4b (OPTION B) — seal the report master with the held PIN-session key
-    /// in-crate; returns the sealed blob. The master never crosses the FFI.
+    /// List the directory; null if the relay has none.
     [Throws=FfiError]
-    bytes seal_with_session();
+    ReportCheck? open_directory(StreamServerClient client);
 
-    /// report_id_n as 32 lowercase hex chars — the identity-free URL address of
-    /// report n (PUT/GET /file/{report_id}/{filename}).
+    /// The enumeration plan from the directory's check (null = absent).
     [Throws=FfiError]
-    string report_id_hex(u32 n);
+    RescuePlanner planner(ReportCheck? directory);
 
-    // `report_pk`, `sign_create` and `sign_write` REMOVED from the surface
-    // (2026-09-03). They exposed the three capability headers of a chunk PUT
-    // (X-Report-PK, X-Report-Create-Sig, X-Report-Write-Sig) for a Kotlin caller
-    // that never existed: `upload_put_report_chunk` builds all three inside Rust,
-    // which is the point — a signature the JVM never holds cannot leak from it.
-    //
-    // The three Rust fns SURVIVE and are the most load-bearing code in this
-    // interface: `upload_put_report_chunk` calls all three on every single chunk
-    // upload. Removing any of them breaks every write to the relay.
-
-    /// report_id of the singleton report DIRECTORY (dedicated HKDF context) as 32
-    /// lowercase hex — the fixed, identity-free address the device appends index
-    /// entries to and the rescue device fetches to read the authoritative n_max.
-    /// Its report_pk + sigs are applied inside upload_put_directory_entry.
+    /// List the report `target` re-derives; null on 404 (record found = false).
     [Throws=FfiError]
-    string directory_id_hex();
+    ReportCheck? open_report(StreamServerClient client, RescueTarget target);
+};
 
-    /// M-1 — the opaque blob NAME (32 lowercase hex) of directory entry n: the
-    /// relay-visible filename the writer PUTs for session n, and the value the
-    /// rescue re-derives + matches to recover n_max. Secret-derived (report_master),
-    /// so the relay cannot enumerate it; replaces the old plain %010d index.
+/// The enumeration, one target at a time.
+interface RescuePlanner {
+    /// The next target to probe, null when the enumeration is over.
+    RescueTarget? next();
+
+    /// Outcome of probing the target next() returned last. Not on a 429.
+    void record(boolean found);
+
+    /// Directory names that matched no index (an anomaly to show).
+    u32 unmatched_entries();
+
+    /// Whether the long tail is probed (directory absent or closed).
+    boolean probes_long_tail();
+
+    /// Once next() returned null: whether the enumeration stopped on the probe
+    /// cap with the tail not exhausted. Reports past the cap were not looked
+    /// for; show the enumeration as incomplete.
+    boolean hit_probe_cap();
+};
+
+/// The verification of one listed report. Nothing it does not verify stays on
+/// disk.
+interface ReportCheck {
+    ReportScheme scheme();
+    u32? index();
+
+    /// Re-derived, never read from the relay. Not a name for local files.
+    string report_id_hex();
+
+    /// Name of a chained report's timestamp proof in the directory.
+    string? ots_name();
+
+    /// Listed objects to fetch, increasing name order (= increasing seq).
+    sequence<string> object_names();
+
+    boolean has_closure();
+
+    /// Fetch the manifest to `scratch_path`, check the closure, delete the
+    /// file. Must precede fetch_object on a chained report with a closure.
+    /// The first Valid or Invalid decision is final; a later call returns it.
     [Throws=FfiError]
-    string directory_entry_name_hex(u32 n);
+    ClosureState verify_closure([ByRef] string scratch_path);
+
+    /// Fetch one listed object (encrypted) to `out_path` and classify it; the
+    /// file is deleted unless the status is Verified or Unverifiable.
+    [Throws=FfiError]
+    ObjectStatus fetch_object([ByRef] string name, [ByRef] string out_path);
+
+    [Throws=FfiError]
+    ReportVerdict verdict();
 };
 
 /// Stateful batched Ed25519 ratchet. All methods take &self with internal
@@ -583,7 +926,7 @@ interface EphemeralRatchet {
 /// Blocking HTTP client for the Frappuccino V2 relay.
 /// All methods are thread-safe (internally cheap-cloning `Arc`).
 interface StreamServerClient {
-    /// Build a client against `base_url` (typically `"https://136.244.101.236:8443"`).
+    /// Build a client against `base_url` (typically `"https://relay.example.org:8443"`).
     /// TLS config embeds the pinned self-signed cert + SPKI SHA-256 gate.
     [Throws=FfiError, Name=new]
     constructor([ByRef] string base_url);
@@ -622,35 +965,25 @@ interface StreamServerClient {
     [Throws=FfiError]
     boolean rotate_batch([ByRef] string identity_pk_hex, RotationProof proof);
 
-    /// Phase C relay-blind rescue — GET /api/v2/archive/reports/{report_id}/blobs,
-    /// **identity-free** (no bearer; the phrase-derived report_id is the
-    /// capability). Returns null on 404 (no record at this report_id — a hole in
-    /// the enumeration), the blob list when the report exists. Throws on real
-    /// transport failures (5xx / TLS) so the caller retries, never treating a
-    /// transient error as a hole.
+    /// GET /api/v2/archive/reports/{report_id}/blobs, identity-free: the
+    /// report's objects and recorded closure (unverified). null on 404 (a hole
+    /// in the enumeration). Throws RateLimited on 429, Network on any other
+    /// failure (never mistaken for a hole).
     [Throws=FfiError]
-    sequence<ArchiveBlobInfo>? archive_list_blobs([ByRef] string report_id);
+    ArchiveListing? archive_list([ByRef] string report_id);
 
-    /// Phase 4.4.2 — combined GET blob + strm_decrypt to file (id-free, Phase
-    /// C). The encrypted blob never lands on disk — only the plaintext is
-    /// written, to `output_path`. Caller is responsible for secure-deleting
-    /// `output_path` after consumption (e.g. via `secure_delete_file`).
+    /// GET one stored object, as stored (encrypted), to `output_path`, never
+    /// into the JVM. Durable write, hashed while written; nothing left on
+    /// error. Fetch only: whether to keep it is a ReportCheck's decision.
     [Throws=FfiError]
-    ArchiveDownloadResult archive_download_and_decrypt(
-        [ByRef] string report_id,
-        [ByRef] string filename,
-        [ByRef] string output_path,
-        ArchiveIdentity archive
-    );
-
-    /// §10.11 (provenance durability) — GET a blob and write its RAW bytes to
-    /// `output_path` with NO STRM decryption (id-free, Phase C). Used for the
-    /// opt-in `.ots` timestamp proof (and any legacy sealed `.fpm`), unsealed /
-    /// verified offline by the recipient. Returns bytes written.
-    [Throws=FfiError]
-    u64 archive_download_raw(
+    ArchiveObjectResult archive_fetch_object(
         [ByRef] string report_id,
         [ByRef] string filename,
         [ByRef] string output_path
     );
+
+    // `archive_list_blobs`, `archive_download_and_decrypt` and
+    // `archive_download_raw` REMOVED: they downloaded (and decrypted) without
+    // verifying. The rescue now verifies before keeping (ReportCheck), then
+    // decrypts what it kept with strm_decrypt_to_file.
 };

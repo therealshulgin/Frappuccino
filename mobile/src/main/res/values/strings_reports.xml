@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Strings of the recording side of the reports: the recording notification,
+  the HUD and the in-app reports banner. In-app only: none of them is ever
+  shown through a system notification other than the recording's own.
+-->
+<resources>
+    <string name="stream_recording_finalizing">Finalising the recording…</string>
+    <string name="stream_previous_session_finalizing">The previous recording is still being finalised. Try again in a moment.</string>
+
+    <plurals name="stream_chunks_lost">
+        <item quantity="one">%d fragment lost</item>
+        <item quantity="other">%d fragments lost</item>
+    </plurals>
+
+    <plurals name="report_banner_lost">
+        <item quantity="one">%d fragment of a recording was lost — tap</item>
+        <item quantity="other">%d fragments of recordings were lost — tap</item>
+    </plurals>
+    <string name="report_banner_attention">Something happened to your recordings — tap</string>
+    <plurals name="report_banner_waiting">
+        <item quantity="one">%d item still on this phone — tap</item>
+        <item quantity="other">%d items still on this phone — tap</item>
+    </plurals>
+
+    <string name="report_dialog_title">Your recordings</string>
+    <plurals name="report_dialog_waiting">
+        <item quantity="one">%1$d item has not reached the server for more than a day (oldest from %2$s). It stays on this phone until it is sent: nothing is deleted for being old, but it is exposed if the phone is seized. Reconnect, or tap Retry.</item>
+        <item quantity="other">%1$d items have not reached the server for more than a day (oldest from %2$s). They stay on this phone until they are sent: nothing is deleted for being old, but they are exposed if the phone is seized. Reconnect, or tap Retry.</item>
+    </plurals>
+    <plurals name="report_dialog_failed_kept">
+        <item quantity="one">%d item was refused by the server for good. It is kept on this phone, will not be sent again, and goes with the emergency wipe.</item>
+        <item quantity="other">%d items were refused by the server for good. They are kept on this phone, will not be sent again, and go with the emergency wipe.</item>
+    </plurals>
+
+    <plurals name="report_alert_capture_lost">
+        <item quantity="one">%d fragment could not be secured during a recording: its video is lost.</item>
+        <item quantity="other">%d fragments could not be secured during recordings: their video is lost.</item>
+    </plurals>
+    <plurals name="report_alert_failed">
+        <item quantity="one">%d item was refused by the server, or could no longer be verified, and was set aside.</item>
+        <item quantity="other">%d items were refused by the server, or could no longer be verified, and were set aside.</item>
+    </plurals>
+    <plurals name="report_alert_directory_refused">
+        <item quantity="one">The server says your report directory is closed, and refused %d entry. This app never closes it: closing it takes a copy of this phone\'s data or your recovery phrase. The recordings themselves are still sent.</item>
+        <item quantity="other">The server says your report directory is closed, and refused %d entries. This app never closes it: closing it takes a copy of this phone\'s data or your recovery phrase. The recordings themselves are still sent.</item>
+    </plurals>
+    <plurals name="report_alert_closure_abandoned">
+        <item quantity="one">%d recording could not be closed: the server never received its beginning.</item>
+        <item quantity="other">%d recordings could not be closed: the server never received their beginning.</item>
+    </plurals>
+    <plurals name="report_alert_interrupted">
+        <item quantity="one">%d recording ended without its closing record. Each of its fragments can still be verified, but where the recording ended cannot be certified.</item>
+        <item quantity="other">%d recordings ended without their closing record. Each of their fragments can still be verified, but where they ended cannot be certified.</item>
+    </plurals>
+    <plurals name="report_alert_migration_lost">
+        <item quantity="one">%d pending fragment from before the update could not be converted and was deleted.</item>
+        <item quantity="other">%d pending fragments from before the update could not be converted and were deleted.</item>
+    </plurals>
+    <plurals name="report_alert_timestamps_cancelled">
+        <item quantity="one">%d timestamp request from before the update was cancelled. The video is not affected.</item>
+        <item quantity="other">%d timestamp requests from before the update were cancelled. The videos are not affected.</item>
+    </plurals>
+</resources>

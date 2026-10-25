@@ -18,32 +18,36 @@ import java.io.File
  *      lisible sans BIP-39 (audit Red Team 2026-05-18, R-H1 / R-E-1).
  *
  *   2. **MP4 orphelins dans `cacheDir/stream_chunks/`** : le `MediaMuxer`
- *      écrit le chunk EN CLAIR (`chunk-NNN.mp4`) sur disque, puis
- *      `StreamChunkEncryptor` le chiffre en `.strm` et le secure-delete. Deux
+ *      écrit le chunk EN CLAIR (`chunk-NNN.mp4`) sur disque, puis l'écrivain
+ *      du rapport le scelle en enveloppe de file, et le MP4 n'est effacé
+ *      qu'APRÈS ce scellement réussi (un MP4 dont le scellement a échoué est
+ *      réessayé, puis effacé et compté perdu s'il échoue encore). Deux
  *      familles d'orphelins, et la distinction compte :
  *        - **0-octet** : un swap qualité discard le preallocated next-chunk
  *          avant tout sample (fix in-bundle B-H3 à `stop()` ; ce cleaner
  *          couvre le legacy).
  *        - **non-vide** (F-01, cross-audit 2026-06-30) : un chunk finalisé
- *          dont le chiffrement a été interrompu par une mort ANORMALE du
+ *          dont le scellement a été interrompu par une mort ANORMALE du
  *          process (kill / OOM-kill / coupure batterie) ou un `panicWipe`
- *          survenu pendant le chiffrement. L'ancien cleaner ne purgeait que
+ *          survenu pendant le scellement. L'ancien cleaner ne purgeait que
  *          les 0-octet, donc ce MP4 en clair survivait sur device saisi.
- *      Ne pas compter sur le sweeper pour rattraper ça : `OrphanSweepWorker`
- *      (TTL 48 h) ne balaie que les `.strm` de la queue d'upload
- *      (`filesDir/stream_chunk_queue`), jamais ces `.mp4`.
+ *      Rien d'autre ne balaie ces `.mp4` : la file d'envoi ne contient que
+ *      des enveloppes chiffrées.
  *
  * `purgeOrphanChunks` secure-delete **tout** `.mp4` orphelin, quelle que soit
  * sa taille, via `secureDeleteFile` Rust (overwrite + fsync + truncate +
  * unlink) ; `purgeDebugRaw` utilise le même primitive. Honnêteté du contrôle :
  * sur FBE / Flash NAND, **FBE reste le contrôle at-rest porteur**, l'overwrite
- * est de la défense en profondeur, pas un effacement garanti. Deux des trois
- * moments d'appel tournent hors capture : service start (pré-bind) et
- * `onDestroy` (post-drain). Le `panicWipe`, lui, court DÉLIBÉRÉMENT contre la
- * capture vivante — device saisi, on jette tout, y compris le chunk en cours
- * de chiffrement. Hors panic, ce n'est donc pas le choix du moment qui protège
- * le chunk live, c'est le paramètre `exceptCurrentPaths` de
- * [purgeOrphanChunks]. (Mis en place en H2-B.11, 2026-05-18.)
+ * est de la défense en profondeur, pas un effacement garanti. Trois des quatre
+ * moments d'appel tournent hors capture : démarrage du processus
+ * ([detachForStartup], pour les MP4 qu'une mort du processus a laissés),
+ * service start (pré-bind) et fin de session (après la clôture du rapport,
+ * donc après le dernier scellement). Le
+ * `panicWipe`, lui, court DÉLIBÉRÉMENT contre la capture vivante — device
+ * saisi, on jette tout, y compris le chunk en cours de scellement. Hors panic,
+ * ce n'est donc pas le choix du moment qui protège le chunk live, c'est le
+ * paramètre `exceptCurrentPaths` de [purgeOrphanChunks]. (Mis en place en
+ * H2-B.11, 2026-05-18.)
  */
 object CaptureScratchCleaner {
 
@@ -126,10 +130,11 @@ object CaptureScratchCleaner {
      * `StreamMetrics` (F-06) plutôt qu'avalé silencieusement.
      *
      * L'appelant DOIT garantir qu'aucun recorder live n'écrit un fichier à
-     * préserver : passer son chemin dans [exceptCurrentPaths], ou n'appeler
-     * que hors capture (service start, pré-bind ; `onDestroy`, post-stop) ou
-     * quand le nuke complet est voulu (`panicWipe`). Retourne le nombre de
-     * fichiers supprimés.
+     * préserver et qu'aucun scellement n'attend un MP4 : passer son chemin
+     * dans [exceptCurrentPaths], ou n'appeler que hors capture (service start,
+     * pré-bind ; fin de session, après la clôture du rapport) ou quand le nuke
+     * complet est voulu (`panicWipe`). Retourne le nombre de fichiers
+     * supprimés.
      */
     fun purgeOrphanChunks(chunkDir: File, exceptCurrentPaths: Set<String> = emptySet()): Int {
         if (!chunkDir.exists() || !chunkDir.isDirectory) return 0
@@ -155,6 +160,10 @@ object CaptureScratchCleaner {
         return secure + fallback
     }
 
+    /** Nombre de `*.mp4` non vides de [chunkDir] : de la vidéo en clair. */
+    fun nonEmptyChunkCount(chunkDir: File): Int =
+        chunkDir.listFiles { _, name -> name.endsWith(".mp4") }?.count { it.length() > 0 } ?: 0
+
     /**
      * Path conventionnel du chunkDir (cacheDir/stream_chunks). Exposé
      * pour les callsites (panicWipe, teardown) qui n'ont pas de
@@ -163,7 +172,27 @@ object CaptureScratchCleaner {
      * rester cohérente.
      */
     fun defaultChunkDir(context: Context): File =
-        File(context.cacheDir, "stream_chunks")
+        File(context.cacheDir, CHUNK_DIR)
+
+    private const val CHUNK_DIR = "stream_chunks"
+
+    /**
+     * Au démarrage du processus : met hors de portée le scratch de capture
+     * qu'une mort du processus pendant un enregistrement a laissé (le morceau
+     * en cours, et ceux que l'écrivain n'avait pas encore scellés). Rien ne
+     * peut plus les sceller, la clé de l'écrivain est partie avec le
+     * processus ; ce sont des MP4 en clair. Renommage synchrone (rapide), à
+     * effacer ensuite hors du thread principal ; un effacement interrompu est
+     * repris par [org.stream.crypto.SecureDirWiper.finishLeftovers], ce
+     * répertoire faisant partie des noms qu'il connaît.
+     *
+     * À n'appeler qu'au démarrage du processus, avant tout composant : aucun
+     * enregistreur ne peut alors exister (l'app tourne dans un seul
+     * processus). Le prochain enregistrement recrée un répertoire neuf.
+     * Retourne le répertoire renommé, ou null s'il n'y en avait pas.
+     */
+    fun detachForStartup(cacheDir: File): File? =
+        org.stream.crypto.SecureDirWiper.detach(File(cacheDir, CHUNK_DIR))
 
     /**
      * Purge complète : miroirs plaintext debug + **tous** les MP4 orphelins
@@ -181,4 +210,12 @@ object CaptureScratchCleaner {
     fun purgeAll(context: Context) {
         purgeAll(context, defaultChunkDir(context))
     }
+
+    /**
+     * Every directory that may hold capture plaintext: the chunk scratch and
+     * the debug mirrors. The emergency wipe takes them out of reach first and
+     * overwrites them before anything else.
+     */
+    fun plaintextDirs(context: Context): List<File> =
+        listOf(defaultChunkDir(context)) + PLAINTEXT_DEBUG_DIRS.map { File(context.filesDir, it) }
 }

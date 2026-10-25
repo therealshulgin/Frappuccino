@@ -1,9 +1,11 @@
 package rs.readahead.washington.mobile.views.activity
 
+import android.content.ActivityNotFoundException
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.view.View
@@ -11,6 +13,9 @@ import android.view.WindowManager
 import android.widget.EditText
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
@@ -20,40 +25,66 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.stream.crypto.ArchiveIdentity
+import org.stream.crypto.SecureWipe
+import org.stream.crypto.StreamPreferences
 import org.stream.crypto.upload.ArchiveSession
-import org.stream.crypto.upload.DiscoveredReport
 import org.stream.crypto.upload.StreamUploadManager
 import rs.readahead.washington.mobile.R
+import rs.readahead.washington.mobile.archive.ArchiveLocalData
+import rs.readahead.washington.mobile.archive.ArchivePlayerActivity
+import rs.readahead.washington.mobile.archive.ArchivePurgeRules
+import rs.readahead.washington.mobile.archive.ArchiveWipeWatch
+import rs.readahead.washington.mobile.archive.FailureReason
+import rs.readahead.washington.mobile.archive.PendingExport
+import rs.readahead.washington.mobile.archive.RescueAnomalies
+import rs.readahead.washington.mobile.archive.RescueAnomaly
+import rs.readahead.washington.mobile.archive.RescueSession
 import rs.readahead.washington.mobile.service.ArchiveDownloadService
 import rs.readahead.washington.mobile.util.jobs.ArchiveAuthHolder
 import rs.readahead.washington.mobile.views.adapters.ArchiveReportsAdapter
+import rs.readahead.washington.mobile.views.adapters.ArchiveUnverifiableAdapter
 import timber.log.Timber
+import uniffi.frappuccino.FfiException
+import uniffi.frappuccino.ProvenanceSigner
 
 /**
- * ArchiveModeActivity — Mode archive V2, l'écran de récupération d'un
- * témoignage depuis la phrase de récupération. Accessible depuis
+ * ArchiveModeActivity — l'écran de secours : retrouver et vérifier son
+ * témoignage depuis la seule phrase de récupération. Accessible depuis
  * StreamSettingsActivity.
  *
- * Lifetime des secrets : par défaut l'activity wipe [ArchiveIdentity] +
- * [ArchiveSession] en [onDestroy]. Pendant un batch, [ArchiveDownloadService]
- * les emprunte et la règle « le dernier vivant wipe » arbitre
- * (cf. [ArchiveAuthHolder]) — d'où le test sur le service dans [onDestroy] :
- * un wipe inconditionnel zéroiserait les secrets sous les pieds d'un download
- * en cours. La phrase, elle, ne quitte jamais cette activity : pas de log, pas
- * de Bundle, pas de putExtra.
+ * Le flux :
+ * 1. Saisie de la phrase BIP-39 (12 mots). Elle est convertie en octets, sert
+ *    à dériver l'identité de déchiffrement, le signataire de provenance et le
+ *    contexte de secours ([ArchiveSession]), puis elle est effacée : elle ne
+ *    quitte jamais cette activité (pas de log, pas de Bundle, pas d'Intent).
+ * 2. RÉCUPÉRER lance la recherche des rapports par dérivation, dans
+ *    [ArchiveDownloadService] : l'annuaire, puis chaque index que le plan
+ *    désigne. Un 429 fait attendre au moins une minute puis rejoue la même
+ *    cible ; une recherche qui ne peut pas aller au bout s'affiche
+ *    INCOMPLÈTE, jamais comme une liste courte.
+ * 3. VÉRIFIER (par rapport ou TOUT VÉRIFIER) télécharge chaque objet chiffré
+ *    dans `noBackupFilesDir/archive_view/<jeton>/`, où Rust le classe ; ce qui
+ *    est exclu est effacé et compté. Chaque rapport affiche son statut, ses
+ *    compteurs et l'intervalle de dates du relais.
+ * 4. REGARDER ouvre le lecteur interne ; EXPORTER, après un avertissement,
+ *    écrit les seuls objets vérifiés dans un dossier choisi par le témoin.
+ *    Plus rien n'est écrit dans le dossier public Download.
+ * 5. Les objets legacy stockés avant que le relais garde les signatures ne
+ *    sont ni vérifiés ni exclus : ils sont gardés à part et listés dans la
+ *    section « non vérifiable », sous les rapports. On peut les y regarder
+ *    (bandeau permanent dans le lecteur) et les exporter, après un second
+ *    avertissement, dans un dossier distinct étiqueté `not-verified`. Ils ne
+ *    sont jamais mêlés au témoignage vérifié.
  *
- * Le flux : saisie de la phrase BIP-39 (12 mots), dérivation d'une
- * [ArchiveIdentity] temporaire en SecureMemory, affichage du fingerprint
- * dérivé pour comparaison avec l'identité locale, puis découverte des reports
- * par DÉRIVATION — il n'y a pas de listing : [ArchiveSession] sonde
- * report_id_0, report_id_1, … sans auth ni bearer, parce que le report_id
- * dérivé de la phrase est la capability. Un tap sur un report, ou le bouton
- * « TOUT TÉLÉCHARGER », délègue à [ArchiveDownloadService] : il télécharge et
- * déchiffre les blobs vers le dossier public de téléchargements
- * (`Frappuccino/<rid>/`, via MediaStore), écrit un `playlist.m3u` à côté, et
- * renvoie sa progression par broadcasts. Les reports terminés restent listés
- * et marqués. Cette activity n'est qu'un contrôleur : elle démarre le service,
- * observe, met à jour l'UI.
+ * Durée de vie des secrets et des copies : « le dernier vivant purge »
+ * (cf. [ArchiveAuthHolder], [ArchiveLocalData]). Une fermeture explicite
+ * (bouton ← ou retour) annule le lot en cours ; si plus aucun écran
+ * d'archive ni lot ne vit, cette activité efface les secrets et purge les
+ * copies, sinon le service le fait en fin de lot. Une destruction par le
+ * système (activité en arrière-plan) n'est pas une fermeture : le lot continue
+ * et la notification ramène à l'écran, qui se rattache à la session en RAM.
+ * L'effacement d'urgence, lui, ferme l'écran même en arrière-plan
+ * ([ArchiveWipeWatch]).
  */
 class ArchiveModeActivity : AppCompatActivity() {
 
@@ -64,76 +95,57 @@ class ArchiveModeActivity : AppCompatActivity() {
     private lateinit var closeBtn: TextView
     private lateinit var streamsInfoView: TextView
     private lateinit var retrieveBtn: TextView
-    private lateinit var downloadAllBtn: TextView
+    private lateinit var enumStatusView: TextView
+    private lateinit var anomaliesView: TextView
+    private lateinit var verifyAllBtn: TextView
     private lateinit var reportsList: RecyclerView
-    private lateinit var progressView: TextView
-    private lateinit var openFolderBtn: TextView
+    private lateinit var unverifiableSection: View
+    private lateinit var unverifiableList: RecyclerView
 
-    private var archiveIdentity: ArchiveIdentity? = null
-    // §10.11 Phase B — provenance signer derived from the SAME phrase, held to
-    // re-derive the per-recording OTS salt for the disclosure bundle. Wiped with
-    // the identity (onDestroy / ArchiveAuthHolder.clear).
-    private var archiveProvenanceSigner: uniffi.frappuccino.ProvenanceSigner? = null
-    // Phase C — cached bytes of the validated mnemonic, used at startRetrieve to
-    // derive the report keyring for relay-blind enumeration. Wiped right after
-    // the keyring is derived (and defensively in onDestroy).
-    private var cachedMnemonic: ByteArray? = null
-    private var archiveSession: ArchiveSession? = null
-    private var reportsAdapter: ArchiveReportsAdapter? = null
+    private lateinit var reportsAdapter: ArchiveReportsAdapter
+    private lateinit var unverifiableAdapter: ArchiveUnverifiableAdapter
 
-    /**
-     * Receives download progress/results from
-     * [ArchiveDownloadService] (registered in onResume, unregistered in
-     * onPause). Drives the progressView text + the adapter ✓ marks. The
-     * heavy lifting is in the service; this just paints the UI.
-     */
-    private val downloadReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            when (intent?.action) {
-                ArchiveDownloadService.ACTION_ARCHIVE_PROGRESS -> {
-                    val rId = intent.getStringExtra(ArchiveDownloadService.EXTRA_REPORT_ID) ?: ""
-                    val rIdx = intent.getIntExtra(ArchiveDownloadService.EXTRA_REPORT_INDEX, 0)
-                    val rTot = intent.getIntExtra(ArchiveDownloadService.EXTRA_REPORT_TOTAL, 0)
-                    val bName = intent.getStringExtra(ArchiveDownloadService.EXTRA_BLOB_NAME) ?: ""
-                    val bIdx = intent.getIntExtra(ArchiveDownloadService.EXTRA_BLOB_INDEX, 0)
-                    val bTot = intent.getIntExtra(ArchiveDownloadService.EXTRA_BLOB_TOTAL, 0)
-                    progressView.visibility = View.VISIBLE
-                    progressView.text = if (bTot > 0) {
-                        getString(R.string.archive_retrieving_blob, bName, bIdx, bTot)
+    /** The export waiting for the folder picker. Saved with the instance
+     *  state: the picker's answer may reach a recreated screen. */
+    private var pendingExport: PendingExport? = null
+
+    private var unlocking = false
+
+    private val pickExportFolder =
+        registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
+            val answer = PendingExport.answer(pendingExport, folderChosen = uri != null)
+            pendingExport = null
+            when (answer) {
+                is PendingExport.Answer.Start ->
+                    if (uri != null && ArchiveAuthHolder.isUnlocked()) {
+                        ArchiveDownloadService.startExport(this, answer.ordinal, uri, answer.unverifiable)
                     } else {
-                        getString(R.string.archive_download_all_progress, rIdx, rTot, rId.take(8))
+                        Toast.makeText(this, R.string.archive_export_lost, Toast.LENGTH_LONG).show()
                     }
-                }
-
-                ArchiveDownloadService.ACTION_ARCHIVE_REPORT_DONE -> {
-                    val rId = intent.getStringExtra(ArchiveDownloadService.EXTRA_REPORT_ID) ?: return
-                    reportsAdapter?.markDownloaded(rId)
-                }
-
-                ArchiveDownloadService.ACTION_ARCHIVE_BATCH_DONE -> {
-                    val count = intent.getIntExtra(ArchiveDownloadService.EXTRA_COUNT, 0)
-                    val dir = intent.getStringExtra(ArchiveDownloadService.EXTRA_PUBLIC_DIR) ?: ""
-                    progressView.visibility = View.VISIBLE
-                    progressView.text = getString(R.string.archive_download_all_done, count, dir)
-                    openFolderBtn.visibility = View.VISIBLE
-                    setDownloadInProgress(false)
-                }
-
-                ArchiveDownloadService.ACTION_ARCHIVE_ERROR -> {
-                    val rIdx = intent.getIntExtra(ArchiveDownloadService.EXTRA_REPORT_INDEX, 0)
-                    val rTot = intent.getIntExtra(ArchiveDownloadService.EXTRA_REPORT_TOTAL, 0)
-                    progressView.visibility = View.VISIBLE
-                    progressView.text = getString(R.string.archive_download_all_partial, rIdx, rTot)
-                    setDownloadInProgress(false)
-                }
+                PendingExport.Answer.Lost ->
+                    Toast.makeText(this, R.string.archive_export_lost, Toast.LENGTH_LONG).show()
+                PendingExport.Answer.Cancelled -> Unit
             }
+        }
+
+    private val rescueReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == ArchiveDownloadService.ACTION_RESCUE_CHANGED) render()
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
+        ArchiveWipeWatch.attach(this) { finish() }
         setContentView(R.layout.activity_archive_mode)
+        // Before the picker's answer, which arrives after onStart.
+        pendingExport = savedInstanceState?.let {
+            PendingExport.fromSaved(
+                it.getInt(PendingExport.KEY_ORDINAL, 0),
+                it.getBoolean(PendingExport.KEY_UNVERIFIABLE, false),
+            )
+        }
 
         mnemonicInput = findViewById(R.id.archiveMnemonicInput)
         statusView = findViewById(R.id.archiveStatus)
@@ -142,412 +154,419 @@ class ArchiveModeActivity : AppCompatActivity() {
         closeBtn = findViewById(R.id.archiveCloseBtn)
         streamsInfoView = findViewById(R.id.archiveStreamsInfo)
         retrieveBtn = findViewById(R.id.archiveRetrieveBtn)
-        downloadAllBtn = findViewById(R.id.archiveDownloadAllBtn)
+        enumStatusView = findViewById(R.id.archiveEnumStatus)
+        anomaliesView = findViewById(R.id.archiveAnomalies)
+        verifyAllBtn = findViewById(R.id.archiveVerifyAllBtn)
         reportsList = findViewById(R.id.archiveReportsList)
-        progressView = findViewById(R.id.archiveProgressText)
-        openFolderBtn = findViewById(R.id.archiveOpenFolderBtn)
+        unverifiableSection = findViewById(R.id.archiveUnverifiableSection)
+        unverifiableList = findViewById(R.id.archiveUnverifiableList)
 
+        reportsAdapter = ArchiveReportsAdapter(
+            onVerify = { ordinal -> startVerification(intArrayOf(ordinal)) },
+            onPlay = { ordinal -> openPlayer(ordinal) },
+            onExport = { ordinal -> confirmExport(ordinal) },
+        )
         reportsList.layoutManager = LinearLayoutManager(this)
-        reportsAdapter = ArchiveReportsAdapter(mutableListOf()) { report ->
-            // Single-report download. Phase 4.4.5 — the list stays visible ;
-            // the row is just marked ✓ when finished.
-            startSingleDownload(report)
-        }
         reportsList.adapter = reportsAdapter
+        unverifiableAdapter = ArchiveUnverifiableAdapter(
+            onPlay = { ordinal -> openPlayer(ordinal, unverifiable = true) },
+            onExport = { ordinal -> confirmExport(ordinal, unverifiable = true) },
+        )
+        unverifiableList.layoutManager = LinearLayoutManager(this)
+        unverifiableList.adapter = unverifiableAdapter
 
         unlockBtn.setOnClickListener { tryUnlock() }
-        closeBtn.setOnClickListener { finish() }
-        retrieveBtn.setOnClickListener { startRetrieve() }
-        downloadAllBtn.setOnClickListener { startDownloadAll() }
-        openFolderBtn.setOnClickListener { openRecoveryFolder() }
+        closeBtn.setOnClickListener { requestClose() }
+        retrieveBtn.setOnClickListener { startEnumeration() }
+        verifyAllBtn.setOnClickListener { verifyAll() }
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() = requestClose()
+        })
 
-        // Mark the activity alive so a running download
-        // service knows the activity still owns the final secret wipe.
-        ArchiveAuthHolder.setActivityAlive(true)
+        ArchiveAuthHolder.attachActivity()
+
+        // Back from the notification, or recreated by the system while a
+        // batch ran: the session is still in RAM, show it.
+        if (ArchiveAuthHolder.isUnlocked()) showUnlocked(ArchiveAuthHolder.getIdentity())
     }
+
+    // ---- unlock ----
 
     private fun tryUnlock() {
-        val phrase = mnemonicInput.text.toString().trim().lowercase()
-        val words = phrase.split(Regex("\\s+")).filter { it.isNotBlank() }
+        if (unlocking) return
+        // The EditText hands out a String: unavoidable. Everything after it
+        // works on bytes, wiped once the keys are derived.
+        val words = mnemonicInput.text.toString().trim().lowercase()
+            .split(Regex("\\s+")).filter { it.isNotBlank() }
         if (words.size != 12) {
-            statusView.text = "PHRASE INVALIDE : attendu 12 mots, recu ${words.size}"
-            statusView.setTextColor(resources.getColor(R.color.wa_orange, theme))
+            setStatus(getString(R.string.archive_phrase_wrong_count, words.size), warning = true)
             return
         }
-
-        statusView.text = "DERIVATION DE LA CLE..."
-        statusView.setTextColor(resources.getColor(R.color.wa_white, theme))
-
-        // Convertir immediatement en ByteArray UTF-8
-        // (jamais de CharArray intermediaire ni de String passee a FFI).
+        val serverUrl = StreamUploadManager.getInstance(this).getServerUrl()
+        if (serverUrl.isNullOrBlank()) {
+            setStatus(getString(R.string.archive_no_server), warning = true)
+            return
+        }
         val mnemonicBytes = words.joinToString(" ").toByteArray(Charsets.UTF_8)
-        try {
+        unlocking = true
+        setStatus(getString(R.string.archive_deriving), warning = false)
+
+        lifecycleScope.launch {
+            // Set from the derivation thread as soon as the keys exist, and
+            // cleared once the holder owns them: if this screen is destroyed
+            // meanwhile, the finally below wipes them instead of leaving them
+            // to the garbage collector.
+            var unowned: Unlock.Done? = null
             try {
-                uniffi.frappuccino.bip39ValidateFr(mnemonicBytes)
-            } catch (e: uniffi.frappuccino.FfiException.InvalidMnemonicWord) {
-                statusView.text = "Mot inconnu : '${e.word}'. Verifiez l'orthographe."
-                statusView.setTextColor(resources.getColor(R.color.wa_orange, theme))
-                return
-            } catch (e: uniffi.frappuccino.FfiException.InvalidMnemonic) {
-                statusView.text = "Phrase BIP-39 invalide : ${e.detail}"
-                statusView.setTextColor(resources.getColor(R.color.wa_orange, theme))
-                return
+                val result = withContext(Dispatchers.Default) {
+                    derive(mnemonicBytes, serverUrl).also { if (it is Unlock.Done) unowned = it }
+                }
+                unlocking = false
+                when (result) {
+                    is Unlock.Done -> {
+                        ArchiveAuthHolder.set(result.identity, result.session, result.signer)
+                        unowned = null
+                        // Cleared on success only: a mistyped phrase stays to be corrected.
+                        mnemonicInput.setText("")
+                        hideKeyboard()
+                        showUnlocked(result.identity)
+                    }
+                    is Unlock.Failed -> setStatus(getString(result.message), warning = true)
+                }
+            } finally {
+                unowned?.wipe()
             }
+        }
+    }
 
-            val manager = StreamUploadManager.getInstance(this)
-            val archive = manager.createArchiveIdentity(mnemonicBytes)
-            archiveIdentity = archive
-
-            // §10.11 Phase B — derive the provenance signer from the SAME phrase
-            // (empty passphrase, as at enrollment) so the rescue can re-derive the
-            // per-recording OTS salt to export into the disclosure bundle. Held +
-            // wiped exactly like the identity; best-effort (provenance is opt-in,
-            // a derivation failure must never break the archive unlock).
-            archiveProvenanceSigner = try {
-                uniffi.frappuccino.ProvenanceSigner.fromMnemonic(mnemonicBytes, byteArrayOf())
+    /** Derive the rescue's keys from the phrase, then wipe the phrase. */
+    private fun derive(mnemonicBytes: ByteArray, serverUrl: String): Unlock {
+        try {
+            uniffi.frappuccino.bip39ValidateFr(mnemonicBytes)
+            val identity = ArchiveIdentity.fromMnemonic(mnemonicBytes)
+            val session = try {
+                ArchiveSession.open(serverUrl, mnemonicBytes)
             } catch (e: Exception) {
-                Timber.w(e, "tryUnlock: provenance signer derivation failed (OTS salt export disabled)")
+                identity.close()
+                throw e
+            }
+            // Best effort: the timestamp check needs it, the rescue itself
+            // does not.
+            val signer = try {
+                ProvenanceSigner.fromMnemonic(mnemonicBytes, byteArrayOf())
+            } catch (e: Exception) {
+                Timber.w(e, "ArchiveModeActivity: provenance signer not derived")
                 null
             }
-
-            // Phase 4.4.2 — cache a COPY of the mnemonic for the auth flow.
-            cachedMnemonic = mnemonicBytes.copyOf()
-
-            mnemonicInput.setText("")
-            // Phase 4.4.2 fix (2026-05-20) : dismiss the IME after a
-            // successful unlock (otherwise the soft keyboard hides the list).
-            try {
-                val imm = getSystemService(android.content.Context.INPUT_METHOD_SERVICE)
-                    as? android.view.inputmethod.InputMethodManager
-                imm?.hideSoftInputFromWindow(mnemonicInput.windowToken, 0)
-                mnemonicInput.clearFocus()
-            } catch (e: Exception) {
-                Timber.w(e, "tryUnlock: hide IME failed (cosmetic)")
-            }
-
-            statusView.text = "ARCHIVE DEVERROUILLEE"
-            statusView.setTextColor(resources.getColor(R.color.wa_white, theme))
-            fingerprintView.text = archive.readableFingerprint()
-            fingerprintView.visibility = View.VISIBLE
-            streamsInfoView.visibility = View.VISIBLE
-            retrieveBtn.visibility = View.VISIBLE
-
-            val localIdentity = org.stream.crypto.StreamPreferences.getIdentity(this)
-            if (localIdentity != null) {
-                val matches = localIdentity.ed25519PublicKey.contentEquals(archive.ed25519PublicKey)
-                streamsInfoView.text = if (matches) {
-                    "OK Phrase correspond a l'identite de ce device.\n\nTape sur RECUPERER pour fetch les streams uploades."
-                } else {
-                    "ATTENTION Phrase DIFFERENTE de l'identite locale.\nTu vas dechiffrer les streams d'une AUTRE identite."
-                }
-            } else {
-                streamsInfoView.text = "Pas d'identite locale — archive seule.\n\nTape sur RECUPERER pour fetch les streams uploades."
-            }
-
-            unlockBtn.visibility = View.GONE
+            return Unlock.Done(identity, session, signer)
+        } catch (e: FfiException.InvalidMnemonicWord) {
+            return Unlock.Failed(R.string.archive_unknown_word)
+        } catch (e: FfiException.InvalidMnemonic) {
+            return Unlock.Failed(R.string.archive_invalid_phrase)
         } catch (e: Exception) {
-            Timber.e(e, "Archive derivation failed")
-            statusView.text = "ERREUR : ${e.message}"
-            statusView.setTextColor(resources.getColor(R.color.wa_orange, theme))
+            Timber.e(e, "ArchiveModeActivity: key derivation failed")
+            return Unlock.Failed(R.string.archive_unlock_failed)
         } finally {
-            // SecureWipe au lieu de fill (resiste JIT).
-            org.stream.crypto.SecureWipe.wipe(mnemonicBytes)
+            SecureWipe.wipe(mnemonicBytes)
         }
     }
 
-    /**
-     * Orchestrates the relay-blind retrieval flow : derive a report keyring
-     * from the phrase, then enumerate the witness's own reports by DERIVATION
-     * — [ArchiveSession] probes report_id_0, report_id_1, …, with no auth call
-     * and no listing endpoint, the phrase-derived report_id being the
-     * capability. The reports are then displayed in the RecyclerView, ready
-     * for tap-to-download and/or "TOUT TÉLÉCHARGER" bulk action.
-     *
-     * Stays on lifecycleScope/Dispatchers.IO : this is a short operation
-     * (derivation + enumeration), screen-off during it is not a concern. The
-     * long part (the actual download) runs in [ArchiveDownloadService].
-     */
-    private fun startRetrieve() {
-        archiveIdentity ?: run {
-            Timber.w("startRetrieve: no archiveIdentity")
-            return
-        }
-        val mnemonic = cachedMnemonic ?: run {
-            Timber.w("startRetrieve: no cached mnemonic — re-unlock needed")
-            statusView.text = "Phrase perdue, ressaisis-la."
-            return
-        }
-        val manager = StreamUploadManager.getInstance(this)
-        val serverUrl = manager.getServerUrl() ?: run {
-            statusView.text = "Pas d'URL serveur configuree dans Settings."
-            return
-        }
-
-        retrieveBtn.visibility = View.GONE
-        statusView.text = getString(R.string.archive_retrieving_reports)
-
-        lifecycleScope.launch(Dispatchers.IO) {
-            // Phase C relay-blind — id-free session. No auth, no bearer: the
-            // phrase-derived report_id is the capability. The witness discovers
-            // its own reports by DERIVATION (not "list what I own"): derive the
-            // report keyring from the phrase and enumerate report_id_0.. .
-            val session = ArchiveSession(serverUrl)
-            archiveSession = session
-
-            val keyring = try {
-                uniffi.frappuccino.ReportKeyring.fromMnemonic(mnemonic, byteArrayOf())
-            } catch (e: Exception) {
-                Timber.e(e, "startRetrieve: report keyring derivation threw")
-                withContext(Dispatchers.Main) {
-                    statusView.text = "Erreur derivation cle : ${e.message}"
-                    retrieveBtn.visibility = View.VISIBLE
-                }
-                return@launch
-            } finally {
-                // The keyring (and the already-derived identity + provenance
-                // signer) is all we need from the phrase — wipe the activity-side
-                // copy now. SecureWipe = volatile overwrite (resists JIT).
-                org.stream.crypto.SecureWipe.wipe(mnemonic)
-                cachedMnemonic = null
-            }
-
-            val reports = try {
-                session.enumerate(keyring)
-            } catch (e: Exception) {
-                // A persistent transport failure aborts enumeration rather than
-                // truncating it (a relay outage must never read as "no reports").
-                Timber.e(e, "startRetrieve: enumerate threw")
-                withContext(Dispatchers.Main) {
-                    statusView.text = "Erreur reseau enumeration : ${e.message}"
-                    retrieveBtn.visibility = View.VISIBLE
-                }
-                return@launch
-            } finally {
-                // The report_ids are captured (Strings); the keyring secret is
-                // no longer needed for the download phase (id-free by report_id).
+    private sealed class Unlock {
+        class Done(val identity: ArchiveIdentity, val session: ArchiveSession, val signer: ProvenanceSigner?) : Unlock() {
+            fun wipe() {
+                session.close()
+                identity.close()
                 try {
-                    keyring.destroy()
-                } catch (e: Exception) {
-                    Timber.w(e, "startRetrieve: keyring.destroy() threw (best-effort)")
+                    signer?.destroy()
+                } catch (_: Exception) {
                 }
             }
+        }
 
-            withContext(Dispatchers.Main) {
-                if (reports.isEmpty()) {
-                    statusView.text = getString(R.string.archive_no_reports)
-                    retrieveBtn.visibility = View.VISIBLE
-                    return@withContext
-                }
-                statusView.text =
-                    "${reports.size} report(s) trouve(s) — tape pour telecharger"
-                streamsInfoView.visibility = View.GONE
-                reportsAdapter?.submit(reports)
-                reportsList.visibility = View.VISIBLE
-                // Expose the bulk DOWNLOAD ALL button as soon
-                // as we have something to download.
-                downloadAllBtn.visibility = View.VISIBLE
-            }
+        class Failed(val message: Int) : Unlock()
+    }
+
+    private fun showUnlocked(identity: ArchiveIdentity?) {
+        mnemonicInput.visibility = View.GONE
+        unlockBtn.visibility = View.GONE
+        setStatus(getString(R.string.archive_unlocked), warning = false)
+        if (identity != null) {
+            fingerprintView.text = identity.readableFingerprint()
+            fingerprintView.visibility = View.VISIBLE
+            val local = StreamPreferences.getIdentity(this)
+            streamsInfoView.text = getString(
+                when {
+                    local == null -> R.string.archive_identity_none
+                    local.ed25519PublicKey.contentEquals(identity.ed25519PublicKey) -> R.string.archive_identity_matches
+                    else -> R.string.archive_identity_differs
+                },
+            )
+            streamsInfoView.visibility = View.VISIBLE
+        }
+        render()
+    }
+
+    private fun hideKeyboard() {
+        try {
+            val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? android.view.inputmethod.InputMethodManager
+            imm?.hideSoftInputFromWindow(mnemonicInput.windowToken, 0)
+            mnemonicInput.clearFocus()
+        } catch (e: Exception) {
+            Timber.w(e, "ArchiveModeActivity: hide IME failed (cosmetic)")
         }
     }
 
-    /**
-     * Visual guard for "a download is running" : the orange
-     * "TOUT TÉLÉCHARGER" button is disabled + faded while a batch runs.
-     * Driven on at [startDownloadService], off by the BATCH_DONE / ERROR
-     * broadcasts (and onResume re-attach).
-     */
-    private fun setDownloadInProgress(active: Boolean) {
-        downloadAllBtn.isEnabled = !active
-        downloadAllBtn.alpha = if (active) 0.4f else 1f
+    private fun setStatus(text: String, warning: Boolean) {
+        statusView.text = text
+        statusView.setTextColor(ContextCompat.getColor(this, if (warning) R.color.wa_orange else R.color.wa_white))
+    }
+
+    // ---- batches ----
+
+    private fun busy(): Boolean {
+        if (ArchiveDownloadService.isRunning) {
+            Toast.makeText(this, R.string.archive_busy, Toast.LENGTH_SHORT).show()
+            return true
+        }
+        return false
+    }
+
+    private fun startEnumeration() {
+        if (!ArchiveAuthHolder.isUnlocked() || busy()) return
+        RescueSession.markEnumerationStarting()
+        ArchiveDownloadService.startEnumeration(this)
+        render()
+    }
+
+    private fun startVerification(ordinals: IntArray) {
+        if (ordinals.isEmpty() || !ArchiveAuthHolder.isUnlocked() || busy()) return
+        ArchiveDownloadService.startVerification(this, ordinals)
+    }
+
+    private fun verifyAll() {
+        val pending = RescueSession.snapshot().entries
+            .filter { it.state != RescueSession.EntryState.VERIFIED }
+            .map { it.ordinal }
+        startVerification(pending.toIntArray())
+    }
+
+    /** [unverifiable]: play the chunks kept apart as not verifiable, from
+     *  their own section, instead of the verified ones. */
+    private fun openPlayer(ordinal: Int, unverifiable: Boolean = false) {
+        val entry = RescueSession.snapshot().entries.firstOrNull { it.ordinal == ordinal } ?: return
+        val token = entry.token
+        val chunks = if (unverifiable) entry.unverifiableChunks else entry.playableChunks
+        if (token == null || chunks == 0) {
+            Toast.makeText(
+                this,
+                if (unverifiable) R.string.archive_play_none_unverifiable else R.string.archive_play_none,
+                Toast.LENGTH_SHORT,
+            ).show()
+            return
+        }
+        startActivity(ArchivePlayerActivity.intent(this, token, unverifiable))
     }
 
     /**
-     * Confirmation dialog before re-downloading a
-     * report that's already saved. Prevents a finger-slip from kicking off
-     * a heavy re-download. Calls [onConfirm] only on the positive button.
+     * Export: an explicit warning first (the copy leaves the app's
+     * protection and the emergency wipe), then the system folder picker. A
+     * phone without one says so instead of failing silently. The export of
+     * the objects kept apart as not verifiable ([unverifiable]) has its own
+     * warning, which adds that nothing proves they are the witness's.
      */
-    private fun confirmRedownload(
-        onConfirm: () -> Unit,
-    ) {
-        androidx.appcompat.app.AlertDialog.Builder(this, R.style.AlertDialogDarkTheme)
-            .setTitle(R.string.archive_redownload_title)
-            .setMessage(R.string.archive_redownload_message)
-            .setPositiveButton(R.string.archive_redownload_confirm) { _, _ -> onConfirm() }
-            .setNegativeButton(R.string.archive_redownload_cancel, null)
+    private fun confirmExport(ordinal: Int, unverifiable: Boolean = false) {
+        if (busy()) return
+        AlertDialog.Builder(this, R.style.AlertDialogDarkTheme)
+            .setTitle(
+                if (unverifiable) R.string.archive_unverifiable_export_warning_title
+                else R.string.archive_export_warning_title,
+            )
+            .setMessage(
+                if (unverifiable) R.string.archive_unverifiable_export_warning_message
+                else R.string.archive_export_warning_message,
+            )
+            .setPositiveButton(R.string.archive_export_confirm) { _, _ ->
+                pendingExport = PendingExport(ordinal, unverifiable)
+                try {
+                    pickExportFolder.launch(null)
+                } catch (e: ActivityNotFoundException) {
+                    pendingExport = null
+                    Toast.makeText(this, R.string.archive_export_no_picker, Toast.LENGTH_LONG).show()
+                }
+            }
+            .setNegativeButton(R.string.archive_cancel, null)
             .show()
     }
 
-    /**
-     * Single-report download (tap on a row). Routes
-     * through [ArchiveDownloadService] like the bulk path (same screen-off
-     * resilience). Busy guard + re-download confirm are unchanged.
-     */
-    private fun startSingleDownload(report: DiscoveredReport) {
-        if (ArchiveDownloadService.isRunning) {
-            Toast.makeText(this, R.string.archive_busy, Toast.LENGTH_SHORT).show()
-            return
-        }
-        if (reportsAdapter?.isDownloaded(report.reportId) == true) {
-            confirmRedownload {
-                startDownloadService(listOf(report.reportId), clearFirst = true)
-            }
-            return
-        }
-        startDownloadService(listOf(report.reportId), clearFirst = false)
-    }
+    // ---- rendering ----
 
-    /**
-     * Bulk "TOUT TÉLÉCHARGER". Hands the adapter's
-     * pending reports (not yet ✓ this session) to [ArchiveDownloadService],
-     * which downloads them sequentially and survives screen-off. Resumable :
-     * re-tapping only retries the remaining ones.
-     */
-    private fun startDownloadAll() {
-        if (ArchiveDownloadService.isRunning) {
-            Toast.makeText(this, R.string.archive_busy, Toast.LENGTH_SHORT).show()
+    private fun render() {
+        if (!ArchiveAuthHolder.isUnlocked()) {
+            retrieveBtn.visibility = View.GONE
+            enumStatusView.visibility = View.GONE
+            anomaliesView.visibility = View.GONE
+            verifyAllBtn.visibility = View.GONE
+            reportsList.visibility = View.GONE
+            unverifiableSection.visibility = View.GONE
             return
         }
-        val pending = reportsAdapter?.pendingReports() ?: emptyList()
-        if (pending.isEmpty()) {
-            progressView.visibility = View.VISIBLE
-            progressView.text = "Tous les reports sont déjà téléchargés ✓"
-            return
-        }
-        startDownloadService(pending.map { it.reportId }, clearFirst = false)
-    }
+        val snapshot = RescueSession.snapshot()
+        val enumeration = snapshot.enumeration
+        val running = ArchiveDownloadService.isRunning
 
-    /**
-     * Hand the unlocked identity + archive session (relay-blind:
-     * no identity, no bearer) to [ArchiveDownloadService] via
-     * [ArchiveAuthHolder] (RAM, NEVER through the Intent — only the public
-     * report ids travel in the Intent) and start the foreground service.
-     */
-    private fun startDownloadService(pendingIds: List<String>, clearFirst: Boolean) {
-        val id = archiveIdentity
-        val session = archiveSession
-        if (id == null || session == null) {
-            Toast.makeText(this, R.string.archive_auth_refused, Toast.LENGTH_SHORT).show()
-            return
+        retrieveBtn.setText(
+            if (enumeration.state == RescueSession.EnumerationState.NOT_STARTED) R.string.archive_retrieve_btn
+            else R.string.archive_retry_btn,
+        )
+        retrieveBtn.visibility = when (enumeration.state) {
+            RescueSession.EnumerationState.NOT_STARTED,
+            RescueSession.EnumerationState.INCOMPLETE,
+            RescueSession.EnumerationState.CANCELLED,
+            -> if (running) View.GONE else View.VISIBLE
+            else -> View.GONE
         }
-        ArchiveAuthHolder.set(id, session, archiveProvenanceSigner)
-        setDownloadInProgress(true)
-        progressView.visibility = View.VISIBLE
-        val intent = Intent(this, ArchiveDownloadService::class.java).apply {
-            putStringArrayListExtra(
-                ArchiveDownloadService.EXTRA_PENDING_IDS, ArrayList(pendingIds)
-            )
-            putExtra(ArchiveDownloadService.EXTRA_CLEAR_FIRST, clearFirst)
-        }
-        ContextCompat.startForegroundService(this, intent)
-    }
 
-    /**
-     * Phase 4.4.2 fix — open the public Downloads folder via an
-     * `ACTION_VIEW_DOWNLOADS` intent. Falls back to a toast carrying a
-     * hardcoded folder hint if the intent isn't resolved; that hint is not
-     * the relative path actually used at write time
-     * (`Environment.DIRECTORY_DOWNLOADS` + `/Frappuccino/<report_id>`).
-     */
-    private fun openRecoveryFolder() {
-        val hint = "Downloads/Frappuccino/"
-        try {
-            val intent = Intent(android.app.DownloadManager.ACTION_VIEW_DOWNLOADS).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-            startActivity(intent)
-        } catch (e: Exception) {
-            Timber.w(e, "openRecoveryFolder: DownloadManager intent failed, fallback toast")
-            Toast.makeText(
+        val enumText = enumerationText(enumeration)
+        enumStatusView.text = enumText
+        enumStatusView.visibility = if (enumText.isEmpty()) View.GONE else View.VISIBLE
+        enumStatusView.setTextColor(
+            ContextCompat.getColor(
                 this,
-                "Fichiers récupérés dans : $hint",
-                Toast.LENGTH_LONG
-            ).show()
+                if (enumeration.state == RescueSession.EnumerationState.INCOMPLETE) R.color.wa_orange else R.color.wa_white,
+            ),
+        )
+
+        val anomalies = anomaliesText(enumeration)
+        anomaliesView.text = anomalies
+        anomaliesView.visibility = if (anomalies.isEmpty()) View.GONE else View.VISIBLE
+
+        reportsAdapter.submit(snapshot.entries)
+        reportsList.visibility = if (snapshot.entries.isEmpty()) View.GONE else View.VISIBLE
+        val unverified = snapshot.entries.any { it.state != RescueSession.EntryState.VERIFIED }
+        verifyAllBtn.visibility = if (unverified && !running) View.VISIBLE else View.GONE
+
+        unverifiableAdapter.submit(snapshot.entries)
+        unverifiableSection.visibility =
+            if (ArchiveUnverifiableAdapter.rows(snapshot.entries).isEmpty()) View.GONE else View.VISIBLE
+    }
+
+    private fun enumerationText(e: RescueSession.EnumerationView): String {
+        val found = resources.getQuantityString(R.plurals.archive_reports_found, e.found, e.found)
+        // A 429 being waited out, during the search or a verification: say
+        // why nothing moves for a minute.
+        val waitMs = e.rateLimitedUntil - System.currentTimeMillis()
+        if (waitMs > 0 && ArchiveDownloadService.isRunning) {
+            return getString(R.string.archive_enum_rate_limited, ((waitMs + 999) / 1000).toInt())
+        }
+        return when (e.state) {
+            RescueSession.EnumerationState.NOT_STARTED -> ""
+            RescueSession.EnumerationState.RUNNING -> getString(
+                R.string.archive_enum_running,
+                resources.getQuantityString(R.plurals.archive_enum_probed, e.probed, e.probed),
+                found,
+            )
+            RescueSession.EnumerationState.COMPLETE ->
+                if (e.found == 0) getString(R.string.archive_enum_none) else getString(R.string.archive_enum_complete, found)
+            // Cut at the planner's probe cap: searching again stops at the
+            // same cap, so the line must not suggest that it would help.
+            RescueSession.EnumerationState.INCOMPLETE ->
+                if (e.failure == FailureReason.PROBE_CAP) {
+                    getString(R.string.archive_enum_capped, found)
+                } else {
+                    getString(
+                        R.string.archive_enum_incomplete,
+                        ArchiveReportsAdapter.reasonText(this, e.failure),
+                        found,
+                    )
+                }
+            RescueSession.EnumerationState.CANCELLED -> getString(R.string.archive_enum_cancelled)
+        }
+    }
+
+    /** The anomalies of [e], chosen by [RescueAnomalies]; only the wording is
+     *  decided here. */
+    private fun anomaliesText(e: RescueSession.EnumerationView): String =
+        RescueAnomalies.of(e).joinToString("\n") { anomaly ->
+            when (anomaly) {
+                RescueAnomaly.DirectoryClosed -> getString(R.string.archive_anomaly_directory_closed)
+                RescueAnomaly.DirectoryClosureInvalid -> getString(R.string.archive_anomaly_directory_closure_invalid)
+                RescueAnomaly.DirectoryClosureUnchecked -> getString(R.string.archive_anomaly_directory_closure_unchecked)
+                RescueAnomaly.DirectoryAbsent -> getString(R.string.archive_anomaly_directory_absent)
+                RescueAnomaly.DirectoryUnreadable -> getString(R.string.archive_anomaly_directory_unreadable)
+                is RescueAnomaly.Unmatched ->
+                    resources.getQuantityString(R.plurals.archive_anomaly_unmatched, anomaly.count, anomaly.count)
+                is RescueAnomaly.UnreadableListings ->
+                    resources.getQuantityString(R.plurals.archive_anomaly_unreadable_listings, anomaly.count, anomaly.count)
+            }
+        }
+
+    // ---- lifecycle ----
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        // A position and a flag, nothing secret (see PendingExport).
+        pendingExport?.let {
+            outState.putInt(PendingExport.KEY_ORDINAL, it.ordinal)
+            outState.putBoolean(PendingExport.KEY_UNVERIFIABLE, it.unverifiable)
         }
     }
 
     override fun onResume() {
         super.onResume()
-        // Re-assert ownership (covers an activity recreate that raced a
-        // running service's teardown).
-        ArchiveAuthHolder.setActivityAlive(true)
-
-        val filter = IntentFilter().apply {
-            addAction(ArchiveDownloadService.ACTION_ARCHIVE_PROGRESS)
-            addAction(ArchiveDownloadService.ACTION_ARCHIVE_REPORT_DONE)
-            addAction(ArchiveDownloadService.ACTION_ARCHIVE_BATCH_DONE)
-            addAction(ArchiveDownloadService.ACTION_ARCHIVE_ERROR)
-        }
+        // Only the repaint signal: the emergency wipe is watched for the
+        // screen's whole life, not only while it is shown (ArchiveWipeWatch).
+        val filter = IntentFilter(ArchiveDownloadService.ACTION_RESCUE_CHANGED)
         // androidx.core in this project predates ContextCompat.registerReceiver
         // (added 1.9.0), so branch on the API level directly. The broadcasts
         // are package-local (setPackage), so the NOT_EXPORTED flag is only a
         // belt on API 33+ where it exists.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(downloadReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            registerReceiver(rescueReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
             @Suppress("UnspecifiedRegisterReceiverFlag")
-            registerReceiver(downloadReceiver, filter)
+            registerReceiver(rescueReceiver, filter)
         }
-
-        // Re-attach : broadcasts may have been missed while paused / the
-        // activity was stopped. Restore the ✓ marks + progress from the
-        // service's static mirrors.
-        val doneIds = ArchiveDownloadService.doneReportIds.toList()
-        doneIds.forEach { reportsAdapter?.markDownloaded(it) }
-        if (ArchiveDownloadService.isRunning) {
-            setDownloadInProgress(true)
-            val idx = ArchiveDownloadService.lastReportIndex
-            val tot = ArchiveDownloadService.lastReportTotal
-            if (tot > 0) {
-                progressView.visibility = View.VISIBLE
-                progressView.text =
-                    getString(R.string.archive_download_all_progress, idx, tot, "")
-            }
-        } else {
-            setDownloadInProgress(false)
-            if (doneIds.isNotEmpty()) openFolderBtn.visibility = View.VISIBLE
-        }
+        // Changes made while paused were not received: catch up.
+        if (ArchiveAuthHolder.isUnlocked()) render() else if (unlockBtn.visibility == View.GONE) finish()
     }
 
     override fun onPause() {
         try {
-            unregisterReceiver(downloadReceiver)
+            unregisterReceiver(rescueReceiver)
         } catch (_: Exception) {
         }
         super.onPause()
     }
 
-    override fun onDestroy() {
-        // The activity is no longer the unconditional owner
-        // of the archive secrets. If a download service is running, it
-        // borrows identity+session via ArchiveAuthHolder and wipes them
-        // when it stops (activityAlive=false tells it to). If no service is
-        // running, we wipe here as before. close() is idempotent → any
-        // race between the two paths is a harmless no-op.
-        ArchiveAuthHolder.setActivityAlive(false)
+    /** Explicit close: confirm if work is running (it will be cancelled). */
+    private fun requestClose() {
         if (!ArchiveDownloadService.isRunning) {
-            // Wipes the holder copy (same refs) AND the activity refs.
-            ArchiveAuthHolder.clear()
-            try {
-                archiveSession?.close()
-            } catch (_: Exception) {
-            }
-            archiveIdentity?.close()
-            // §10.11 Phase B — wipe the provenance signer's seed (mlock'd). The
-            // holder.clear() above already destroyed the shared ref; destroy() is
-            // idempotent, so this is a no-op if it ran, and a safety net otherwise.
-            try {
-                archiveProvenanceSigner?.destroy()
-            } catch (_: Exception) {
-            }
+            finish()
+            return
         }
-        archiveSession = null
-        archiveIdentity = null
-        archiveProvenanceSigner = null
+        AlertDialog.Builder(this, R.style.AlertDialogDarkTheme)
+            .setTitle(R.string.archive_close_confirm_title)
+            .setMessage(R.string.archive_close_confirm_message)
+            .setPositiveButton(R.string.archive_close_confirm_yes) { _, _ -> finish() }
+            .setNegativeButton(R.string.archive_cancel, null)
+            .show()
+    }
 
-        // Defensive wipe of any leftover mnemonic.
-        cachedMnemonic?.let { org.stream.crypto.SecureWipe.wipe(it) }
-        cachedMnemonic = null
-
+    override fun onDestroy() {
+        // An explicit close (finish) ends the rescue: cancel the batch and stop
+        // the service, whose teardown then purges at once (no screen is left)
+        // instead of after the call in flight. A destruction by the system is
+        // not a close, and the batch goes on. Nor is a recreation for a
+        // configuration change: the new instance attaches right after this
+        // one detaches, so this one must not purge on its way out.
+        val stillAttached = ArchiveAuthHolder.detachActivity()
+        if (isFinishing) ArchiveDownloadService.stop(this)
+        if (!isChangingConfigurations &&
+            ArchivePurgeRules.shouldPurge(stillAttached, ArchiveDownloadService.isRunning)
+        ) {
+            ArchiveAuthHolder.clear()
+            ArchiveLocalData.purgeAll(this)
+        }
         super.onDestroy()
     }
 }

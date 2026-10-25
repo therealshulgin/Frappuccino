@@ -30,7 +30,8 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import org.stream.crypto.StreamPreferences
 import org.stream.crypto.capture.ShakeDetector
-import org.stream.crypto.upload.ChunkUploadQueue
+import org.stream.crypto.upload.EnvelopeQueue
+import org.stream.crypto.upload.ReportAlerts
 import org.stream.crypto.upload.StreamUploadManager
 import rs.readahead.washington.mobile.R
 import rs.readahead.washington.mobile.service.StreamRecordingService
@@ -65,9 +66,9 @@ class StreamActivity : AppCompatActivity() {
     // Bandeau orange "ENRÔLEMENT EN ATTENTE" visible
     // uniquement en idle quand StreamPreferences.hasPendingEnrollment().
     private lateinit var enrollmentBanner: TextView
-    // Bandeau orphelins : fragments en attente d'envoi depuis
-    // trop longtemps (risque de purge 48h) ou déjà supprimés faute de réseau.
-    // In-app only (choix threat-model : pas de notif système).
+    // Bandeau des rapports : fragments perdus, objets refusés, alertes, ou
+    // objets encore sur le téléphone depuis plus d'un jour. In-app only
+    // (choix threat-model : pas de notif système).
     private lateinit var orphanBanner: TextView
 
     // Toggle button (one for start + stop)
@@ -88,12 +89,6 @@ class StreamActivity : AppCompatActivity() {
     private lateinit var stealthOverlay: View
 
     private var isRecording = false
-    // 2026-05-09 — flag set pendant la fin de session pour bloquer les
-    // double-tap REC qui crashent le process. Phase 2.1.5 flush bloque
-    // onDestroy jusqu'à ~5s ; tant que ce délai n'est pas écoulé, un
-    // nouveau startForegroundService déclenche
-    // ForegroundServiceDidNotStartInTimeException côté Android 12+.
-    private var isStopping = false
     // Debounce simple anti-double-click sur le bouton REC.
     private var lastRecClickTime = 0L
     private var recordingStartTime = 0L
@@ -106,21 +101,8 @@ class StreamActivity : AppCompatActivity() {
         override fun onReceive(context: Context?, intent: Intent?) {
             val uploaded = intent?.getIntExtra(StreamRecordingService.EXTRA_CHUNKS_UPLOADED, 0) ?: 0
             val encrypted = intent?.getIntExtra(StreamRecordingService.EXTRA_CHUNKS_ENCRYPTED, 0) ?: 0
-            val pending = encrypted - uploaded
-            // Phase 3.7 : show uploaded/encrypted with arrow + check icon
-            // when caught up. Orange when pending > 5 (~25 s of catchup
-            // at default 5 s chunk interval) so the user spots a backlog
-            // at a glance.
-            chunkStatus.text = when {
-                encrypted == 0 -> "0\u2191/0"
-                pending <= 0 -> "$encrypted\u2191 \u2713"
-                else -> "$uploaded\u2191/$encrypted"
-            }
-            val ctx = context ?: this@StreamActivity
-            chunkStatus.setTextColor(
-                if (pending > 5) ContextCompat.getColor(ctx, R.color.wa_orange)
-                else android.graphics.Color.parseColor("#AAFFFFFF")
-            )
+            val lost = intent?.getIntExtra(StreamRecordingService.EXTRA_CHUNKS_LOST, 0) ?: 0
+            showChunkStatus(context ?: this@StreamActivity, encrypted, uploaded, lost)
         }
     }
 
@@ -132,6 +114,30 @@ class StreamActivity : AppCompatActivity() {
                 qualityIndicator.text = label
             }
         }
+    }
+
+    /**
+     * Phase 3.7 : uploaded/sealed with an arrow, a check when caught up.
+     * Orange when more than 5 chunks wait (~25 s of catch-up at the default 5 s
+     * chunk), so a backlog shows at a glance. A chunk lost at capture (it could
+     * not be sealed) adds a cross and turns the counter red: the witness must
+     * see it during the recording, not discover it later.
+     */
+    private fun showChunkStatus(ctx: Context, encrypted: Int, uploaded: Int, lost: Int) {
+        val pending = encrypted - uploaded
+        val base = when {
+            encrypted == 0 -> "0\u2191/0"
+            pending <= 0 -> "$encrypted\u2191 \u2713"
+            else -> "$uploaded\u2191/$encrypted"
+        }
+        chunkStatus.text = if (lost > 0) "$base \u2715$lost" else base
+        chunkStatus.setTextColor(
+            when {
+                lost > 0 -> android.graphics.Color.parseColor("#FF5A5A")
+                pending > 5 -> ContextCompat.getColor(ctx, R.color.wa_orange)
+                else -> android.graphics.Color.parseColor("#AAFFFFFF")
+            }
+        )
     }
 
     private val CAMERA_PERMISSION_CODE = 100
@@ -227,27 +233,22 @@ class StreamActivity : AppCompatActivity() {
             fingerprintText.text = uploadManager.identity!!.readableFingerprint()
         }
 
-        // Les deux gardes de ce listener empêchent un crash de process : ne
-        // retirer ni l'une ni l'autre. Android tue le process avec
-        // ForegroundServiceDidNotStartInTimeException si un service démarré
-        // par startForegroundService n'appelle pas startForeground dans les
-        // 5 s, et un tap REC rapide enchaînait deux startForegroundService,
-        // le second n'ayant plus le temps. D'où :
-        //   1. isStopping bloque tout nouveau start tant que la session
-        //      précédente n'a pas fini son onDestroy + son flush. Le flag est
-        //      armé et relâché dans stopRecording, dont le commentaire porte
-        //      le décompte du flush : changer l'un sans relire l'autre casse
-        //      l'accord entre les deux.
+        // Les deux gardes de ce listener sont à garder toutes les deux :
+        //   1. Tant que la session précédente n'a pas fini (clôture du
+        //      rapport écrite, service arrêté), un nouveau start serait ignoré
+        //      par le service (une seule session à la fois) et l'écran se
+        //      croirait en train d'enregistrer sans que rien ne le soit. On
+        //      attend donc que le service ait relâché la session.
         //   2. Debounce 800 ms pour les double-clicks accidentels.
         recButton.setOnClickListener {
             val now = System.currentTimeMillis()
-            if (isStopping) {
+            if (!isRecording && StreamRecordingService.isBusy()) {
                 Toast.makeText(
                     this,
-                    "Session précédente en cours de finalisation, attends 2-3s.",
+                    R.string.stream_previous_session_finalizing,
                     Toast.LENGTH_SHORT
                 ).show()
-                timber.log.Timber.d("[REC] click ignored — isStopping=true")
+                timber.log.Timber.d("[REC] click ignored — previous session still finalising")
                 return@setOnClickListener
             }
             if (now - lastRecClickTime < 800L) {
@@ -422,7 +423,12 @@ class StreamActivity : AppCompatActivity() {
         // unregister here would freeze the counter for the rest of the
         // session. Re-pull on resume.
         if (isRecording) {
-            chunkStatus.text = "${StreamRecordingService.lastChunksUploaded}/${StreamRecordingService.lastChunksEncrypted}↑"
+            showChunkStatus(
+                this,
+                StreamRecordingService.lastChunksEncrypted,
+                StreamRecordingService.lastChunksUploaded,
+                StreamRecordingService.lastChunksLost,
+            )
             // Coming back from stealth (power button →
             // unlock → onResume) : passe par exitStealthMode pour cacher
             // l'overlay noir + re-arm KEEP_SCREEN_ON proprement. Si on
@@ -449,54 +455,48 @@ class StreamActivity : AppCompatActivity() {
             if (pending && !isRecording) View.VISIBLE else View.GONE
     }
 
-    // -- Phase 3.26-E — orphan fragments banner (in-app, no notification) --
+    // -- Reports banner (in-app, no notification) --
     //
-    // Surfaces two states the user must not discover only by their footage
-    // going missing: (1) AT-RISK = orphan blobs older than WARN_AGE_MS still
-    // on disk, heading for the 48 h secure-delete; (2) DELETED = blobs the
-    // rescue/TTL already purged. By therealshulgin's threat-model choice this is
-    // IN-APP ONLY (a system notification would force POST_NOTIFICATIONS,
-    // un-hiding the recording FGS notification during covert recording).
+    // Surfaces what the witness must not discover only by their footage going
+    // missing: chunks lost at capture, objects the relay refused (kept in the
+    // failed directory), the other report alerts, and objects still on the
+    // phone after a day (exposed to a seizure of the device; nothing is ever
+    // deleted for being old). By the project's threat-model choice this is
+    // IN-APP ONLY: a system notification would force POST_NOTIFICATIONS,
+    // un-hiding the recording FGS notification during covert recording.
 
-    private data class OrphanState(
-        val deletedCount: Int,
-        val deletedOldestMs: Long,
-        val atRiskCount: Int,
-        val atRiskOldestMs: Long,
-    )
+    private data class ReportsState(
+        val alerts: List<ReportAlerts.Alert>,
+        val failedCount: Int,
+        val waitingCount: Int,
+        val waitingOldestMs: Long,
+    ) {
+        val lostTotal: Int get() = ReportAlerts.lostTotal(alerts)
+        val isEmpty: Boolean get() = alerts.isEmpty() && failedCount == 0 && waitingCount == 0
+    }
 
-    private fun computeOrphanState(): OrphanState? {
-        val deletions = StreamPreferences.getOrphanDeletions(this)
-        val deletedCount = deletions.sumOf { it.count }
-        val deletedOldest = deletions
-            .mapNotNull { if (it.oldestBlobMs > 0L) it.oldestBlobMs else null }
-            .minOrNull() ?: 0L
-
-        var atRiskCount = 0
-        var atRiskOldest = 0L
-        // At-risk only matters if auto-upload is ON. If the user opted out,
-        // they chose to let orphans expire — a warning would contradict that.
-        if (StreamPreferences.isAutoUploadOrphansEnabled(this)) {
-            val pending = try {
-                ChunkUploadQueue(this).getPending()
-            } catch (e: Exception) {
-                emptyList()
-            }
-            // Only count blobs actually past the warning age. A fresh backlog
-            // still draining normally must NOT raise a false "at risk" alarm
-            // (counting all pending would inflate the number and erode trust
-            // in the warning — the opposite of this feature's intent).
-            val now = System.currentTimeMillis()
-            val atRisk = pending.filter {
-                (now - it.lastModified()) >= OrphanSweepWorker.WARN_AGE_MS
-            }
-            if (atRisk.isNotEmpty()) {
-                atRiskCount = atRisk.size
-                atRiskOldest = atRisk.minOf { it.lastModified() }
-            }
+    private fun computeReportsState(): ReportsState? {
+        val alerts = StreamPreferences.getReportAlerts(this)
+        val queue = try {
+            EnvelopeQueue.get(this)
+        } catch (e: Exception) {
+            null
         }
-        return if (deletedCount <= 0 && atRiskCount <= 0) null
-        else OrphanState(deletedCount, deletedOldest, atRiskCount, atRiskOldest)
+        val failed = queue?.failedCount() ?: 0
+        // Only envelopes past the warning age: a fresh backlog still leaving
+        // normally must not raise an alarm (that would erode trust in it).
+        val waiting = try {
+            queue?.pendingOlderThan(OrphanSweepWorker.WARN_AGE_MS).orEmpty()
+        } catch (e: Exception) {
+            emptyList()
+        }
+        val state = ReportsState(
+            alerts = alerts,
+            failedCount = failed,
+            waitingCount = waiting.size,
+            waitingOldestMs = waiting.minOfOrNull { it.lastModified() } ?: 0L,
+        )
+        return if (state.isEmpty) null else state
     }
 
     private fun refreshOrphanBanner() {
@@ -512,58 +512,90 @@ class StreamActivity : AppCompatActivity() {
             orphanBanner.visibility = View.GONE
             return
         }
-        val state = computeOrphanState()
+        val state = computeReportsState()
         if (state == null) {
             orphanBanner.visibility = View.GONE
             return
         }
-        // Deleted (irreversible) takes banner priority over at-risk; the
-        // dialog still shows both. Red = deleted, amber = at-risk.
-        if (state.deletedCount > 0) {
-            orphanBanner.text = getString(R.string.orphan_banner_deleted, state.deletedCount)
-            orphanBanner.setBackgroundColor(android.graphics.Color.parseColor("#CC1A1A"))
-        } else {
-            orphanBanner.text = getString(R.string.orphan_banner_at_risk, state.atRiskCount)
-            orphanBanner.setBackgroundColor(android.graphics.Color.parseColor("#E0A300"))
+        // Lost video first, then anything else that went wrong (red), then
+        // objects still waiting (amber). The dialog shows all of them.
+        when {
+            state.lostTotal > 0 -> {
+                orphanBanner.text = resources.getQuantityString(
+                    R.plurals.report_banner_lost, state.lostTotal, state.lostTotal
+                )
+                orphanBanner.setBackgroundColor(android.graphics.Color.parseColor("#CC1A1A"))
+            }
+            state.alerts.isNotEmpty() || state.failedCount > 0 -> {
+                orphanBanner.text = getString(R.string.report_banner_attention)
+                orphanBanner.setBackgroundColor(android.graphics.Color.parseColor("#CC1A1A"))
+            }
+            else -> {
+                orphanBanner.text = resources.getQuantityString(
+                    R.plurals.report_banner_waiting, state.waitingCount, state.waitingCount
+                )
+                orphanBanner.setBackgroundColor(android.graphics.Color.parseColor("#E0A300"))
+            }
         }
         orphanBanner.visibility = View.VISIBLE
     }
 
     private fun showOrphanDialog() {
-        val state = computeOrphanState() ?: return
-        val sb = StringBuilder()
-        if (state.atRiskCount > 0) {
-            sb.append(
-                getString(
-                    R.string.orphan_dialog_at_risk,
-                    state.atRiskCount,
-                    formatOrphanDate(state.atRiskOldestMs),
-                    formatOrphanDate(state.atRiskOldestMs + OrphanSweepWorker.PURGE_AGE_MS),
-                )
+        val state = computeReportsState() ?: return
+        val parts = ArrayList<String>()
+        val totals = ReportAlerts.totals(state.alerts)
+        val oldestOf = { reason: String ->
+            state.alerts.filter { it.reason == reason && it.oldestMs > 0L }.minOfOrNull { it.oldestMs } ?: 0L
+        }
+        for ((reason, count) in totals) {
+            val text = when (reason) {
+                ReportAlerts.Reason.EXPIRED, ReportAlerts.Reason.UNRECOVERABLE ->
+                    getString(R.string.orphan_dialog_deleted, count, formatOrphanDate(oldestOf(reason)))
+                ReportAlerts.Reason.CAPTURE_LOST ->
+                    resources.getQuantityString(R.plurals.report_alert_capture_lost, count, count)
+                ReportAlerts.Reason.FAILED ->
+                    resources.getQuantityString(R.plurals.report_alert_failed, count, count)
+                ReportAlerts.Reason.DIRECTORY_REFUSED ->
+                    resources.getQuantityString(R.plurals.report_alert_directory_refused, count, count)
+                ReportAlerts.Reason.CLOSURE_ABANDONED ->
+                    resources.getQuantityString(R.plurals.report_alert_closure_abandoned, count, count)
+                ReportAlerts.Reason.INTERRUPTED ->
+                    resources.getQuantityString(R.plurals.report_alert_interrupted, count, count)
+                ReportAlerts.Reason.MIGRATION_LOST ->
+                    resources.getQuantityString(R.plurals.report_alert_migration_lost, count, count)
+                ReportAlerts.Reason.TIMESTAMPS_CANCELLED ->
+                    resources.getQuantityString(R.plurals.report_alert_timestamps_cancelled, count, count)
+                else -> null
+            }
+            if (text != null) parts.add(text)
+        }
+        if (state.failedCount > 0) {
+            parts.add(
+                resources.getQuantityString(R.plurals.report_dialog_failed_kept, state.failedCount, state.failedCount)
             )
         }
-        if (state.deletedCount > 0) {
-            if (sb.isNotEmpty()) sb.append("\n\n")
-            sb.append(
-                getString(
-                    R.string.orphan_dialog_deleted,
-                    state.deletedCount,
-                    formatOrphanDate(state.deletedOldestMs),
+        if (state.waitingCount > 0) {
+            parts.add(
+                resources.getQuantityString(
+                    R.plurals.report_dialog_waiting, state.waitingCount,
+                    state.waitingCount, formatOrphanDate(state.waitingOldestMs),
                 )
             )
         }
         val builder = androidx.appcompat.app.AlertDialog.Builder(this, R.style.AlertDialogDarkTheme)
-            .setTitle(R.string.orphan_dialog_title)
-            .setMessage(sb.toString())
-        if (state.atRiskCount > 0) {
+            .setTitle(R.string.report_dialog_title)
+            .setMessage(parts.joinToString("\n\n"))
+        if (state.waitingCount > 0) {
             builder.setPositiveButton(R.string.orphan_action_retry) { _, _ ->
                 OrphanSweepWorker.triggerManualRescue(applicationContext)
                 Toast.makeText(this, R.string.orphan_retry_toast, Toast.LENGTH_SHORT).show()
             }
         }
-        if (state.deletedCount > 0) {
+        if (state.alerts.isNotEmpty()) {
+            // Acknowledges the alerts only: the failed directory and the
+            // waiting objects are live counts, they stay until they change.
             builder.setNeutralButton(R.string.orphan_action_ack) { _, _ ->
-                StreamPreferences.clearOrphanDeletions(this)
+                StreamPreferences.clearReportAlerts(this)
                 refreshOrphanBanner()
             }
         }
@@ -784,6 +816,12 @@ class StreamActivity : AppCompatActivity() {
             Toast.makeText(this, R.string.stream_encryption_not_initialized, Toast.LENGTH_LONG).show()
             return
         }
+        // Every start path comes here (button, shake, permission result): the
+        // service would ignore a start while the previous session finalises.
+        if (StreamRecordingService.isBusy()) {
+            Toast.makeText(this, R.string.stream_previous_session_finalizing, Toast.LENGTH_SHORT).show()
+            return
+        }
 
         isRecording = true
         recordingStartTime = System.currentTimeMillis()
@@ -984,20 +1022,9 @@ class StreamActivity : AppCompatActivity() {
 
     private fun stopRecording() {
         isRecording = false
-        // Crash fix 2026-05-09 — bloque tout nouveau startForegroundService
-        // pendant que l'ancien service finit son onDestroy. Phase 2.1.5 : ce
-        // flush attend jusqu'à 3,5 s (join du thread de stop) puis jusqu'à
-        // 3 s (threads de chiffrement), soit 6,5 s bornés avant le reste du
-        // teardown ; le flag est à 5500 ms et ne couvre donc plus le pire cas.
-        // Ce pire cas suppose que maybeRetryAuth parte sur un appel réseau,
-        // que le service décrit comme rare (« en pratique <1s sur un device
-        // fluide »). Si l'user re-tap REC pendant cette fenêtre, le click
-        // listener affiche un toast au lieu de relancer le service.
-        isStopping = true
-        timerHandler.postDelayed({
-            isStopping = false
-            timber.log.Timber.d("[REC] isStopping cleared — ready for new session")
-        }, 5500L)
+        // Tant que le service n'a pas fini sa fin de session (clôture du
+        // rapport écrite), StreamRecordingService.isBusy() reste vrai et le
+        // click listener refuse un nouveau start avec un toast.
 
         // Leaving recording state must also leave stealth,
         // otherwise the black overlay stays drawn over the idle screen.
@@ -1005,7 +1032,9 @@ class StreamActivity : AppCompatActivity() {
             exitStealthMode()
         }
 
-        // Unregister receiver and stop service
+        // Unregister receiver and ask the service to stop. A stop request,
+        // not stopService: the service closes the report while still in the
+        // foreground, then stops itself.
         try { unregisterReceiver(chunkUpdateReceiver) } catch (_: Exception) {}
         try { unregisterReceiver(qualityUpdateReceiver) } catch (_: Exception) {}
         if (serviceBound) {
@@ -1013,8 +1042,7 @@ class StreamActivity : AppCompatActivity() {
             serviceBound = false
         }
         streamService = null
-        val intent = Intent(this, StreamRecordingService::class.java)
-        stopService(intent)
+        StreamRecordingService.requestStop(this)
 
         // Switch UI back to idle — symmetric to startRecording:
         //   timer / chunks / blinking dot out

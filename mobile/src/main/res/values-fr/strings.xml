@@ -60,37 +60,14 @@
   <!-- Bouton retour générique -->
   <string name="action_back">Retour</string>
 
-  <!-- Mode archive -->
+  <!-- Mode archive. Les autres chaînes des écrans de secours sont dans strings_archive.xml. -->
   <string name="archive_title">MODE ARCHIVE</string>
   <string name="archive_prompt">SAISISSEZ VOTRE PHRASE BIP-39\nPOUR DÉCHIFFRER VOS STREAMS</string>
-  <string name="archive_warning">⚠ LA PHRASE NE QUITTE PAS CET ÉCRAN.\nNE LA PARTAGEZ JAMAIS.\nAPPUYER SUR ← EFFACE TOUT.</string>
+  <string name="archive_warning">⚠ LA PHRASE NE QUITTE PAS CET ÉCRAN. NE LA PARTAGEZ JAMAIS.\nLes vidéos récupérées restent chiffrées dans l\'app et ne sont déchiffrées que pendant que vous les regardez. Elles sont effacées à la fermeture de cet écran et par l\'effacement d\'urgence. Un export sort de la protection de l\'app.</string>
   <string name="archive_input_hint">12 mots séparés par des espaces</string>
   <string name="archive_unlock">DÉVERROUILLER</string>
-  <string name="archive_close">← Fermer et effacer la session</string>
-  <!-- Phase 4.4.2 (2026-05-19) — récupération archives. -->
+  <string name="archive_close">← Fermer : annule le téléchargement et efface les copies récupérées</string>
   <string name="archive_retrieve_btn">RÉCUPÉRER MES STREAMS</string>
-  <string name="archive_retrieving_auth">Authentification serveur…</string>
-  <string name="archive_retrieving_reports">Listage des reports…</string>
-  <string name="archive_retrieving_blob">Téléchargement %1$s (%2$d/%3$d)…</string>
-  <string name="archive_no_reports">Aucun report trouvé pour cette identité.</string>
-  <string name="archive_auth_refused">Serveur refusé : vérifiez la phrase + la connectivité.</string>
-  <string name="archive_open_folder">OUVRIR LE DOSSIER</string>
-  <string name="archive_report_summary">%1$d blob(s) • %2$s</string>
-  <!-- UX list-persist (2026-05-20). -->
-  <string name="archive_download_all_btn">TOUT TÉLÉCHARGER</string>
-  <string name="archive_report_downloaded">✓</string>
-  <string name="archive_download_all_progress">Report %1$d/%2$d : %3$s…</string>
-  <string name="archive_download_all_done">Tous les %1$d reports téléchargés dans %2$s</string>
-  <string name="archive_download_all_partial">Stoppé au report %1$d/%2$d — retapez TOUT TÉLÉCHARGER pour reprendre.</string>
-  <!-- Bugs UX (2026-05-20) — race + écrasement accidentel. -->
-  <string name="archive_busy">Un téléchargement est déjà en cours, patientez.</string>
-  <string name="archive_redownload_title">Re-télécharger ce report ?</string>
-  <string name="archive_redownload_message">Ce report est déjà dans Downloads/Frappuccino/. Le re-télécharger remplacera les fichiers existants.</string>
-  <string name="archive_redownload_confirm">RE-TÉLÉCHARGER</string>
-  <string name="archive_redownload_cancel">ANNULER</string>
-  <!-- Foreground service de téléchargement (2026-05-30). -->
-  <string name="archive_fgs_starting">Démarrage du téléchargement…</string>
-  <string name="archive_fgs_progress">Téléchargement archive — report %1$d/%2$d</string>
 
   <!-- Écran déverrouillage PIN -->
   <string name="pin_unlock_title">PIN POUR DÉVERROUILLER</string>
@@ -135,7 +112,7 @@
   <string name="stream_settings_lock_dialog_message">Le ratchet sera effacé de la RAM. Il faudra ressaisir le PIN pour streamer.</string>
   <string name="stream_settings_lock_dialog_action">Verrouiller</string>
   <string name="stream_settings_wipe_dialog_title">EFFACER TOUT ?</string>
-  <string name="stream_settings_wipe_dialog_message">Cela efface L\'IDENTITÉ V2 et le RATCHET :\n- Identité publique (ed25519_pk + x25519_pk)\n- Ratchet courant (batch + clés éphémères)\n- Blobs locaux (chunks en attente d\'upload)\n\nSeule votre phrase BIP-39 permettra de récupérer les streams déjà uploadés (via Mode Archive).\n\nPour un reset complet de l\'app (incluant le PIN Tella), désinstallez et réinstallez.\n\nCette action est IRRÉVERSIBLE.</string>
+  <string name="stream_settings_wipe_dialog_message">Cela efface de ce téléphone :\n- l\'IDENTITÉ V2 et le RATCHET (clés publiques, lot courant, clés éphémères)\n- l\'état des rapports, à partir duquel ce téléphone signe ses prochains enregistrements\n- la file d\'envoi, y compris les enregistrements pas encore envoyés et ceux en échec\n- les vidéos récupérées pour être regardées dans l\'app\n- les enregistrements que les versions précédentes de l\'app ont exportés dans Download/Frappuccino\n\nPas effacés : les fichiers que vous avez exportés par le sélecteur de fichiers du système. Ils sont hors de portée de l\'app.\n\nL\'effacement écrase puis supprime ; sur une mémoire flash c\'est au mieux, une ancienne copie d\'un bloc peut subsister.\n\nSeule votre phrase BIP-39 permettra de récupérer les streams déjà envoyés (via Mode Archive). Les enregistrements pas encore envoyés sont perdus.\n\nPour un reset complet de l\'app (incluant le PIN Tella), désinstallez et réinstallez.\n\nCette action est IRRÉVERSIBLE.</string>
   <string name="stream_settings_wipe_dialog_action">EFFACER</string>
   <string name="stream_settings_wipe_confirm_title">Dernière confirmation</string>
   <string name="stream_settings_wipe_confirm_message">Vraiment effacer l\'identité V2 ?</string>
@@ -185,11 +162,9 @@
     <string name="stream_settings_shake_med">Moyenne</string>
     <string name="stream_settings_shake_high">Élevée</string>
 
-    <!-- Bandeau fragments orphelins (in-app ; pas de notif). -->
-    <string name="orphan_banner_at_risk">%1$d fragment(s) en attente d\'envoi — appuyer</string>
-    <string name="orphan_banner_deleted">%1$d fragment(s) non envoyé(s) supprimé(s) — appuyer</string>
-    <string name="orphan_dialog_title">Fragments en attente</string>
-    <string name="orphan_dialog_at_risk">%1$d fragment(s) d\'un enregistrement n\'ont pas encore atteint le serveur (le plus ancien date du %2$s). Sans réseau utilisable, ils seront supprimés automatiquement vers le %3$s pour ne laisser aucune trace en clair. Reconnectez-vous, ou appuyez sur Réessayer.</string>
+    <!-- Boutons de la boîte des enregistrements, et l'alerte laissée par les
+         versions qui supprimaient les fragments non envoyés (in-app ; pas de
+         notif). Le reste est dans strings_reports.xml. -->
     <string name="orphan_dialog_deleted">%1$d fragment(s) non envoyé(s) ont été supprimés (le plus ancien datait du %2$s). Ils n\'ont pas pu atteindre le serveur à temps.</string>
     <string name="orphan_action_retry">Réessayer l\'envoi</string>
     <string name="orphan_action_ack">J\'ai compris</string>

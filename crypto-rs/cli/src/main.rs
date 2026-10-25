@@ -49,7 +49,8 @@ enum Command {
     /// Live-probe a V2 relay endpoint (challenge only; the `/auth/v2/status`
     /// lookup went with that route, R-SRV-1).
     ProtocolProbe(commands::protocol_probe::Args),
-    /// Phase 4.4 — list and download archives via BIP-39 (rescue device).
+    /// Rescue: from the BIP-39 phrase, find the reports on a relay, verify
+    /// every stored object, and write only what verifies.
     FetchArchive(commands::fetch_archive::Args),
     /// §10.11 — verify disclosed chunks against a Bitcoin OTS proof. No
     /// manifest and no mini-cert: the lean model stores neither.

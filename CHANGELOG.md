@@ -11,6 +11,50 @@ Categories used: **Added**, **Changed**, **Removed**, **Fixed**, **Security**,
 
 ## [Unreleased]
 
+### Breaking — rapports signés à la production et figés à la clôture (2026-10-25)
+
+**Ordre de déploiement : le relais AVANT l'APK.** Le vérifier par une sonde :
+`POST /close/<rid>` sans en-têtes doit rendre **400**, pas 404. Un client qui reçoit
+404 sur `/close` réessaie avec recul et n'abandonne pas.
+
+- **Added — domaine de signature `0x09 ReportClose`** sur
+  `report_id ‖ u32_be(seq_limit) ‖ sha256(manifest)`, manifeste
+  `"FQM1" ‖ u32_be(count) ‖ count × (u32_be(seq) ‖ sha256(blob))` ; miroir serveur et
+  KAT croisé.
+- **Added — route `POST /close/{report_id}`** ; après clôture, le relais refuse tout
+  nom hors de l'ensemble déclaré (409 `Report closed`) ; le nom `manifest` est
+  réservé (400 en PUT) ; les fiches closes expirées restent en pierres tombales.
+- **Added — métadonnée `x-amz-meta-report-write-sig`** posée par le `put_object` qui
+  crée l'objet et renvoyée par l'archive (`X-Report-Write-Sig`), et clôture dans le
+  listing (`closure`). Donnée d'intégrité : une migration de stockage doit préserver
+  les métadonnées utilisateur.
+- **Changed — état de rapport sur l'appareil** : `report_state.bin` (Rust, scellé par
+  la session PIN, AAD `frappuccino-report-state-v2`) remplace `report_master` ;
+  nouveaux index sur une chaîne HKDF à sens unique (`stream.report.chain.v2.*`) ;
+  objets nommés `NNNNNN.strm` par numéro de capture.
+- **Changed — file d'envoi** : enveloppes `FQE1` (charge utile + en-tête chiffré sous
+  une clé de file Keystore), signées à la production, revérifiées par Rust avant tout
+  envoi ; un job WorkManager par enveloppe.
+- **Changed — secours** : vérification sous la clé re-dérivée de la phrase avant de
+  ranger, statuts par objet et par rapport, section « non vérifiable » pour les objets
+  legacy sans signature ; lecture interne (copies chiffrées dans `noBackupFilesDir`) et
+  export explicite par le sélecteur du système. Plus aucune écriture dans
+  `Download/Frappuccino/`.
+- **Changed — `reports.json`** : fsync du répertoire à chaque sauvegarde ; un fichier
+  illisible empêche le relais de démarrer (au lieu de repartir vide).
+- **Security — effacement d'urgence étendu** : abandon synchrone de l'écrivain, état de
+  rapport, clé de file, files et répertoire d'échecs, copies de lecture interne,
+  anciennes exportations de l'installation dans `Download/Frappuccino/`.
+- **Removed — exports FFI** `strm_encrypt`, `strm_encrypt_file`,
+  `upload_put_report_chunk`, `upload_put_directory_entry`, `archive_list_blobs`,
+  `archive_download_and_decrypt`, `archive_download_raw`, et les méthodes de
+  `ReportKeyring` ; le TTL de 48 h des chunks en attente.
+- **Migration** des appareils existants au premier déverrouillage (conversion des
+  fichiers en attente en enveloppes signées à ce moment, une clôture legacy par index
+  legacy, puis suppression du maître). Les limites qui restent (R1-R7) sont dans
+  `docs/ACCEPTED_RESIDUALS_2026-06-28.md`. Un secours d'une version antérieure ne voit
+  pas les rapports enregistrés après la mise à jour.
+
 ### Security — Phase 3.39 (metrics.log en stockage interne, FRAG-R1-3)
 
 - **`MetricsFileLogger` écrit désormais dans `filesDir`**, le stockage privé

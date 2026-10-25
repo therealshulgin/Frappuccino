@@ -17,7 +17,9 @@ package org.stream.crypto
  *   - Déchiffrement des streams passés → [ArchiveIdentity.fromMnemonic]
  *   - Signature des uploads → [org.stream.crypto.ratchet.EphemeralRatchet]
  *   - Signature de provenance → `ProvenanceSigner.fromMnemonic`
- *   - Clés de capacité des reports → `ReportKeyring.fromMnemonic`
+ *   - Clés des reports → `pinSessionCreateReportState` (état des rapports
+ *     possédé par Rust, `filesDir/report_state.bin`, scellé sous la session
+ *     PIN ; il ne traverse jamais la JVM)
  *
  * Ces deux derniers sont dérivés de la même phrase à l'enrôlement, dans
  * `StreamUploadManager.enrollFromMnemonic` : qui audite la surface de clés

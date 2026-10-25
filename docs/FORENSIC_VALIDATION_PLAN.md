@@ -117,6 +117,9 @@ Package `org.hzontal.tellaFOSS`. Use a **release** APK for any claim about relea
 **Leak signature (falsifies):** `Bearer `/`eyJ…`/64-hex key in WorkSpec input (R-01 regression); recognizable ed25519/x25519 hex or readable ratchet markers in the XML; JWT surviving in `workdb` post-reboot.
 
 ### Surface 8 — MediaStore Downloads + thumbnails
+
+> **Later change (2026-10-25).** The current rescue no longer writes to `Download/` at all: recovered objects stay encrypted in `noBackupFilesDir/archive_view/`, a sliding window of chunks is decrypted to a private directory only while the internal player shows them, and everything is purged on close, at app start and by the emergency wipe, which also removes what earlier versions of this installation exported to `Download/Frappuccino/`. Exports are explicit, through the system folder picker, after a warning. The steps below describe the campaign as run against the earlier behaviour; a re-run would check `archive_view` and the purges instead.
+
 **Steps**
 1. Perform an archive rescue (1 report, several blobs).
 2. `adb shell run-as <pkg> find cache/archive_recovery -type f` → expect 0.

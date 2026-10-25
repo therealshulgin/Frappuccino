@@ -13,6 +13,8 @@
 > the code is authoritative** (`docs/METADATA_EXPOSURE_MAP.md:10`). Two such divergences were found and
 > are flagged below — they are gold for the next auditor.
 
+> **Later change (2026-10-25).** BET B below is phrased as "forward secrecy". Read it in two halves today: past *content* is unreadable because no X25519 private key is on the device; the proven forward security is that of *authentication*; and the integrity of past *reports* now rests on their signed closure, which covers closed reports only (`docs/ARCHITECTURE_TECHNIQUE_COMPLETE.md` §8.7, §10.1).
+
 ---
 
 ## 1. Index

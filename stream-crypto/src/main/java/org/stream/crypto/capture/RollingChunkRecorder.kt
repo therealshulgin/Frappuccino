@@ -54,6 +54,13 @@ import java.util.concurrent.atomic.AtomicReference
  *     rotation events and **on the calling thread of [stop]** for the final
  *     chunk. Implementations must not assume any specific thread.
  *
+ * **Completion** : [stop] returns only once every delivery has returned from
+ * [onChunkReady], the background ones included (bounded by
+ * [DELIVERY_DRAIN_TIMEOUT_MS]; its return value says whether they all did). A
+ * consumer that has to act after the last chunk, such as closing the report
+ * the chunks belong to, can therefore do it right after [stop] returns: no
+ * rotation or swap drain thread is left to deliver a chunk behind it.
+ *
  * (Phase H2-B.4, 2026-05-16.)
  */
 class RollingChunkRecorder(
@@ -82,10 +89,16 @@ class RollingChunkRecorder(
 
     private val rotateThread = HandlerThread("RollingChunkRotate").apply { start() }
     private val rotateHandler = Handler(rotateThread.looper)
+    // Token of the cadence's own posts (preallocate, rotate), so that [stop]
+    // cancels them without dropping anything else queued on the rotation
+    // thread: a swap waiting there would otherwise wait for ever.
+    private val cadenceToken = Any()
     private val seqNum = AtomicInteger(0)
     @Volatile private var currentChunk: PendingChunk? = null
     @Volatile private var preallocatedNext: PendingChunk? = null
     private val running = AtomicBoolean(false)
+    private val started = AtomicBoolean(false)
+    private val released = AtomicBoolean(false)
 
     // [videoConfig] is swapped by [swapVideoConfig] (new resolution / bitrate /
     // mime) while the recorder stays live; makeChunk() reads it to configure the
@@ -136,6 +149,12 @@ class RollingChunkRecorder(
     private var consecutiveRotationFailures = 0
     @Volatile private var escalated = false
 
+    // Deliveries handed to a background drain thread (rotation or swap) whose
+    // onChunkReady has not returned yet. [stop] waits for this to reach zero
+    // before returning, which is the completion signal documented on the class.
+    private val deliveriesInFlight = AtomicInteger(0)
+    private val deliveryLock = Object()
+
     init {
         // Build the very first chunk synchronously so the GL pipeline
         // has a target Surface to bind to.
@@ -168,7 +187,9 @@ class RollingChunkRecorder(
     fun cameraSurfaceTexture(): SurfaceTexture = glPipeline.cameraSurfaceTexture()
 
     fun start() {
-        if (!running.compareAndSet(false, true)) error("Already started")
+        check(!released.get()) { "released" }
+        if (!started.compareAndSet(false, true)) error("Already started")
+        running.set(true)
         // GL pipeline was already started in the constructor (so the
         // caller could bind the camera SurfaceTexture). Here we only
         // boot audio capture + the first chunk's encoders.
@@ -191,8 +212,8 @@ class RollingChunkRecorder(
             "rollingStart seq=%d chunkMs=%d preallocLeadMs=%d",
             first.seq, chunkIntervalMs, preallocLeadMs
         )
-        rotateHandler.postDelayed({ preallocateNext() }, chunkIntervalMs - preallocLeadMs)
-        rotateHandler.postDelayed({ rotateChunk() }, chunkIntervalMs)
+        postCadence(chunkIntervalMs - preallocLeadMs) { preallocateNext() }
+        postCadence(chunkIntervalMs) { rotateChunk() }
     }
 
     /**
@@ -255,14 +276,26 @@ class RollingChunkRecorder(
         }
     }
 
-    fun stop() {
-        if (!running.getAndSet(false)) return
-        rotateHandler.removeCallbacksAndMessages(null)
+    /**
+     * Stops the capture and delivers the chunk in flight. Returns once every
+     * delivery, background ones included, has returned from [onChunkReady], or
+     * after [DELIVERY_DRAIN_TIMEOUT_MS]: `true` if they all returned, `false`
+     * if some drain thread was still running at the deadline (a chunk it
+     * delivers later arrives after this call). A second call returns `true` at
+     * once without stopping anything, and so does a call on a recorder that
+     * never started: free that one with [release].
+     */
+    fun stop(): Boolean {
+        if (!running.getAndSet(false)) return true
 
-        val curr = currentChunk
-        val preall = preallocatedNext
-        currentChunk = null
-        preallocatedNext = null
+        // Take the chunks to stop ON the rotation thread. A rotation or a swap
+        // running right now finishes first (it checked `running` before this
+        // call cleared it), hands its old chunk to its own drain, and leaves
+        // its new one as the current chunk; only then is the current chunk
+        // read here. Read from this thread instead, a rotation half-way
+        // through would deliver the same chunk a second time and leave its
+        // new one running with nobody to stop it.
+        val (curr, preall) = takeChunksOnRotateThread()
 
         // GL pipeline first (avoid EGL_BAD_SURFACE on encoder shutdown).
         try { glPipeline.stop() } catch (e: Exception) {
@@ -322,7 +355,135 @@ class RollingChunkRecorder(
             Timber.w(e, "stop: pcmThread failed")
         }
         rotateThread.quitSafely()
-        Timber.tag("StreamMetrics").i("rollingStop done")
+        val allDelivered = awaitDeliveries(DELIVERY_DRAIN_TIMEOUT_MS)
+        Timber.tag("StreamMetrics").i(
+            "rollingStop done allDelivered=%b pending=%d",
+            allDelivered, deliveriesInFlight.get()
+        )
+        return allDelivered
+    }
+
+    /**
+     * For [stop]: cancel the rotation cadence and take the current and the
+     * preallocated chunks (clearing both), on the rotation thread, behind
+     * whatever rotation or swap it is running. Inline when already on that
+     * thread. If the thread cannot take the task, or does not get to it in
+     * [STOP_HANDOFF_TIMEOUT_MS] (a rotation stuck in GL), the chunks are taken
+     * from the calling thread instead, as a last resort; exactly one of the two
+     * takes them.
+     */
+    private fun takeChunksOnRotateThread(): Pair<PendingChunk?, PendingChunk?> {
+        val claimed = AtomicBoolean(false)
+        val taken = AtomicReference<Pair<PendingChunk?, PendingChunk?>>(null)
+        val take = {
+            if (claimed.compareAndSet(false, true)) {
+                rotateHandler.removeCallbacksAndMessages(cadenceToken)
+                taken.set(currentChunk to preallocatedNext)
+                currentChunk = null
+                preallocatedNext = null
+            }
+        }
+        if (android.os.Looper.myLooper() == rotateThread.looper) {
+            take()
+        } else {
+            val done = CountDownLatch(1)
+            val posted = rotateHandler.post {
+                try {
+                    take()
+                } finally {
+                    done.countDown()
+                }
+            }
+            if (posted) {
+                try {
+                    if (!done.await(STOP_HANDOFF_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                        Timber.e("stop: rotation thread busy past %d ms, taking the chunks from here", STOP_HANDOFF_TIMEOUT_MS)
+                    }
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+            }
+            take()
+        }
+        return taken.get() ?: (null to null)
+    }
+
+    /** Post one step of the chunk cadence, under [cadenceToken] so [stop] can cancel the cadence alone. */
+    private fun postCadence(delayMs: Long, step: () -> Unit) {
+        rotateHandler.postAtTime(Runnable { step() }, cadenceToken, android.os.SystemClock.uptimeMillis() + delayMs)
+    }
+
+    /**
+     * Free a recorder that was built but never [start]ed: its constructor
+     * already started the GL pipeline and its thread, the rotation thread, and
+     * the first chunk's encoders and muxer. Delivers nothing (nothing was
+     * recorded). Returns true if it released, false for a recorder that
+     * started (stop it with [stop]) or was already released. Idempotent.
+     */
+    fun release(): Boolean {
+        if (running.get() || started.get()) return false
+        if (!released.compareAndSet(false, true)) return false
+        try { glPipeline.stop() } catch (e: Exception) {
+            Timber.w(e, "release: glPipeline failed")
+        }
+        // bundle.stop() handles "configured but not started": it releases the
+        // codecs and deletes the empty MP4.
+        for (chunk in listOf(currentChunk, preallocatedNext)) {
+            try { chunk?.bundle?.stop() } catch (e: Exception) {
+                Timber.w(e, "release: bundle.stop failed")
+            }
+        }
+        currentChunk = null
+        preallocatedNext = null
+        rotateThread.quitSafely()
+        return true
+    }
+
+    /**
+     * Runs [body], which ends with an [onChunkReady] call, on a one-shot thread
+     * named [name], counted in [deliveriesInFlight] until it returns. A failed
+     * `Thread.start()` takes the count back before rethrowing, so a delivery
+     * that never ran cannot hold [stop] until its deadline.
+     */
+    private fun startDelivery(name: String, body: () -> Unit) {
+        deliveriesInFlight.incrementAndGet()
+        val thread = Thread({
+            try {
+                body()
+            } finally {
+                deliveryFinished()
+            }
+        }, name)
+        try {
+            thread.start()
+        } catch (t: Throwable) {
+            deliveryFinished()
+            throw t
+        }
+    }
+
+    private fun deliveryFinished() {
+        if (deliveriesInFlight.decrementAndGet() <= 0) {
+            synchronized(deliveryLock) { deliveryLock.notifyAll() }
+        }
+    }
+
+    /** Waits until no background delivery is running, at most [timeoutMs]. */
+    private fun awaitDeliveries(timeoutMs: Long): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        synchronized(deliveryLock) {
+            while (deliveriesInFlight.get() > 0) {
+                val left = deadline - System.currentTimeMillis()
+                if (left <= 0L) return false
+                try {
+                    deliveryLock.wait(left)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return deliveriesInFlight.get() <= 0
+                }
+            }
+        }
+        return true
     }
 
     /**
@@ -359,13 +520,22 @@ class RollingChunkRecorder(
         check(running.get()) { "swapVideoConfig called before start() or after stop()" }
         val latch = CountDownLatch(1)
         val errRef = AtomicReference<Exception?>(null)
-        rotateHandler.post {
+        val posted = rotateHandler.post {
+            // A stop that came between the post and now: the recorder is not
+            // swapping anything any more (its chunks are the stop's).
+            if (!running.get()) {
+                errRef.set(IllegalStateException("swapVideoConfig: recorder stopped"))
+                latch.countDown()
+                return@post
+            }
             val swapStartNs = System.nanoTime()
             var swapNext: PendingChunk? = null
             try {
                 // Cancel the pending periodic prealloc/rotation; we rebuild the
                 // chunk cadence around the new config at the end of this swap.
-                rotateHandler.removeCallbacksAndMessages(null)
+                // The cadence only: anything else queued here (a stop's
+                // hand-off) must still run.
+                rotateHandler.removeCallbacksAndMessages(cadenceToken)
 
                 val old = currentChunk
                 val preall = preallocatedNext
@@ -411,7 +581,7 @@ class RollingChunkRecorder(
                 //    the swap returns fast and the GL surface switch isn't held
                 //    up by the old encoder's EOS flush. signalEndOfInputStream
                 //    on the old video encoder is done by bundle.stop().
-                Thread({
+                startDelivery("RollingChunkSwapDrain-${old?.seq ?: -1}") {
                     if (old != null) {
                         try { old.bundle.stop() } catch (e: Exception) {
                             Timber.w(e, "swapVideoConfig: old bundle.stop failed seq=%d", old.seq)
@@ -432,7 +602,7 @@ class RollingChunkRecorder(
                             Timber.w(e, "swapVideoConfig: preallocated bundle.stop failed")
                         }
                     }
-                }, "RollingChunkSwapDrain-${old?.seq ?: -1}").start()
+                }
             } catch (e: Exception) {
                 errRef.set(e)
                 Timber.e(e, "swapVideoConfig failed")
@@ -447,13 +617,17 @@ class RollingChunkRecorder(
                 // swap cancelled the pending cadence at the top; restore it for both
                 // success and failure — unless the backstop escalated.
                 if (running.get() && !escalated) {
-                    rotateHandler.postDelayed({ preallocateNext() }, chunkIntervalMs - preallocLeadMs)
-                    rotateHandler.postDelayed({ rotateChunk() }, chunkIntervalMs)
+                    postCadence(chunkIntervalMs - preallocLeadMs) { preallocateNext() }
+                    postCadence(chunkIntervalMs) { rotateChunk() }
                 }
                 latch.countDown()
             }
         }
-        latch.await()
+        // Not posted: the rotation thread has quit (the recorder stopped).
+        if (!posted) throw IllegalStateException("swapVideoConfig: recorder stopped")
+        if (!latch.await(SWAP_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+            throw IllegalStateException("swapVideoConfig: no answer from the rotation thread in $SWAP_TIMEOUT_MS ms")
+        }
         errRef.get()?.let { throw it }
     }
 
@@ -615,7 +789,7 @@ class RollingChunkRecorder(
                 Timber.e(e, "rotateChunk : synchronous makeChunk failed")
                 onRotationFailure(old, null, e)
                 if (running.get() && !escalated) {
-                    rotateHandler.postDelayed({ rotateChunk() }, chunkIntervalMs)
+                    postCadence(chunkIntervalMs) { rotateChunk() }
                 }
                 return
             }
@@ -656,7 +830,7 @@ class RollingChunkRecorder(
             // 6. Drain old bundle in background. signalEndOfInputStream
             //    on the old video encoder is done by bundle.stop(); its
             //    drain thread sees EOS and exits.
-            Thread({
+            startDelivery("RollingChunkDrain-${old.seq}") {
                 try {
                     old.bundle.stop()
                 } catch (e: Exception) {
@@ -671,7 +845,7 @@ class RollingChunkRecorder(
                 } catch (e: Exception) {
                     Timber.w(e, "onChunkReady cb failed seq=%d", old.seq)
                 }
-            }, "RollingChunkDrain-${old.seq}").start()
+            }
         } catch (e: Exception) {
             // N1/#2: forfeit the broken `next`, keep `old` recording (it is
             // delivered by the retry's success or the backstop's clean stop),
@@ -684,8 +858,8 @@ class RollingChunkRecorder(
             // success this is the normal next cycle; on failure it retries a fresh
             // rotation with `old` still current — unless the backstop escalated.
             if (running.get() && !escalated) {
-                rotateHandler.postDelayed({ preallocateNext() }, chunkIntervalMs - preallocLeadMs)
-                rotateHandler.postDelayed({ rotateChunk() }, chunkIntervalMs)
+                postCadence(chunkIntervalMs - preallocLeadMs) { preallocateNext() }
+                postCadence(chunkIntervalMs) { rotateChunk() }
             }
         }
     }
@@ -728,6 +902,21 @@ class RollingChunkRecorder(
 /** Max consecutive rotation failures before the recorder escalates a fail-closed
  *  stop instead of retrying (and letting the clear chunk grow unbounded). */
 private const val MAX_ROTATION_FAILURES = 3
+
+/** How long [RollingChunkRecorder.stop] waits for the rotation thread to hand
+ *  over the chunks: past a rotation or a swap in progress, which is a few GL
+ *  operations, each bounded at 2 s by the GL pipeline. */
+private const val STOP_HANDOFF_TIMEOUT_MS = 5_000L
+
+/** How long a caller of [RollingChunkRecorder.swapVideoConfig] waits for the
+ *  swap: a chunk allocation plus a GL operation, normally well under a second. */
+private const val SWAP_TIMEOUT_MS = 10_000L
+
+/** How long [RollingChunkRecorder.stop] waits for the background deliveries.
+ *  A drain is one muxer close plus the consumer's callback, normally well
+ *  under a second; the bound only keeps a wedged encoder from holding the
+ *  caller for ever. */
+const val DELIVERY_DRAIN_TIMEOUT_MS = 30_000L
 
 /** Signals to the host service that capture cannot recover and must be stopped
  *  cleanly (the in-flight clear chunk is finalized+encrypted via onChunkReady). */

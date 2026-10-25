@@ -43,7 +43,7 @@ set -euo pipefail
 # Every harness in crypto-rs/stream/src/kani_proofs.rs must be verified. Bump
 # this deliberately when adding or removing one, in the same commit, so the
 # change is visible in review rather than absorbed silently.
-EXPECTED_HARNESSES=5
+EXPECTED_HARNESSES=8
 
 die() { echo "[run-kani] FAIL: $*" >&2; exit 1; }
 

@@ -39,6 +39,15 @@ Model: `crypto-rs/core/proofs/RatchetProtocol.spthy`. Sources of truth:
 **verifier** `server/app/routes/auth_v2.py` (the acceptance conditions = the
 security oracle).
 
+**Out of this model: reports.** The report capability signatures (`0x07`
+create, `0x08` write, `0x09` close), the one-way report key chain and the relay's
+rule after a closure are **not** modeled here, and no other formal model covers
+them yet: they rest on unit tests, frozen cross-language vectors
+(`crypto-rs/core/tests/report_chain_kat.rs`, `server/tests/test_report_close_kat.py`)
+and the relay's pytest suite. "Forward secrecy" in this document is that of
+**authentication**; it says nothing about which reports a device state can still
+sign (`docs/ACCEPTED_RESIDUALS_2026-06-28.md`, R1).
+
 ## The protocol that is modelled
 
 The V2 design is a **batched forward-secure signature lineage** (Algorand-style

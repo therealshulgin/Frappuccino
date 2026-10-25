@@ -256,6 +256,25 @@ pub fn seal_with_key(
     salt: &[u8; SALT_BYTES],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
+    seal_with_key_and_aad(derived_key, salt, plaintext, AAD)
+}
+
+/// [`seal_with_key`] under a caller-chosen `aad` instead of the store's own
+/// [`AAD`]. Same blob layout. A blob sealed under one AAD does not open under
+/// another, so a caller with its own AAD keeps its blobs apart from every other
+/// blob sealed under the same session key (the report device state uses
+/// `report::CTX_STATE_AAD`). Open it with [`open_with_key_and_aad`] and the
+/// same `aad`.
+///
+/// # Errors
+/// * [`CryptoError::DerivationFailed`] if the AEAD construction fails
+///   (never in practice).
+pub fn seal_with_key_and_aad(
+    derived_key: &[u8; KEY_BYTES],
+    salt: &[u8; SALT_BYTES],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
     let mut nonce = [0u8; NONCE_BYTES];
     OsRng.fill_bytes(&mut nonce);
 
@@ -265,7 +284,7 @@ pub fn seal_with_key(
             XNonce::from_slice(&nonce),
             Payload {
                 msg: plaintext,
-                aad: AAD,
+                aad,
             },
         )
         .map_err(|e| CryptoError::DerivationFailed(format!("AEAD encrypt: {e}")))?;
@@ -297,6 +316,19 @@ pub fn open_with_key(
     derived_key: &[u8; KEY_BYTES],
     blob: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+    open_with_key_and_aad(derived_key, blob, AAD)
+}
+
+/// [`open_with_key`] for a blob sealed by [`seal_with_key_and_aad`] under
+/// `aad`. A blob sealed under any other AAD fails to authenticate.
+///
+/// # Errors
+/// As [`open_with_key`].
+pub fn open_with_key_and_aad(
+    derived_key: &[u8; KEY_BYTES],
+    blob: &[u8],
+    aad: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     if blob.len() < HEADER_SIZE + TAG_BYTES {
         return Err(CryptoError::InvalidBlob(format!(
             "blob too short: {} (minimum {})",
@@ -322,7 +354,7 @@ pub fn open_with_key(
             XNonce::from_slice(&nonce),
             Payload {
                 msg: ciphertext,
-                aad: AAD,
+                aad,
             },
         )
         .map_err(|_| CryptoError::WrongPin)?;
@@ -484,5 +516,36 @@ mod tests {
             open_with_key(&key, &[0u8; HEADER_SIZE]),
             Err(CryptoError::InvalidBlob(_))
         ));
+    }
+
+    #[test]
+    fn a_blob_opens_only_under_the_aad_it_was_sealed_with() {
+        // No Argon2id needed: the session key is any 32 bytes here.
+        let key = Zeroizing::new([0x11u8; KEY_BYTES]);
+        let salt = [0x22u8; SALT_BYTES];
+        let own = seal_with_key_and_aad(&key, &salt, b"state", b"own-aad").unwrap();
+        assert_eq!(
+            &open_with_key_and_aad(&key, &own, b"own-aad").unwrap()[..],
+            b"state"
+        );
+        // Not under the store's AAD, nor under any other.
+        assert!(matches!(
+            open_with_key(&key, &own),
+            Err(CryptoError::WrongPin)
+        ));
+        assert!(matches!(
+            open_with_key_and_aad(&key, &own, b"other"),
+            Err(CryptoError::WrongPin)
+        ));
+        // And a blob of the store does not open under the caller's AAD.
+        let store = seal_with_key(&key, &salt, b"seed").unwrap();
+        assert!(matches!(
+            open_with_key_and_aad(&key, &store, b"own-aad"),
+            Err(CryptoError::WrongPin)
+        ));
+        assert_eq!(
+            &open_with_key_and_aad(&key, &store, AAD).unwrap()[..],
+            b"seed"
+        );
     }
 }

@@ -1,12 +1,19 @@
-//! Report capability keyring — **relay-blind reports** (Phase C,
-//! `docs/RELAY_BLIND_REPORTS.md`; motto: *a seizure exposes nothing*).
+//! Report capability keys — **relay-blind reports**
+//! (`docs/RELAY_BLIND_REPORTS.md`; motto: *a seizure exposes nothing*).
 //!
 //! A report is addressed and authorized by a key derived from the BIP-39 seed,
 //! **not** by the witness's identity. The relay stores `report_id → report_pk`
 //! and never the identity, so seizing the relay disk reveals no
 //! `identity → report → when` link.
 //!
-//! ## Derivation (a dedicated HKDF context, never identity/ratchet/provenance)
+//! Two derivation schemes share ONE index space. Indices below the migration
+//! point `k` belong to the legacy scheme ([`ReportKeyring`]); indices from `k`
+//! on belong to the chained scheme ([`ReportDeviceState`]). A fresh enrollment
+//! starts the chain at `k = 0`. The rescue device does not know `k`, so
+//! [`ReportRescue`] derives both families for every index and lets the relay's
+//! listings tell which one exists.
+//!
+//! ## Legacy derivation (a dedicated HKDF context, never identity/ratchet/provenance)
 //!
 //! ```text
 //! master_seed (BIP-39, 64 B)
@@ -23,20 +30,69 @@
 //! from the phrase alone at rescue (device with no local state), so reports are
 //! enumerable by derivation without the relay ever indexing them by identity.
 //!
+//! Once a device has migrated, the legacy scheme has three remaining uses:
+//! deriving the chain's starting point and the directory key from
+//! `report_master` at migration, signing the objects and closures of legacy
+//! reports still pending at that moment, and letting the rescue device find
+//! legacy reports.
+//!
+//! ## Chained derivation
+//!
+//! ```text
+//! report_master
+//!   ├─▶ HKDF("stream.report.chain.v2.root", 32) ──────────▶ C_0
+//!   └─▶ HKDF("stream.report.directory.v1", 32) ───────────▶ directory seed (same key as legacy)
+//! C_i
+//!   ├─▶ HKDF("stream.report.chain.v2.next", 32) ──────────▶ C_{i+1}
+//!   ├─▶ HKDF("stream.report.chain.v2.key", 32) ───────────▶ seed_i ─▶ report_sk_i, report_pk_i, report_id_i
+//!   ├─▶ HKDF("stream.report.chain.v2.directory-entry", 16) ▶ name of report i's directory entry
+//!   └─▶ HKDF("stream.report.chain.v2.ots-name", 16) ──────▶ name of report i's timestamp proof (in the directory)
+//! ```
+//!
+//! The device keeps only `(i, C_i, directory seed)` ([`ReportDeviceState`]) and
+//! never `report_master`. Opening report `i` derives its key from `C_i`, then
+//! replaces `C_i` by `C_{i+1}` and wipes `C_i`. Once the advanced state is
+//! persisted, the state can no longer re-derive the key of a report opened
+//! before it. It still derives every report opened AFTER it (the chain is
+//! deterministic, so that the phrase alone finds every report at rescue), and
+//! copies of earlier states left on storage are outside what this module can
+//! wipe.
+//!
 //! ## Signatures (domain-separated, [`SignatureDomain`])
 //!
 //! - `create_sig = Ed25519(report_sk_n, 0x07 ‖ report_id_n ‖ report_pk_n)` —
 //!   authorizes the lazy creation of `report_id_n` at its first chunk PUT.
 //! - `write_sig  = Ed25519(report_sk_n, 0x08 ‖ report_id_n ‖ filename ‖ sha256(body))` —
 //!   authorizes writing one chunk; rides every PUT.
+//! - `close_sig  = Ed25519(report_sk_n, 0x09 ‖ report_id_n ‖ u32_be(seq_limit) ‖ sha256(manifest))` —
+//!   closes the report over the exact set of objects listed in its [`Manifest`].
 //!
 //! `report_id` is signed as its **raw 16 bytes** (the relay hex-decodes the
 //! `{report_id}` path component before verifying), `report_pk` as its raw 32
-//! bytes, `sha256(body)` as its raw 32 bytes. The fixed-width `report_id`
-//! prefix and `sha256` suffix anchor the variable-length `filename` in the
-//! middle unambiguously. The relay (verifier) mirrors these byte layouts in
+//! bytes, `sha256(body)` and `sha256(manifest)` as their raw 32 bytes,
+//! `seq_limit` as 4 big-endian bytes. The fixed-width `report_id` prefix and
+//! `sha256` suffix anchor the variable-length `filename` in the middle
+//! unambiguously. The relay (verifier) mirrors these byte layouts in
 //! `server/app/routes/upload.py`; changing one invalidates every in-flight
 //! report signature.
+
+mod chain;
+mod manifest;
+mod rescue;
+mod verify;
+mod writer;
+
+pub use chain::{
+    ReportDeviceState, ReportOpening, CTX_STATE_AAD, MAX_MIGRATION_INDEX, STATE_BYTES,
+    STATE_VERSION,
+};
+pub use manifest::{
+    chain_object_name, parse_chain_object_name, Manifest, ManifestEntry, MANIFEST_MAGIC, MAX_SEQ,
+    MAX_SEQ_LIMIT,
+};
+pub use rescue::{ReportRescue, ReportScheme, RescueReport};
+pub use verify::{verify_close, verify_create, verify_write};
+pub use writer::{PreparedClose, PreparedObject, ReportWriter};
 
 use crate::bip39::{self, Language};
 use crate::error::CryptoError;
@@ -61,6 +117,11 @@ const REPORT_MASTER_BYTES: usize = 32;
 const REPORT_ID_BYTES: usize = 16;
 /// SHA-256 digest / body-hash width.
 const HASH_BYTES: usize = 32;
+/// Ed25519 signature width.
+const SIG_BYTES: usize = 64;
+/// Width of an opaque object name (directory entry, timestamp proof) before
+/// hex encoding: 16 bytes, 32 lowercase hex characters on the wire.
+const NAME_BYTES: usize = 16;
 
 /// HKDF context for the intermediate report seed (distinct from identity /
 /// provenance / ratchet — a different context => a different key from the same
@@ -99,6 +160,163 @@ const CTX_REPORT_DIRECTORY: &[u8] = b"stream.report.directory.v1";
 const CTX_REPORT_DIR_ENTRY: &[u8] = b"stream.report.directory.entry.v1";
 
 // ============================================================================
+// Errors
+// ============================================================================
+
+/// Failures of the report state machine, the writer, the manifest parser and
+/// the secret-free verifiers. Kept apart from [`CryptoError`] so a caller can
+/// tell a protocol refusal (a chunk before the metadata, a duplicate sequence
+/// number, a closure that does not match its manifest) from a derivation
+/// failure, which arrives wrapped in [`ReportError::Crypto`].
+///
+/// No variant carries key material: the payloads are public counters and
+/// static descriptions.
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum ReportError {
+    /// A derivation or mnemonic error from the underlying primitives.
+    #[error(transparent)]
+    Crypto(#[from] CryptoError),
+    /// The device state's index cannot advance any further (`u32` exhausted).
+    #[error("report index space exhausted")]
+    IndexExhausted,
+    /// A migration asked for more chain steps than [`MAX_MIGRATION_INDEX`].
+    #[error("migration index {k} exceeds the maximum of {max}")]
+    MigrationIndexTooLarge {
+        /// The requested migration point.
+        k: u32,
+        /// The largest accepted migration point.
+        max: u32,
+    },
+    /// A serialized device state is malformed or of an unknown version.
+    #[error("invalid report state: {0}")]
+    InvalidState(&'static str),
+    /// A sequence number above [`MAX_SEQ`].
+    #[error("sequence number {0} is out of range")]
+    SeqOutOfRange(u32),
+    /// `seq = 0` was offered as a chunk; it is reserved for the metadata object.
+    #[error("sequence number 0 is reserved for the metadata object")]
+    SeqReservedForMetadata,
+    /// A chunk (or a closure) was requested before the metadata object (seq 0)
+    /// was recorded.
+    #[error("the metadata object (seq 0) must be sealed first")]
+    MetadataRequired,
+    /// The sequence number is already recorded in this writer.
+    #[error("sequence number {0} is already sealed")]
+    DuplicateSeq(u32),
+    /// A closure was prepared: the writer seals nothing more.
+    #[error("the report is closing; no further object can be sealed")]
+    WriterClosing,
+    /// A prepared object was committed into a writer of another report.
+    #[error("the prepared object belongs to another report")]
+    ForeignPreparation,
+    /// A closing manifest is malformed, or has a shape its scheme forbids.
+    #[error("invalid manifest: {0}")]
+    InvalidManifest(&'static str),
+    /// The `seq_limit` presented with a closure is not the one its manifest
+    /// implies.
+    #[error("seq_limit does not match the manifest")]
+    SeqLimitMismatch,
+    /// The report public key is not a valid Ed25519 point.
+    #[error("invalid report public key")]
+    InvalidPublicKey,
+    /// The signature does not verify under the report public key.
+    #[error("report signature verification failed")]
+    InvalidSignature,
+}
+
+// ============================================================================
+// Shared derivation and signing helpers (legacy and chained schemes)
+// ============================================================================
+
+/// `report_master = HKDF(BIP-39 seed, "stream.report.master.v1", 32)`. Shared by
+/// the legacy keyring, the chained device state and the rescue, so the three
+/// can never start from different masters.
+fn report_master_from_seed(seed: &[u8]) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+    hkdf::sha256(seed, None, CTX_REPORT_MASTER, REPORT_MASTER_BYTES)
+}
+
+/// The directory's Ed25519 seed, `HKDF(report_master,
+/// "stream.report.directory.v1", 32)`. The chained scheme keeps the very same
+/// directory key as the legacy one, so the directory's `report_id` survives the
+/// migration.
+fn directory_seed_from_master(report_master: &[u8]) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+    hkdf::sha256(
+        report_master,
+        None,
+        CTX_REPORT_DIRECTORY,
+        ED25519_SEED_BYTES,
+    )
+}
+
+/// Turn 32 bytes of HKDF output into an Ed25519 signing key. The intermediate
+/// seed is wiped at scope exit; the `SigningKey` wipes itself on drop (dalek
+/// `zeroize` feature).
+fn signing_key_from_okm(okm: &[u8]) -> Result<SigningKey, CryptoError> {
+    if okm.len() != ED25519_SEED_BYTES {
+        return Err(CryptoError::DerivationFailed(format!(
+            "an Ed25519 seed is {ED25519_SEED_BYTES} bytes, got {}",
+            okm.len()
+        )));
+    }
+    let mut seed: Zeroizing<[u8; ED25519_SEED_BYTES]> = Zeroizing::new([0u8; ED25519_SEED_BYTES]);
+    seed.copy_from_slice(okm);
+    Ok(SigningKey::from_bytes(&seed))
+}
+
+/// SHA-256 of `bytes` as a fixed array.
+fn sha256(bytes: &[u8]) -> [u8; HASH_BYTES] {
+    let digest = Sha256::digest(bytes);
+    let mut out = [0u8; HASH_BYTES];
+    out.copy_from_slice(&digest);
+    out
+}
+
+/// Lowercase hex, the wire form of every opaque object name.
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        // Writing to a String cannot fail.
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// The 0x07 message: `report_id(16) ‖ report_pk(32)`.
+fn create_message(report_id: &[u8; REPORT_ID_BYTES], report_pk: &[u8; PK_BYTES]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(REPORT_ID_BYTES + PK_BYTES);
+    msg.extend_from_slice(report_id);
+    msg.extend_from_slice(report_pk);
+    msg
+}
+
+/// The 0x08 message: `report_id(16) ‖ filename ‖ body_sha256(32)`.
+fn write_message(
+    report_id: &[u8; REPORT_ID_BYTES],
+    filename: &[u8],
+    body_sha256: &[u8; HASH_BYTES],
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(REPORT_ID_BYTES + filename.len() + HASH_BYTES);
+    msg.extend_from_slice(report_id);
+    msg.extend_from_slice(filename);
+    msg.extend_from_slice(body_sha256);
+    msg
+}
+
+/// The 0x09 message: `report_id(16) ‖ u32_be(seq_limit) ‖ manifest_sha256(32)`.
+fn close_message(
+    report_id: &[u8; REPORT_ID_BYTES],
+    seq_limit: u32,
+    manifest_sha256: &[u8; HASH_BYTES],
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(REPORT_ID_BYTES + 4 + HASH_BYTES);
+    msg.extend_from_slice(report_id);
+    msg.extend_from_slice(&seq_limit.to_be_bytes());
+    msg.extend_from_slice(manifest_sha256);
+    msg
+}
+
+// ============================================================================
 // Public, secret-free helper
 // ============================================================================
 
@@ -121,28 +339,41 @@ pub fn report_id_from_pk(report_pk: &[u8; PK_BYTES]) -> [u8; REPORT_ID_BYTES] {
 }
 
 /// Build + sign a `create_sig` (`0x07 ‖ report_id ‖ report_pk`) under `sk`.
-/// Shared by the per-index reports and the directory (same byte layout / domain;
-/// only the signing key differs), so a layout change can never drift between them.
-fn sign_create_under(sk: &SigningKey) -> [u8; 64] {
+/// Shared by the legacy reports, the chained reports and the directory (same
+/// byte layout / domain; only the signing key differs), so a layout change can
+/// never drift between them.
+fn sign_create_under(sk: &SigningKey) -> [u8; SIG_BYTES] {
     let pk = sk.verifying_key().to_bytes();
     let id = report_id_from_pk(&pk);
-    let mut msg = Vec::with_capacity(REPORT_ID_BYTES + PK_BYTES);
-    msg.extend_from_slice(&id);
-    msg.extend_from_slice(&pk);
-    let tbs = SignatureDomain::ReportCreate.prefixed(&msg);
+    let tbs = SignatureDomain::ReportCreate.prefixed(&create_message(&id, &pk));
     sk.sign(&tbs).to_bytes()
 }
 
 /// Build + sign a `write_sig` (`0x08 ‖ report_id ‖ filename ‖ body_sha256`) under
-/// `sk`. Shared by the per-index reports and the directory.
-fn sign_write_under(sk: &SigningKey, filename: &[u8], body_sha256: &[u8; HASH_BYTES]) -> [u8; 64] {
+/// `sk`. Shared by the legacy reports, the chained reports and the directory.
+fn sign_write_under(
+    sk: &SigningKey,
+    filename: &[u8],
+    body_sha256: &[u8; HASH_BYTES],
+) -> [u8; SIG_BYTES] {
     let pk = sk.verifying_key().to_bytes();
     let id = report_id_from_pk(&pk);
-    let mut msg = Vec::with_capacity(REPORT_ID_BYTES + filename.len() + HASH_BYTES);
-    msg.extend_from_slice(&id);
-    msg.extend_from_slice(filename);
-    msg.extend_from_slice(body_sha256);
-    let tbs = SignatureDomain::ReportWrite.prefixed(&msg);
+    let tbs = SignatureDomain::ReportWrite.prefixed(&write_message(&id, filename, body_sha256));
+    sk.sign(&tbs).to_bytes()
+}
+
+/// Build + sign a `close_sig` (`0x09 ‖ report_id ‖ u32_be(seq_limit) ‖
+/// sha256(manifest)`) under `sk`. Shared by the chained writer and the legacy
+/// closure.
+fn sign_close_under(
+    sk: &SigningKey,
+    seq_limit: u32,
+    manifest_sha256: &[u8; HASH_BYTES],
+) -> [u8; SIG_BYTES] {
+    let pk = sk.verifying_key().to_bytes();
+    let id = report_id_from_pk(&pk);
+    let tbs =
+        SignatureDomain::ReportClose.prefixed(&close_message(&id, seq_limit, manifest_sha256));
     sk.sign(&tbs).to_bytes()
 }
 
@@ -171,12 +402,7 @@ impl ReportKeyring {
     /// [`CryptoError`] on an invalid mnemonic or an HKDF / mlock failure.
     pub fn from_mnemonic(mnemonic: &str, passphrase: &str) -> Result<Self, CryptoError> {
         let seed = bip39::mnemonic_to_seed(mnemonic, passphrase, Language::French)?;
-        let derived = hkdf::sha256(
-            seed.as_bytes(),
-            None,
-            CTX_REPORT_MASTER,
-            REPORT_MASTER_BYTES,
-        )?;
+        let derived = report_master_from_seed(seed.as_bytes())?;
         let mut master = [0u8; REPORT_MASTER_BYTES];
         master.copy_from_slice(&derived[..]);
         Self::from_master_array(master)
@@ -215,10 +441,7 @@ impl ReportKeyring {
         info.extend_from_slice(CTX_REPORT_KEY);
         info.extend_from_slice(&n.to_be_bytes());
         let okm = self.with_master_bytes(|m| hkdf::sha256(m, None, &info, ED25519_SEED_BYTES))?;
-        let mut seed: Zeroizing<[u8; ED25519_SEED_BYTES]> =
-            Zeroizing::new([0u8; ED25519_SEED_BYTES]);
-        seed.copy_from_slice(&okm[..]);
-        Ok(SigningKey::from_bytes(&seed))
+        signing_key_from_okm(&okm)
     }
 
     /// The public capability key `report_pk_n` for report index `n`.
@@ -272,6 +495,26 @@ impl ReportKeyring {
         ))
     }
 
+    /// `close_sig` closing legacy report `n`: `Ed25519(report_sk_n, 0x09 ‖
+    /// report_id_n ‖ u32_be(0) ‖ sha256(empty manifest))`.
+    ///
+    /// A legacy closure never lists objects: the manifest is
+    /// [`Manifest::empty`] and `seq_limit` is 0. Its purpose is to freeze the
+    /// report on the relay once the device has nothing left to send to it, so
+    /// the caller sends it only after every pending object of report `n` has
+    /// been delivered. The chained scheme never produces an empty closure.
+    ///
+    /// # Errors
+    /// [`CryptoError::DerivationFailed`] on an HKDF failure.
+    pub fn sign_legacy_close(&self, n: u32) -> Result<[u8; SIG_BYTES], CryptoError> {
+        let manifest_sha256 = Manifest::empty().sha256();
+        Ok(sign_close_under(
+            &self.report_signing_key(n)?,
+            0,
+            &manifest_sha256,
+        ))
+    }
+
     // ========================================================================
     // Report directory — the witness's authoritative `n_max` for exact rescue
     // ========================================================================
@@ -289,13 +532,8 @@ impl ReportKeyring {
 
     /// The directory's transient Ed25519 signing key (no index — a singleton).
     fn directory_signing_key(&self) -> Result<SigningKey, CryptoError> {
-        let okm = self.with_master_bytes(|m| {
-            hkdf::sha256(m, None, CTX_REPORT_DIRECTORY, ED25519_SEED_BYTES)
-        })?;
-        let mut seed: Zeroizing<[u8; ED25519_SEED_BYTES]> =
-            Zeroizing::new([0u8; ED25519_SEED_BYTES]);
-        seed.copy_from_slice(&okm[..]);
-        Ok(SigningKey::from_bytes(&seed))
+        let okm = self.with_master_bytes(directory_seed_from_master)?;
+        signing_key_from_okm(&okm)
     }
 
     /// The directory's public capability key `report_pk_directory`.
@@ -676,6 +914,49 @@ mod tests {
     }
 
     const EXP_DIR_ENTRY_NAME_0: &str = "988deb4340e1dde7d40a40e19803b163";
+
+    #[test]
+    fn legacy_close_signs_the_empty_manifest_at_limit_zero() {
+        let k = ReportKeyring::from_mnemonic(MN_FIXED, "").unwrap();
+        let n = 4;
+        let pk = k.report_pk(n).unwrap();
+        let id = k.report_id(n).unwrap();
+        let sig = k.sign_legacy_close(n).unwrap();
+        let empty = Manifest::empty().to_bytes();
+        assert_eq!(empty, b"FQM1\x00\x00\x00\x00");
+        let msg = close_message(&id, 0, &sha256(&empty));
+        assert!(verify(&pk, SignatureDomain::ReportClose, &msg, &sig));
+        assert!(verify_close(&pk, 0, &empty, &sig).unwrap().is_empty());
+        // Bound to the index and to the close domain.
+        assert!(!verify(
+            &k.report_pk(n + 1).unwrap(),
+            SignatureDomain::ReportClose,
+            &msg,
+            &sig
+        ));
+        assert!(!verify(&pk, SignatureDomain::ReportWrite, &msg, &sig));
+        // A legacy closure is never anything but empty at limit 0.
+        assert_eq!(
+            verify_close(&pk, 1, &empty, &sig).unwrap_err(),
+            ReportError::SeqLimitMismatch
+        );
+    }
+
+    #[test]
+    fn message_layouts_are_fixed_width_around_the_variable_part() {
+        let id = [0x11u8; 16];
+        let pk = [0x22u8; 32];
+        let hash = [0x33u8; 32];
+        assert_eq!(create_message(&id, &pk), [&id[..], &pk[..]].concat());
+        assert_eq!(
+            write_message(&id, b"000001.strm", &hash),
+            [&id[..], b"000001.strm", &hash[..]].concat()
+        );
+        assert_eq!(
+            close_message(&id, 0x0102_0304, &hash),
+            [&id[..], &[1, 2, 3, 4], &hash[..]].concat()
+        );
+    }
 
     #[test]
     fn debug_redacts_master() {

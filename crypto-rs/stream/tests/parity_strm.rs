@@ -22,14 +22,21 @@
 //! round-trip tests below.
 
 use frappuccino_crypto_core::identity::ArchiveIdentity;
-use frappuccino_crypto_stream::header::{
-    parse_header, HEADER_SIZE_NO_GRANTS, MODE_CHUNKED, NONCE_PREFIX_BYTES,
-};
+use frappuccino_crypto_stream::header::{HEADER_SIZE_NO_GRANTS, NONCE_PREFIX_BYTES};
+// The Kotlin parity vectors are V1/V2 blobs: only the `legacy-strm` build can
+// read them, so what serves that test is gated with it. Without the gate the
+// shipped (V3-only) configuration does not even compile this file under
+// `clippy -D warnings`.
+#[cfg(feature = "legacy-strm")]
+use frappuccino_crypto_stream::header::{parse_header, MODE_CHUNKED};
 use frappuccino_crypto_stream::{decrypt, encrypt_chunked, encrypt_single};
 use serde::Deserialize;
+#[cfg(feature = "legacy-strm")]
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::path::{Path, PathBuf};
+#[cfg(feature = "legacy-strm")]
+use std::path::Path;
+use std::path::PathBuf;
 
 fn vectors_dir() -> PathBuf {
     // tests/ are run with CARGO_MANIFEST_DIR = crypto-rs/stream.
@@ -43,6 +50,7 @@ fn vectors_dir() -> PathBuf {
 struct StrmFile {
     mnemonic: String,
     passphrase: String,
+    #[cfg_attr(not(feature = "legacy-strm"), allow(dead_code))]
     cases: Vec<Case>,
 }
 
@@ -61,6 +69,7 @@ struct Case {
 
 /// Decode the expected plaintext either from `plaintext_hex` (inline for small
 /// cases) or from a sibling `.bin` file (large cases).
+#[cfg(feature = "legacy-strm")]
 fn load_plaintext(case: &Case, dir: &Path) -> Vec<u8> {
     if let Some(hex) = &case.plaintext_hex {
         hex::decode(hex).expect("plaintext_hex decode")

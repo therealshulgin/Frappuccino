@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Internal player of the rescue. The VideoView is a SurfaceView: the activity
+  calls setSecure(true) on it after inflating this layout and BEFORE attaching
+  it to the window, which is the only moment the flag takes effect. Do not
+  replace the inflate-then-setContentView(view) sequence in the activity with
+  setContentView(R.layout...), which attaches first.
+
+  The banner at the top is shown only when the screen plays the objects kept
+  apart as not verifiable. It stays on screen for the whole session, over the
+  video, and is never hidden by the controls.
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@android:color/black">
+
+    <VideoView
+        android:id="@+id/archivePlayerVideo"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:layout_gravity="center" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top"
+        android:layout_marginTop="24dp"
+        android:gravity="center_horizontal"
+        android:orientation="vertical">
+
+        <TextView
+            android:id="@+id/archivePlayerUnverifiedBanner"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:layout_marginEnd="8dp"
+            android:layout_marginBottom="6dp"
+            android:padding="8dp"
+            android:background="@color/wa_orange"
+            android:text="@string/archive_player_unverified_banner"
+            android:textColor="@color/wa_white"
+            android:textSize="12sp"
+            android:textStyle="bold"
+            android:fontFamily="monospace"
+            android:visibility="gone" />
+
+        <TextView
+            android:id="@+id/archivePlayerPart"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:padding="6dp"
+            android:background="#88000000"
+            android:textColor="@color/wa_white"
+            android:textSize="12sp"
+            android:fontFamily="monospace" />
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/archivePlayerMessage"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:padding="12dp"
+        android:background="#88000000"
+        android:textColor="@color/wa_white"
+        android:textSize="13sp"
+        android:fontFamily="monospace"
+        android:visibility="gone" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:layout_marginBottom="16dp"
+        android:orientation="horizontal"
+        android:padding="8dp">
+
+        <TextView
+            android:id="@+id/archivePlayerPrev"
+            android:layout_width="0dp"
+            android:layout_height="44dp"
+            android:layout_weight="1"
+            android:layout_marginEnd="6dp"
+            android:gravity="center"
+            android:text="@string/archive_player_prev"
+            android:textColor="@color/wa_white"
+            android:textSize="12sp"
+            android:fontFamily="monospace"
+            android:background="#88000000"
+            android:clickable="true"
+            android:focusable="true" />
+
+        <TextView
+            android:id="@+id/archivePlayerClose"
+            android:layout_width="0dp"
+            android:layout_height="44dp"
+            android:layout_weight="1"
+            android:layout_marginEnd="6dp"
+            android:gravity="center"
+            android:text="@string/archive_player_close"
+            android:textColor="@color/wa_white"
+            android:textSize="12sp"
+            android:fontFamily="monospace"
+            android:background="#88000000"
+            android:clickable="true"
+            android:focusable="true" />
+
+        <TextView
+            android:id="@+id/archivePlayerNext"
+            android:layout_width="0dp"
+            android:layout_height="44dp"
+            android:layout_weight="1"
+            android:gravity="center"
+            android:text="@string/archive_player_next"
+            android:textColor="@color/wa_white"
+            android:textSize="12sp"
+            android:fontFamily="monospace"
+            android:background="#88000000"
+            android:clickable="true"
+            android:focusable="true" />
+    </LinearLayout>
+
+</FrameLayout>

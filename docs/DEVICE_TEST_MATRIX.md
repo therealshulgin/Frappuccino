@@ -240,7 +240,7 @@ adb logcat -v threadtime -s StreamMetrics StreamRecordingService ArchiveDownload
 - **C. FGS startup:** covered in P0-E.
 - **D. POST_NOTIFICATIONS (API 33+):** covered in P0-E item 2.
 - **E. Onboarding PIN flow:** uninstall→reinstall → walk the 4-PIN sequence → BIP-39 12-word FR generate/confirm. **PASS:** ÉTAPE 1/2 → enter 6 digits → CONFIRM step → match → next fragment. **FAIL:** "Retour" button off-screen on small displays (height_percent 0.45 + absolute 64dp top margin); PIN mismatch not flagged; CharArray mnemonic not wiped on an exception path.
-- **F. Scoped storage archive rescue (API 29+):** download a small report → file lands in `Downloads/Frappuccino/…mp4` via MediaStore without legacy WRITE perm; survives 30 s screen-off (WifiLock). 
+- **F. Archive rescue and export (API 29+):** verify a small report → its objects land **encrypted** under the app's private `noBackupFilesDir/archive_view/` and play in the internal player; nothing is written to `Download/`; the rescue survives 30 s screen-off (WifiLock). Export: the system folder picker (`ACTION_OPEN_DOCUMENT_TREE`) opens after the warning, the exported files carry neutral names, and on a device with no picker the app shows that export is not possible. (Earlier versions wrote decrypted files to `Downloads/Frappuccino/` via MediaStore; the emergency wipe now removes what this installation put there.) 
 - **G. Screen size/density:** run onboarding on small/low-dpi, very-high-dpi, tablet, and notched units; `dumpsys display | grep -E "Width|Height|Density"`; screenshot to verify nothing clipped/off-screen/under-notch.
 - **H. OEM permission-dialog variants:** stock vs One UI vs ColorOS vs MIUI — `getprop ro.build.fingerprint`, screenshot each; behavior must stay consistent (grant→record, deny→toast+fail).
 
@@ -251,7 +251,7 @@ adb logcat -v threadtime -s StreamMetrics StreamRecordingService ArchiveDownload
 - **P1:** only one of CAMERA/RECORD_AUDIO requested.
 - **P1:** CharArray mnemonic not wiped on exception → secret lingers in heap.
 - **P1:** MIUI/One UI hidden-menu routing → silent setup failure.
-- **P1:** scoped-storage archive write fails on API 29+.
+- **P1:** export through the system folder picker fails or leaves a partial copy on API 29+; the internal player cannot decrypt or play a verified chunk.
 - **P2:** PIN keypad text size too small/large at xxxhdpi.
 - **P2:** wordmark clipped under notch.
 

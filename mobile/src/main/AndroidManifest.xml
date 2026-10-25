@@ -95,6 +95,15 @@
             android:screenOrientation="portrait"
             android:theme="@style/AppTheme.NoActionBar" />
 
+        <!-- Internal player of the rescue. Handles rotation itself, so turning
+             the phone does not tear down the surface and re-decrypt the window. -->
+        <activity
+            android:name=".archive.ArchivePlayerActivity"
+            android:configChanges="keyboardHidden|orientation|screenSize|screenLayout|smallestScreenSize"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:theme="@style/AppTheme.NoActionBar" />
+
         <activity
             android:name=".views.activity.StreamSettingsActivity"
             android:configChanges="keyboardHidden|orientation|screenSize"

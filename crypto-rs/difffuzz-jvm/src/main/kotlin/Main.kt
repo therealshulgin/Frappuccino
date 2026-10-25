@@ -45,6 +45,12 @@ private fun reprErr(e: FfiException): String {
         is FfiException.Network -> "Network" to e.detail
         is FfiException.Internal -> "Internal" to e.detail
         is FfiException.Io -> "Io" to e.detail
+        is FfiException.WriterClosed -> "WriterClosed" to ""
+        is FfiException.WriterBusy -> "WriterBusy" to ""
+        is FfiException.NoQueueKey -> "NoQueueKey" to ""
+        is FfiException.EnvelopeCorrupt -> "EnvelopeCorrupt" to e.detail
+        is FfiException.ReportRefused -> "ReportRefused" to e.detail
+        is FfiException.RateLimited -> "RateLimited" to e.retryAfterSecs.toString()
     }
     return "err:$variant:$detail"
 }

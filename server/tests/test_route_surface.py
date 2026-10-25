@@ -59,6 +59,7 @@ SURFACE_ATTENDUE = {
     ("GET", "/redoc"),
     ("GET", "/health"),
     ("PUT", "/file/{report_id}/{filename}"),
+    ("POST", "/close/{report_id}"),
     ("POST", "/auth/challenge"),
     ("POST", "/auth/v2/enroll"),
     ("POST", "/auth/v2/verify"),

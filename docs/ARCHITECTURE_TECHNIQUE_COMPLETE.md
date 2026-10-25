@@ -8,7 +8,7 @@
 > listés en [§13](#13-références-internes).
 > **En cas de divergence entre ce document et le code, le code fait foi.**
 >
-> *Dernière revue : 2026-09-04.*
+> *Dernière revue : 2026-10-25.*
 
 ---
 
@@ -44,9 +44,14 @@ transport, modèle de confiance - est remplacé.
 
 Le principe central est une **asymétrie de capacités** entre le device et son détenteur
 légitime : le téléphone peut **chiffrer** et **signer**, mais ne peut **jamais déchiffrer
-son propre passé** ni **forger des signatures pour des sessions antérieures**. La capacité
-de lecture appartient exclusivement à une phrase BIP-39 de 12 mots, écrite sur papier,
-qui ne touche jamais le stockage du device après l'enrôlement. Ce design est une adaptation
+son propre passé**, et il ne peut plus **étendre ni réécrire un rapport clos** : chaque
+rapport est signé pendant l'enregistrement par une clé qui lui est propre, effacée de
+l'appareil à la clôture, et le relais refuse tout nouvel objet dans un rapport dont il a
+reçu la clôture signée (§8.7). Cette seconde propriété vaut pour les rapports **clos** ;
+elle ne couvre ni le rapport en cours d'enregistrement, ni les rapports ouverts après une
+extraction de l'état de l'appareil (§10.1). La capacité de lecture appartient
+exclusivement à une phrase BIP-39 de 12 mots, écrite sur papier, qui ne touche jamais le
+stockage du device après l'enrôlement. Le ratchet d'authentification est une adaptation
 du mécanisme de forward security du consensus **Algorand** (clés de participation éphémères,
 détruites séquentiellement après usage) au cas d'usage du témoignage de terrain.
 
@@ -62,18 +67,27 @@ Propriétés saillantes, dans l'état courant du code :
 - **Ratchet éphémère batché** : lignée de signatures Ed25519 forward-secure. Chaque
   authentification consomme une clé à usage unique, détruite immédiatement ; chaque
   batch de 50 clés est authentifié par une signature du batch précédent, remontant à
-  l'identité long-terme. La forward secrecy de ce protocole est **prouvée en Tamarin**
-  (Dolev-Yao, 10/10 lemmes), sa machine à états **model-checkée en TLA+/TLC**.
+  l'identité long-terme. La forward security de **l'authentification** est **prouvée en
+  Tamarin** (Dolev-Yao, lemme `forward_secrecy_auth`), la machine à états du ratchet
+  **model-checkée en TLA+/TLC**. Ces preuves portent sur l'authentification, pas sur le
+  contenu des rapports.
+- **Rapports signés à la production, figés à la clôture** : chaque objet d'un rapport
+  (métadonnées, chunk, clôture) est signé au moment où il est produit, et la signature
+  voyage avec lui dans une enveloppe de file ; l'envoi ne signe jamais. À l'arrêt de
+  l'enregistrement, la clôture (`0x09`) engage la liste exacte des objets, puis la clé
+  du rapport est effacée ; l'état conservé par l'appareil ne permet plus de la redériver
+  (§8.7).
 - **Séparation de domaine explicite des signatures** (R-C-1, juin 2026) : tag d'un octet
   par contexte. Surfaces serveur-miroir : `0x01` AuthChallenge, `0x02` BatchRotation,
   `0x03` Enrollment (`0x04` ArchiveAuth est **réservé mais retiré** depuis le passage des
   archives en mode relais-aveugle, §8.7) ; capacités report relais-aveugles `0x07`
-  ReportCreate / `0x08` ReportWrite ; `0x05`/`0x06` sont **réservés et retirés** au
-  même titre que `0x04` (le manifeste signé a été supprimé par le recul métadonnées
-  du 2026-06-25, §4.4). Source Rust ⇄ miroir serveur byte-identiques.
+  ReportCreate / `0x08` ReportWrite / `0x09` ReportClose ; `0x05`/`0x06` sont **réservés
+  et retirés** au même titre que `0x04` (le manifeste signé a été supprimé par le recul
+  métadonnées du 2026-06-25, §4.4). Source Rust ⇄ miroir serveur byte-identiques.
 - **Relais aveugle** : FastAPI + MinIO ne stockent que des blobs STRM opaques. Le serveur
   ne voit jamais de clair, ne logge pas d'IP, vérifie des signatures et impose
-  anti-rejeu + anti-double-dépense + monotonie de rotation.
+  anti-rejeu + anti-double-dépense + monotonie de rotation, et refuse tout nouvel objet
+  dans un rapport clos.
 - **Capture HEVC temps réel** via MediaCodec piloté par un wedge OpenGL ES (CameraX en
   amont), chunks de 5 s chiffrés et uploadés au fil de l'eau : la vidéo est à l'abri
   **même si le téléphone est saisi en cours d'enregistrement**.
@@ -102,9 +116,10 @@ le device est le point de défaillance.
 
 Frappuccino inverse le problème : la donnée **quitte** le device au fil de la capture,
 chiffrée vers une clé dont la moitié privée n'existe sur aucune machine. Ce qui reste sur
-le téléphone après coup ne permet ni de relire, ni de réécrire le passé. La saisie du
-device devient un événement *borné* : l'adversaire obtient au pire la capacité de signer
-quelques sessions futures (jusqu'à révocation), jamais le contenu.
+le téléphone après coup ne permet pas de relire le passé, ni de réécrire un rapport clos.
+Ce qu'il permet encore est dit en §10.1 : signer le rapport en cours d'enregistrement au
+moment de la saisie et les rapports ouverts après elle, sans limite de durée ; jamais lire
+le contenu.
 
 ### 1.2 Fork de Tella FOSS
 
@@ -158,7 +173,7 @@ construite explicitement **contre** le risque :
 
 | Acteur | Rôle | Ce qu'il détient / voit |
 |---|---|---|
-| **Device militant** | Capture + chiffre + signe + uploade | Clés **publiques** Ed25519/X25519, batch courant de 50 clés éphémères Ed25519, blob ratchet scellé par PIN |
+| **Device militant** | Capture + chiffre + signe + uploade | Clés **publiques** Ed25519/X25519, batch courant de 50 clés éphémères Ed25519, blob ratchet scellé par PIN, état de rapport scellé par la session PIN (maillon courant de la chaîne + graine d'annuaire, §8.7), clé de file sous Keystore, file d'enveloppes chiffrées |
 | **Serveur relais** | Stocke des blobs opaques, vérifie les signatures, impose le protocole | Pks Ed25519 pseudonymes, batches publics, blobs chiffrés, tailles/timestamps |
 | **Phrase BIP-39** (papier) | Seule capacité de lecture et de récupération | Tout - via `ArchiveModeActivity` (Android) ou `frappuccino-cli` (desktop) |
 
@@ -173,8 +188,8 @@ construite explicitement **contre** le risque :
 | Voleur opportuniste | Saisit le téléphone, regarde l'écran | App verrouillée, `FLAG_SECURE`, stealth screen, auto-lock du ratchet à l'inactivité |
 | Police sans forensique | Exige le PIN, fouille la galerie | Le PIN n'ouvre que le ratchet (signatures futures) ; aucun contenu local lisible |
 | Police avec **Cellebrite/GrayKey** | Extraction storage, brute-force PIN offline | Argon2id 256 MiB×4 + deny-list ; même PIN cassé : **aucun stream passé déchiffrable** (pas de clé privée X25519 sur le device) |
-| Coercition sur le PIN (« rubber-hose » partiel) | PIN donné sous contrainte | L'adversaire peut signer des sessions **futures** (jusqu'à révocation), pas lire le passé ni le forger |
-| Saisie **en cours d'enregistrement** | Device ouvert, session active | Les chunks déjà chiffrés/uploadés sont hors d'atteinte ; voir §10.1 pour l'état RAM courant |
+| Coercition sur le PIN (« rubber-hose » partiel) | PIN donné sous contrainte | L'adversaire peut s'authentifier et signer les rapports **ouverts après** ce moment, et écrire dans l'annuaire (§10.1) ; il ne lit pas le passé et ne peut plus étendre un rapport **clos** |
+| Saisie **en cours d'enregistrement** | Device ouvert, session active | Les chunks déjà chiffrés/uploadés sont hors d'atteinte ; la clé du rapport en cours est en mémoire jusqu'à sa clôture, voir §10.1 |
 | Saisie du serveur relais | Tout le stockage + registres | Blobs STRM opaques, pks pseudonymes, métadonnées (§8.5). Aucun plaintext, aucune clé privée |
 | Serveur **+** device **+** PIN | Scénario cumulatif | Perd encore : la clé privée X25519 n'existe nulle part ailleurs que dans la phrase |
 | Interception réseau / MITM | Position réseau active | TLS 1.2/1.3 avec **pin SPKI** par verifier rustls custom (pas de CA store système), **jeu de 3 pins** acceptés en union constant-time (primaire + 2 break-glass, dont une clé tenue off-host) ; test de régression MITM automatisé |
@@ -228,9 +243,12 @@ les garder distinctes est nécessaire pour juger correctement toute faiblesse.
   (§10.7 livré, heap-dump session active = `Bearer eyJ=0`) ; et même un bearer
   hypothétiquement lu reste **neutralisé côté serveur** (scope-segregé + **write-once**,
   combo-1 : ni lecture, ni suppression, ni écrasement des rushes) ;
-- une fuite d'état ratchet ne donne au pire qu'une **capacité de signature *future*
-  bornée**, détectable et révocable, **jamais du contenu passé** (forward secrecy prouvée
-  Tamarin/TLA+).
+- une fuite de l'état de l'appareil (ratchet, état de rapport) donne une **capacité de
+  signature *future***, **jamais du contenu passé** : la confidentialité du passé tient à
+  l'absence de `x25519_sk`, pas au ratchet. Cette capacité n'est **pas bornée dans le
+  temps**, aucun canal ne la signale au témoin, et il n'existe pas de route de révocation
+  d'identité ; elle porte sur le rapport en cours et sur ceux ouverts ensuite, pas sur les
+  rapports déjà clos (§10.1).
 
 ⇒ Ces fuites RAM résiduelles sont des cibles de **durcissement / défense-en-profondeur**,
 **pas** des défauts qui rendraient la confiscation ou la destruction capables d'empêcher le
@@ -249,19 +267,27 @@ Tout le design dérive de cette phrase. Sur le device, après enrôlement :
 
 ```
 ✅ Clé publique X25519      → peut CHIFFRER (sceller des clés de session)
-✅ Batch éphémère courant   → peut SIGNER (≤ 50 sessions, puis rotation)
+✅ Batch éphémère courant   → peut S'AUTHENTIFIER (49 slots, le dernier réservé à la rotation)
 ✅ Graine du batch suivant  → peut faire avancer le ratchet sans la seed
+✅ État de rapport (i, C_i, graine d'annuaire), scellé par la session PIN
+                            → peut OUVRIR le rapport i et les suivants, écrire dans l'annuaire
+✅ Graine de provenance, scellée par la session PIN → sel des horodatages OTS (opt-in)
 
 ❌ Clé privée X25519        → ne peut PAS DÉCHIFFRER (jamais persistée)
-❌ Clés éphémères passées   → détruites à l'usage (forward secrecy)
+❌ Clés éphémères passées   → détruites à l'usage (forward security de l'authentification)
+❌ Clés des rapports clos   → effacées à la clôture, non redérivables depuis l'état (§8.7)
+❌ report_master            → absent de l'appareil après l'inscription ou la migration
 ❌ Seed / phrase BIP-39     → jamais stockée (papier uniquement)
 ```
 
-Conséquence opérationnelle : la valeur forensique d'un device saisi tend vers zéro à
-mesure que la session s'éloigne. L'attaquant qui obtient *tout* (storage + PIN + RAM)
-obtient la capacité de **se faire passer pour** le militant sur quelques sessions futures
-- capacité bornée, détectable (le serveur trace les slots consommés), révocable - mais
-pas un seul octet de contenu passé.
+Conséquence opérationnelle : l'attaquant qui obtient *tout* (storage + PIN + RAM) ne lit
+pas un seul octet de contenu passé et ne peut plus étendre un rapport clos. Il obtient la
+capacité de **se faire passer pour** le militant : s'authentifier, signer le rapport en
+cours au moment de l'extraction et tous les rapports ouverts après elle, écrire dans
+l'annuaire. Cette capacité n'est bornée ni dans le temps ni en nombre de rapports (le
+ratchet tourne avec la graine du batch suivant), aucun canal ne la signale au témoin, et
+il n'existe pas de route de révocation d'identité. Le détail et ce qui en limite la portée
+sont en §10.1.
 
 ### 3.2 L'inspiration Algorand
 
@@ -280,7 +306,7 @@ La transposition Frappuccino :
 | Participation keys par lots (key dilution √N) | **Batches de 50 clés Ed25519 éphémères** dérivés par chaîne HKDF |
 | Une clé par round, détruite après | **Une clé par session/auth, wipée immédiatement** après signature |
 | Chaîne d'attestation des lots | **RotationProof** : chaque batch signé par un slot du batch précédent, jusqu'à la signature d'enrôlement par la clé long-terme |
-| Impossible de forger le passé | **Forward secrecy des signatures, prouvée Tamarin** (§9.2.5) |
+| Impossible de forger le passé | **Forward security de l'authentification, prouvée Tamarin** (§9.2.5) ; pour le contenu, **rapport clos figé** : clé effacée à la clôture et refus du relais (§8.7), couvert par des tests, sans modèle Tamarin |
 
 S'y ajoute une dimension absente d'Algorand parce que propre au témoignage : la
 **séparation chiffrement/déchiffrement**. Algorand protège l'intégrité de l'histoire ;
@@ -330,8 +356,8 @@ runtime et non-wipeables, le GC déplace les buffers, le JIT peut élider un wip
 
 La réponse : **tout secret matériel vit en Rust**. PIN et mnemonic traversent la
 frontière UniFFI en `bytes` et sont consommés côté Rust en `Zeroizing` ; le plaintext
-vidéo est lu, chiffré et écrit par Rust (`strm_encrypt_file`) sans jamais monter sur la
-heap JVM ; l'effacement est garanti au niveau **IR compilateur** (§9.2.1), pas au niveau
+vidéo est lu, chiffré, signé et écrit en enveloppe par Rust (`ReportWriter.seal_chunk_file`)
+sans jamais monter sur la heap JVM ; l'effacement est garanti au niveau **IR compilateur** (§9.2.1), pas au niveau
 des intentions. Le wipe côté Kotlin subsiste uniquement pour les buffers de saisie UI
 (`SecureWipe`), en défense en profondeur.
 
@@ -358,8 +384,9 @@ des intentions. Le wipe côté Kotlin subsiste uniquement pour les buffers de sa
 complet (50 keypairs éphémères), la graine `chain_1` - rien d'autre. La `sk` Ed25519
 long-terme a servi exactement un usage avant destruction : signer le batch_0
 (domaine `0x03`). La récupération d'archive ne passe plus par elle : depuis le modèle de
-reports relais-aveugles (§8.7), l'accès aux archives est **sans identité**, autorisé par
-les clés de capacité dérivées de la phrase (domaines `0x07`/`0x08`), et le domaine
+reports relais-aveugles (§8.7), l'accès aux archives est **sans identité** (connaître le
+`report_id` dérivé de la phrase suffit à lire), les écritures sont autorisées par les clés
+de capacité dérivées de la phrase (domaines `0x07`/`0x08`/`0x09`), et le domaine
 d'authentification d'archive historique `0x04` est **réservé mais retiré**.
 
 **Fingerprint de vérification.** Le device dérive aussi un fingerprint lisible de l'identité -
@@ -459,7 +486,7 @@ différentes, et écart de longueur entre le challenge d'auth (40 octets `nonce�
 message de rotation (1600 octets `concat(50 pk)`). Pas une vulnérabilité exploitable en
 l'état, mais une surface de forge en attente du prochain changement d'endpoint ou de
 format. Le fix (commit `da56da4`, modèle Tamarin actualisé) rend la séparation
-**explicite et structurelle**. L'espace de tags compte aujourd'hui huit contextes
+**explicite et structurelle**. L'espace de tags compte aujourd'hui neuf contextes
 (`signature_domain.rs`, enum `SignatureDomain` et son test de gel
 `signature_domain_surface_is_frozen` — cité par symbole, les plages de lignes de ce
 document ayant déjà pourri une fois), répartis en trois familles :
@@ -473,11 +500,14 @@ document ayant déjà pourri une fois), répartis en trois familles :
 | `0x05` | `ProvenanceManifest` | (clé provenance `P`) | (n/a) | **réservé, retiré** (recul métadonnées 2026-06-25) |
 | `0x06` | `ProvenanceKeyAttestation` | (Ed25519 long-terme) | (n/a) | **réservé, retiré** (recul métadonnées 2026-06-25) |
 | `0x07` | `ReportCreate` | clé report `R_n` (dérivée seed) | `report_id(16) ‖ report_pk(32)` | `PUT /file/{rid}/{name}` 1er chunk (miroir serveur) |
-| `0x08` | `ReportWrite` | clé report `R_n` (dérivée seed) | `report_id(16) ‖ filename ‖ sha256(body)(32)` | `PUT /file/{rid}/{name}` chaque chunk (miroir serveur) |
+| `0x08` | `ReportWrite` | clé report `R_n` (dérivée seed) | `report_id(16) ‖ filename ‖ sha256(body)(32)` | `PUT /file/{rid}/{name}` chaque objet (miroir serveur) ; revérifiée au secours |
+| `0x09` | `ReportClose` | clé report `R_n` (dérivée seed) | `report_id(16) ‖ u32_be(seq_limit) ‖ sha256(manifest)(32)` | `POST /close/{rid}` (miroir serveur) ; revérifiée au secours |
 
 Source de vérité Rust : [`crypto-rs/core/src/signature_domain.rs`](../crypto-rs/core/src/signature_domain.rs) ;
 miroir serveur byte-identique : [`server/app/signature_domain.py`](../server/app/signature_domain.py)
-(`0x01`-`0x04` et `0x07`/`0x08` y ont une constante ; `0x05`/`0x06` n'en ont jamais
+(`0x01`-`0x04` et `0x07`-`0x09` y ont une constante ; le test serveur
+`test_signature_domain_mirror.py` vérifie le miroir, et `test_report_close_kat.py` vérifie
+en Python des signatures `0x09` figées par Rust, sans jamais re-signer ; `0x05`/`0x06` n'en ont jamais
 eu, ayant été hors-ligne quand on les croyait vivants). Attention à ne pas confondre
 deux choses : `0x04` garde une constante réservée côté serveur
 (`SIG_DOMAIN_ARCHIVE_AUTH`, pour que l'octet n'y soit jamais réutilisé non plus) mais
@@ -564,17 +594,25 @@ Propriétés :
   la mutation à 98-100 % et les tests de bornes ±1.
 
 Le déchiffrement n'existe que dans deux contextes : mode archive (phrase saisie,
-`x25519_sk` re-dérivée en RAM, wipée à la fermeture) et CLI desktop. Le chemin FFI
-est `archive_download_and_decrypt`, qui déchiffre et écrit le clair **à l'intérieur
-de Rust** ; le legacy qui copiait le plaintext vers la JVM a été scellé hors FFI
-(audit 8.1.6 #2). Cette section nommait `strm_decrypt_to_file`, qui n'a en fait
-jamais eu d'appelant Kotlin et a été retiré de la surface le 2026-09-03 (la
-fonction Rust reste, elle porte deux tests de bout en bout).
+`x25519_sk` re-dérivée en RAM, wipée à la fermeture) et CLI desktop. Sur Android, le
+secours télécharge d'abord l'objet **chiffré** sur disque (`archive_fetch_object`, qui
+rend aussi son empreinte et la signature d'écriture que le relais a gardée), le vérifie
+(§7.4), et ne le déchiffre qu'**ensuite**, fichier à fichier dans Rust
+(`strm_decrypt_to_file`), vers le stockage privé de l'application : le clair ne
+traverse pas la JVM. Le legacy qui copiait le plaintext vers la JVM avait été scellé
+hors FFI (audit 8.1.6 #2) ; l'ancien chemin qui téléchargeait et déchiffrait en un appel,
+sans vérifier l'origine, a été retiré.
 
 ### 4.6 Stockage local : PIN store double-protégé
 
-Le seul secret persistant du device est le blob ratchet, sous **deux couches
-indépendantes** :
+Les secrets persistants du device sont le blob ratchet, l'état de rapport
+(`report_state.bin`, §8.7) et la graine de provenance. Le blob ratchet est rangé sous
+**deux couches indépendantes**, décrites ci-dessous ; l'état de rapport est un fichier
+possédé par Rust, scellé par la clé de session PIN (même dérivation Argon2id, AAD
+`frappuccino-report-state-v2`), qui ne traverse jamais la JVM. S'y ajoute la **clé de
+file**, 32 octets aléatoires qui scellent les en-têtes des enveloppes en attente (§6.3) :
+elle est rangée dans un `EncryptedFile` sous la clé maîtresse du Keystore, donc au niveau
+de protection de la couche plateforme seule, sans PIN.
 
 1. **Couche crypto (la vraie)** : Argon2id (`m = 256 MiB, t = 4, p = 1`, salt 16 o)
    dérive une clé de 32 o depuis le PIN → XChaCha20-Poly1305 avec AAD versionnée
@@ -601,7 +639,9 @@ garde aucun contenu**.
   type `Zeroizing`, lui réservé aux copies de pile transitoires `seed`/`signer_seed`), **et
   pas mlock'd** (décision assumée : Android n'a pas de swap disque, seulement de la zram -
   cf. revue de design §2.6) ; `mlock`/`LockedSecret` couvre les secrets dérivés de la phrase
-  (`report_master` §8.7, identité, provenance). JWT d'upload tenu **côté Rust** dans un holder
+  (identité, provenance, et le `report_master` legacy le temps de la migration, §8.7). Le
+  maillon de chaîne, la graine d'annuaire et la clé du rapport en cours sont, comme le
+  ratchet, zéroïsés au `Drop` sans être `mlock`'d. JWT d'upload tenu **côté Rust** dans un holder
   `Zeroizing` (`UPLOAD_JWT`, stashé par `verify()`), jamais sur disque ni dans un Intent.
   `UploadAuthHolder` n'en est qu'une façade fine : il n'expose que le bit de présence ou,
   pour une requête, une copie transitoire immédiatement relâchée. Le bearer ne traverse
@@ -619,7 +659,9 @@ garde aucun contenu**.
 | Propriété | Mécanisme | Niveau de preuve |
 |---|---|---|
 | Confidentialité des streams vs device saisi | Pas de `x25519_sk` sur le device ; scellement par blob | Design + revue ; vérité d'implémentation couverte par tests/parité/fuzz |
-| Forward secrecy des signatures | Wipe immédiat + HKDF one-way + rotation | **Tamarin** `forward_secrecy_auth` (Dolev-Yao) ; wipe prouvé non-élidé en **LLVM IR** |
+| Forward security de l'authentification | Wipe immédiat + HKDF one-way + rotation | **Tamarin** `forward_secrecy_auth` (Dolev-Yao) ; wipe prouvé non-élidé en **LLVM IR**. Porte sur l'authentification, pas sur les rapports |
+| Rapport clos figé | Clé du rapport effacée à la clôture, état avancé non redérivable (chaîne HKDF) ; le relais refuse tout nom hors de l'ensemble déclaré une fois la clôture `0x09` enregistrée | Tests Rust (chaîne, écrivain, KAT `report_chain_kat.rs`) et pytest (`test_report_close.py`, `test_report_tombstone.py`, KAT croisé `test_report_close_kat.py`). **Pas de modèle Tamarin des rapports.** Ne couvre pas le rapport en cours ni ceux ouverts après une extraction (§10.1) |
+| Authenticité des objets au secours | `write_sig` (`0x08`) et clôture (`0x09`) revérifiées sous la `report_pk` **re-dérivée de la phrase**, jamais sous une clé reçue du relais ; ce qui ne vérifie pas est exclu et compté | Tests Rust de `ReportRescue` et du secours FFI ; parité de code Android/CLI (même module Rust) |
 | Authentification de l'upload | Challenge-response Ed25519, domaine `0x01` | **Tamarin** `auth_slot_origin` |
 | Anti-rejeu | Nonce TTL 60 s à pop atomique + usage unique des slots persisté | **Tamarin** `nonce_use_once` + **TLA+** `AntiReplay` (exhaustif borné) |
 | Anti-rollback / monotonie | `batch_number` strictement croissant côté serveur | **TLA+** `NoRollback`/`MonotoneBatch` + tests concurrence serveur |
@@ -666,13 +708,26 @@ prod** ; `pin_store_seal` a été retiré de la surface le 2026-09-03, la justif
 `open`. Les chemins prod scellent/ouvrent in-crate via le holder PIN-session
 `pin_session_*` ;
 `open_extended`/`seal_with_key`/`open_with_key` retirés à la migration no-export R-CR-1, §8.8),
-chiffrement fichier (`strm_encrypt_file` : Rust lit le MP4 en `Zeroizing`, écrit le STRM - le
-plaintext ne traverse pas la JVM), `EphemeralRatchet` (`sign_and_advance`, `advance_batch`),
-`EnrollmentKit` (`sign_enrollment` - domaine `0x03` unique ; le `0x04` ArchiveAuth /
-`sign_archive_challenge` a été **retiré** avec le modèle relais-aveugle, cf. §4.4),
-`ArchiveIdentity`, `StreamServerClient` (challenge/verify/rotate + les **trois** méthodes
-archive `archive_list_blobs`/`archive_download_and_decrypt`/`archive_download_raw` ; une 4ᵉ fn
-Rust `archive_download_blob` reste interne, non exposée à l'UDL), `secure_delete_file`.
+l'**état de rapport** (`pin_session_create_report_state` à l'inscription,
+`pin_session_migrate_report_state` à la migration, `pin_session_open_report` qui rend un
+écrivain, `report_state_wipe`), l'**écrivain de rapport** `ReportWriter`
+(`seal_directory_entry`, `seal_metadata`, `seal_chunk_file` : Rust lit le MP4 en
+`Zeroizing`, le chiffre, le signe et écrit l'enveloppe - le plaintext ne traverse pas la
+JVM -, `close_report`, `abort`, plus `report_writer_abort_live` pour l'effacement
+d'urgence), la **file d'enveloppes** (`queue_key_*`, `envelope_inspect`,
+`upload_send_envelope` qui construit l'URL depuis l'enveloppe et la vérifie avant tout
+envoi), la conversion legacy (`legacy_convert_*`, `legacy_write_closure`), l'horodatage
+(`ots_ticket_*`, `pin_session_seal_ots_proof`, `ots_proof_status`), `EphemeralRatchet`
+(`sign_and_advance`, `advance_batch`), `EnrollmentKit` (`sign_enrollment` - domaine `0x03`
+unique ; le `0x04` ArchiveAuth / `sign_archive_challenge` a été **retiré** avec le modèle
+relais-aveugle, cf. §4.4), `ArchiveIdentity`, le **secours** `ReportRescue` /
+`RescuePlanner` / `ReportCheck` (énumération, vérification par objet et par clôture,
+verdict), `StreamServerClient` (challenge/verify/rotate + `archive_list`, qui rend la liste
+et la clôture, et `archive_fetch_object`, qui télécharge le chiffré sur disque),
+`strm_decrypt_to_file`, `secure_delete_file`. Les anciens points d'entrée qui chiffraient
+sans signer (`strm_encrypt_file`), signaient à l'envoi (`upload_put_report_chunk`,
+`upload_put_directory_entry`) ou téléchargeaient sans vérifier (`archive_list_blobs`,
+`archive_download_and_decrypt`, `archive_download_raw`) ont été retirés de la surface.
 
 Deux choix structurants :
 
@@ -782,31 +837,61 @@ chunk + tripwire de synchro `chunkStartSkew` loggé à chaque chunk).
 Chaque chunk de 5 s suit, en continu :
 
 ```
-onChunkReady → strm_encrypt_file (Rust, Zeroizing) → blob STRM
-  → secure_delete du MP4 clair → ChunkUploadQueue (filesDir, persistante)
-  → WorkManager ChunkUploadWorker : PUT idempotent HTTP/2, bearer tenu côté Rust,
-    backoff exponentiel, concurrence adaptative 1-6, circuit-breaker 507
+onChunkReady → exécuteur mono-thread FIFO → ReportWriter.seal_chunk_file(seq) (Rust)
+  : lit le MP4 (Zeroizing), le chiffre en STRM, signe 0x08, écrit l'enveloppe
+    (.part → sync_all → rename → fsync du répertoire), PUIS l'enregistre au manifeste
+  → secure_delete du MP4 clair (seulement après succès)
+  → EnvelopeQueue (filesDir/stream_envelopes, persistante)
+  → WorkManager ChunkUploadWorker, un job par enveloppe : upload_send_envelope (Rust
+    revérifie l'enveloppe, construit l'URL, PUT), bearer tenu côté Rust, backoff
+    exponentiel, concurrence adaptative 1-6, circuit-breaker 507
 ```
+
+**Signature à la production, jamais à l'envoi.** Au début de l'enregistrement, l'appareil
+ouvre le rapport suivant (`pin_session_open_report` : l'état avance et est réécrit
+durablement **avant** que l'écrivain soit rendu), scelle l'entrée d'annuaire et le JSON de
+métadonnées (seq 0) ; un échec à ce stade annule l'écrivain et l'enregistrement ne démarre
+pas. Chaque chunk reçoit ensuite son **numéro de capture** (seq ≥ 1) et devient un objet
+`NNNNNN.strm`. Un échec de scellement est réessayé un nombre borné de fois ; au-delà, le
+MP4 est effacé et compté **perdu**, et le compteur est affiché. À l'arrêt, la clôture est
+la **dernière** tâche de l'exécuteur, soumise après le retour réel du `stop()` de
+l'enregistreur ; le service reste au premier plan, wake lock tenu, jusqu'à l'écriture de
+l'enveloppe de clôture, puis la clé du rapport est effacée. Une borne de sécurité longue
+force la clôture si l'enregistreur ne rend pas la main, et tout chunk livré ensuite est
+compté perdu et affiché. Une enveloppe de file porte la charge utile exacte à envoyer et
+un en-tête chiffré (XChaCha20-Poly1305 sous la clé de file) qui contient l'adresse du
+rapport, les signatures et le nom de l'objet ; avant tout envoi, Rust déchiffre cet
+en-tête, re-hache la charge utile, vérifie `report_id = H(pk)` et la signature : une
+enveloppe qui ne vérifie pas n'est jamais envoyée, ni re-signée (statut
+`envelope_corrupt`). Une enveloppe n'est effacée que lorsque le relais la détient (2xx) ;
+un refus définitif la range dans `stream_envelopes_failed/`, comptée et affichée jusqu'à
+l'effacement d'urgence. Une enveloppe refusée ne peut pas repartir : elle ne peut être
+re-signée, et la clé de son rapport n'existe plus (résidu R5, §10.2).
 
 **Garde-fou d'hygiène (F-01, cross-audit 2026-06-30).** Si un MP4 de chunk se trouve
 **finalisé mais pas encore chiffré** lors d'une mort anormale du process (panic en plein
-`strm_encrypt_file`, kill OEM), `CaptureScratchCleaner.purgeOrphanChunks` secure-delete
-**tout** `.mp4` orphelin (quelle que soit sa taille) du répertoire de scratch -
-**synchroniquement avant le bind caméra** au démarrage du service, et de nouveau à
-`onDestroy`. Le contrôle at-rest porteur reste le FBE Android ; cette purge est une
+scellement, kill OEM), plus rien ne peut le sceller : la clé de l'écrivain est morte
+avec le process. **Au démarrage du process** (`MyApplication`, avant tout enregistrement),
+le répertoire de scratch est renommé de façon synchrone puis écrasé hors du thread
+principal (`CaptureScratchCleaner.detachForStartup`), et une passe interrompue est
+reprise au démarrage suivant. `CaptureScratchCleaner.purgeOrphanChunks` secure-delete
+aussi **tout** `.mp4` orphelin (quelle que soit sa taille) **avant le bind caméra** au
+démarrage du service, et en fin de session **après la clôture du rapport** ; un MP4 non
+vide trouvé à ce moment-là est compté perdu. Le contrôle at-rest porteur reste le FBE Android ; cette purge est une
 défense en profondeur qui ferme la fenêtre « clair résiduel » entre la finalisation MP4 et
 son chiffrement.
 
 Le bearer d'upload est toujours **détenu côté Rust** (`Zeroizing`, jamais en `String`
 JVM), et l'upload du chunk est **Rust-only par construction** (design verrouillé) : les
-en-têtes de capacité sont signés dans le keyring FFI, il n'existe **aucun chemin OkHttp**
-de repli côté worker (un PUT OkHttp serait identity-based, donc rejeté par le relais
-aveugle). Un binding natif malsain remonte en `Throwable` → `Result.retry()` (le blob
-reste sur disque pour la tentative suivante), **pas** en bascule de transport ;
-l'ancien flag `enabled` + « filet OkHttp » a été retiré à l'audit 2026-06-26 (R-CR-5 :
-zéro lecteur, le repli décrit n'existait pas). Le transport Rust route le PUT du chunk,
-le POST report et la recovery entièrement côté Rust : le bearer n'entre **jamais** dans
-la pile HTTP JVM (heap-0 par construction, §10.7).
+signatures de capacité sont déjà dans l'enveloppe, posées à la production, et Rust en
+tire les en-têtes ; il n'existe **aucun chemin OkHttp** de repli côté worker (un PUT
+OkHttp serait identity-based, donc rejeté par le relais aveugle). Un binding natif
+malsain remonte en `Throwable` → `Result.retry()` (l'enveloppe reste sur disque pour la
+tentative suivante), **pas** en bascule de transport ; l'ancien flag `enabled` + « filet
+OkHttp » a été retiré à l'audit 2026-06-26 (R-CR-5 : zéro lecteur, le repli décrit
+n'existait pas). Le transport Rust route le PUT des objets, le POST de clôture et le
+secours entièrement côté Rust, par la même primitive en `DirectTls` et en `ObfQuic` : le
+bearer n'entre **jamais** dans la pile HTTP JVM (heap-0 par construction, §10.7).
 
 **Le transport release est désormais `ObfQuic` (Salamander), plus `DirectTls`** (Lot 3
 B4, clôture du finding structurel D-1). `RustUploadTransport.mode = TransportMode.OBF_QUIC`
@@ -828,11 +913,16 @@ le goulot est la caméra, jamais le chiffrement.
 
 La résilience de ce chemin a été durcie par itérations de terrain documentées :
 queue persistante survivant reboot et mort de process, reprise réseau par
-`NetworkCallback` + polling de secours, JWT survivant au stop pour drainer les derniers
-chunks (cleared seulement sur `lock()`/`panicWipe()`), trio anti perte de données
-(report idempotent par session, sweep serveur des reports zombies, HTTP **507**
-disk-full → circuit ouvert immédiat côté client, blob préservé on-device - filet validé
-en condition réelle de saturation totale du disque serveur : zéro chunk perdu).
+`NetworkCallback` + polling de secours, trio anti perte de données (report idempotent
+par session, sweep serveur des reports zombies, HTTP **507** disk-full → circuit ouvert
+immédiat côté client, blob préservé on-device - filet validé en condition réelle de
+saturation totale du disque serveur : zéro chunk perdu). Depuis la signature à la
+production, mettre une enveloppe en file n'exige ni JWT ni déverrouillage ; seul l'objet
+qui **crée** un rapport (le premier, ou une entrée d'annuaire) a besoin d'un bearer, et
+l'effacement du JWT comme l'auto-lock sont différés tant qu'une telle enveloppe attend.
+L'ancien TTL de 48 h sur les chunks en attente (`sweepStaleChunks`) a été retiré : il
+visait des fichiers impossibles à envoyer faute de clé, ce que la signature à la
+production supprime.
 
 ### 6.4 Le squish 1.33 - autopsie d'un bug, méthode du projet
 
@@ -858,8 +948,9 @@ Le harness est conservé pour re-valider tout futur device.
   PCM ou repoint GL) a un rapport risque/valeur défavorable - différé, documenté.
 - **Concat archive en un seul MP4** (4.4.7) : non livré ; la règle de re-basage des PTS
   audio/vidéo par chunk est spécifiée dans la roadmap pour éviter une désynchro
-  cumulative sur les longues sessions. En attendant : `playlist.m3u` générée au
-  download, lecture chaînée VLC/MX.
+  cumulative sur les longues sessions. En attendant : le lecteur interne du mode archive
+  enchaîne les chunks dans l'ordre des seq (§7.4), et l'export écrit des fichiers
+  numérotés dans cet ordre.
 - **Matrice de devices** : validé en profondeur sur deux SoC (MediaTek/Seeker,
   Snapdragon 8 Gen 3/OnePlus 13). Le plan d'élargissement existe
   ([`docs/DEVICE_TEST_MATRIX.md`](DEVICE_TEST_MATRIX.md)) ; l'exécution attend le parc.
@@ -876,8 +967,9 @@ Le harness est conservé pour re-valider tout futur device.
 | `PinUnlockActivity` | Unlock Argon2id (Rust), saisie convertie en `ByteArray` (le listener `PinLockView` legacy expose un `String` transitoire, cf R-D-1), deny-list backoff, `excludeFromRecents` |
 | `StreamRecordingService` | Foreground service `camera\|microphone`, `PARTIAL_WAKE_LOCK`, recording écran éteint, flags `isRunning`/`isShuttingDown` contre les races de teardown |
 | `StreamSettingsActivity` | Fingerprint, qualité max, shake-to-record, auto-lock, lock/panic - gate `isLocked → finish` à l'`onResume` |
-| `ArchiveModeActivity` + `ArchiveDownloadService` | Récupération par phrase : FGS `dataSync` + WakeLock + WifiLock HIGH_PERF, retry par chunk, secrets passés en RAM via `ArchiveAuthHolder` (jamais par Intent/Binder) |
-| `V2LockTimeoutController` | Observateur ProcessLifecycle pur-V2 : timer JWT (field-tuné : ne fire jamais pendant un chiffrement in-flight ni un recording) + timer séparé d'auto-lock ratchet (15 min défaut) |
+| `ArchiveModeActivity` + `ArchiveDownloadService` | Récupération par phrase : FGS `dataSync` + WakeLock + WifiLock HIGH_PERF, énumération et vérification par rapport, statuts affichés, secrets passés en RAM via `ArchiveAuthHolder` (jamais par Intent/Binder) |
+| `ArchivePlayerActivity` | Lecteur interne : `VideoView` en `setSecure(true)` + `FLAG_SECURE`, fenêtre glissante de chunks déchiffrés, section « non vérifiable » sous bandeau permanent |
+| `V2LockTimeoutController` | Observateur ProcessLifecycle pur-V2 : timer JWT (field-tuné : ne fire jamais pendant un chiffrement in-flight, un recording ou son démontage, ni tant qu'une enveloppe qui peut exiger un JWT attend) + timer séparé d'auto-lock ratchet (15 min défaut) ; purge aussi les copies du lecteur interne : au passage en arrière-plan si aucun écran du secours n'est ouvert et qu'aucun lot ne tourne, puis, après le délai de l'auto-lock, même sous un écran resté ouvert derrière l'accueil, dès qu'aucun lot ne tourne (auto-lock désactivé : seule la première purge reste) |
 | Onboarding | Génération + confirmation BIP-39 → PIN V2 → enrôlement serveur (avec worker de retry si offline) - **2 écrans PIN**, l'infra de lock Tella ayant été retirée |
 
 ### 7.2 Hygiène des secrets côté UI
@@ -890,32 +982,106 @@ immédiat, tap-to-exit) sur les surfaces exposées.
 
 ### 7.3 Panic wipe
 
-`panicWipe()` détruit : le ratchet en RAM, le blob ratchet persisté, l'identité publique
-locale, la queue de chunks `.strm` non uploadés, les jobs WorkManager pendants **et
-l'historique WorkManager** (`workdb` prunée - fix R-E-2 : cette base était une timeline
-forensique en clair qui survivait au wipe), le JWT. L'app revient à l'état non-enrôlé.
+L'effacement d'urgence procède dans cet ordre (`StreamSettingsActivity`, puis
+`StreamUploadManager.panicWipe()`, à qui `ArchiveLocalData.detachForPanic()` remet les
+répertoires du secours) :
+
+1. **abandon synchrone de l'écrivain vivant** (`report_writer_abort_live`) : la clé du
+   rapport en cours disparaît avant tout le reste, sans clôture ;
+2. **annulation de tous les jobs WorkManager et de leur historique** (`workdb` prunée -
+   fix R-E-2 : cette base était une timeline forensique en clair qui survivait au wipe) ;
+3. **arrêt des services** d'enregistrement et de secours, et effacement des clés de la
+   session d'archive ;
+4. **clés et préférences** : ratchet en RAM et persisté, identité publique locale, JWT,
+   graine de provenance, **clé de file** et **état de rapport** ;
+5. **répertoires** : la file d'enveloppes, le répertoire d'échecs, les marqueurs, les
+   tickets d'horodatage, les restes de l'ancienne file, le scratch de capture, puis les
+   copies du lecteur interne (`noBackupFilesDir/archive_view`, `archive_recovery`) sont
+   **renommés de façon synchrone** (une écriture tardive échoue alors au lieu de recréer
+   un fichier) puis écrasés et supprimés en arrière-plan, en une seule passe : **le clair
+   de toutes les parties d'abord** (scratch de capture, miroirs de debug, répertoires
+   `plain/` du lecteur, `archive_recovery`), le chiffré ensuite ;
+6. **anciennes exportations** : ce que des versions antérieures de cette installation ont
+   écrit en clair dans `Download/Frappuccino/` (requête MediaStore à partir d'Android 10,
+   qui ne rend que les entrées créées par l'app ; voie fichier avant).
+
+L'app revient à l'état non-enrôlé.
 
 Ce que le panic wipe ne fait **pas**, en toute clarté : il ne supprime pas les blobs déjà
-uploadés (c'est le but - ils sont illisibles sans la phrase) ; il ne révoque pas
-l'identité côté serveur (révocation serveur = action séparée, l'utilisateur peut être
-sous contrainte) ; il ne garantit rien contre une image forensique prise **avant** le
-wipe ; et sur un flash NAND, l'irrécupérabilité physique des secteurs réécrits n'est pas
-démontrable depuis l'app (le blob restant étant scellé Argon2id, l'enjeu réel est
-faible). Limites détaillées : §10.3.
+uploadés (c'est le but - ils sont illisibles sans la phrase) ; il **n'efface pas les
+exports explicites** faits par le sélecteur de fichiers du système (`ACTION_OPEN_DOCUMENT_TREE`),
+qui sont hors de portée de l'app et que l'avertissement d'export annonce comme tels ; il
+ne révoque rien côté serveur (il n'existe pas de route de révocation d'identité, et le
+wipe n'émet volontairement aucun signal réseau sous contrainte) ; les enregistrements pas
+encore envoyés sont perdus avec la file ; il ne garantit rien contre une image forensique
+prise **avant** le wipe ; et sur un flash NAND, l'irrécupérabilité physique des secteurs
+réécrits n'est pas démontrable depuis l'app (le blob restant étant scellé Argon2id,
+l'enjeu réel est faible). Limites détaillées : §10.3.
 
 ### 7.4 Archive mode
 
-La phrase saisie re-dérive **en RAM seulement** les clés de capacité report
-(`Zeroizing`, wipées à la fermeture). Depuis le modèle relais-aveugle (§8.7), l'accès aux
-archives est **sans identité** : le device de rescue fetch le report-annuaire (adresse
-fixe dérivée de la phrase) pour recouvrer `n_max` par *derive-and-match*, puis liste,
-télécharge et déchiffre chunk par chunk (`archive_download_and_decrypt`) chaque report `0..n_max`,
-et reconstitue manifest + playlist - aucune signature de challenge long-terme (`0x04`)
-n'est plus consommée. Le flux a été durci par le terrain : download en foreground service
-(survit écran éteint), retry par chunk, marqueurs ✓, « tout télécharger », garde
-anti-doublons MediaStore, lecture-en-double des entrées d'annuaire legacy `%010d` (M-1).
-Le même rescue existe hors Android : `frappuccino-cli fetch-archive` (desktop Linux,
-mêmes primitives Rust).
+La phrase saisie re-dérive **en RAM seulement** l'identité d'archive et, pour chaque
+index, les `report_id`, clés publiques et noms des deux familles de rapports (legacy et
+chaîne, §8.7) ; aucune clé de signature n'est nécessaire au secours. L'accès aux archives
+est **sans identité** : aucune signature de challenge long-terme (`0x04`) n'est consommée.
+Le secours est le module Rust `ReportRescue` (`crypto-rs/ffi/src/rescue.rs`), le même pour
+l'APK et pour `frappuccino-cli fetch-archive`.
+
+**Le secours vérifie avant de ranger.**
+
+1. **Énumération.** Le secours liste l'annuaire, apparie ses noms d'entrée aux index des
+   deux familles (*derive-and-match*), puis sonde chaque index jusqu'au plus haut
+   apparié plus une marge. Une **clôture de l'annuaire** est affichée comme une anomalie
+   (l'appareil ne clôt jamais l'annuaire ; il faut détenir sa clé, donc l'état de
+   l'appareil ou la phrase, §10.1) et le sondage continue au-delà. Un 429 fait attendre au moins 60 s puis reprendre ; une énumération
+   incomplète est affichée comme telle.
+2. **Vérification**, sous la `report_pk` **re-dérivée de la phrase** (le `report_id` est
+   recalculé, jamais reçu), objet par objet, avant tout déchiffrement :
+   - **rapport chaîne clos** (clôture `0x09` valide, manifeste téléchargé et conforme) :
+     chaque objet du manifeste dont l'empreinte est la bonne est `VERIFIED`, même sans
+     signature stockée ; empreinte différente → `FOREIGN` ; absent → `MISSING` ; objet
+     hors manifeste → `UNEXPECTED`. Le rapport est `COMPLETE`, `INCOMPLETE` (seulement des
+     absents) ou `ALTERED` (un objet étranger, ou un objet hors manifeste validement
+     signé, donc un second signataire) ;
+   - **rapport chaîne sans clôture valide** : un objet est `VERIFIED` si la signature
+     d'écriture gardée par le relais (`X-Report-Write-Sig`) vérifie, sinon il est exclu ;
+     le rapport est `INTERRUPTED` (objets authentifiés un par un, fin non certifiée) ;
+   - **rapport legacy** : signature d'écriture valide → `VERIFIED` ; objet stocké sans
+     signature (avant que le relais les garde) → section **« non vérifiable »** ; une
+     clôture legacy valide se lit « figé côté relais ».
+   Ce qui ne vérifie pas est exclu et compté ; chaque rapport affiche son statut, ses
+   compteurs et l'**intervalle de dates** de ses objets (horloge du relais), pour aider le
+   témoin à repérer ce qui serait postérieur à une perte ou une saisie.
+3. **Horodatage.** La preuve OTS déchiffrée est comparée à l'engagement recalculé depuis
+   les objets `VERIFIED` (`OTS_MATCH` / `OTS_MISMATCH` / `OTS_ABSENT`) ; l'ancrage Bitcoin se
+   vérifie avec le CLI.
+
+**Lecture interne, export explicite.** Les objets vérifiés sont rangés **chiffrés** dans
+`noBackupFilesDir/archive_view/<jeton aléatoire>/` (jamais nommé par le `report_id`,
+exclu des sauvegardes). Le lecteur interne (`ArchivePlayerActivity`) ne déchiffre qu'une
+**fenêtre glissante** de quelques chunks vers un répertoire privé et efface chaque chunk
+dès qu'il en sort ; la capture d'écran est refusée deux fois (`FLAG_SECURE` et
+`setSecure(true)` sur la surface). Fermer le secours annule le travail en cours et purge
+(renommage synchrone puis effacement en arrière-plan) ; la même purge a lieu au démarrage
+de l'app, au minuteur d'arrière-plan quand aucun lot ne tourne (après le délai de
+l'auto-lock, même sous un écran du secours resté ouvert derrière l'accueil), et à
+l'effacement d'urgence. L'**export** est un bouton par rapport, précédé d'un avertissement (la copie
+quitte la protection de l'app et échappe à l'effacement d'urgence), vers un dossier choisi
+par `ACTION_OPEN_DOCUMENT_TREE`, sous des noms neutres ; il ne contient que les objets
+`VERIFIED`, plus la preuve OTS et son sel quand la preuve correspond. Un objet qui ne se
+déchiffre pas est exclu de l'export et compté à l'écran, et le reste du rapport s'exporte ;
+si c'est un chunk, la preuve et son sel sont exclus avec lui, puisqu'ils portent sur tous les
+chunks vérifiés. Les objets **non
+vérifiables** restent à part : listés dans leur propre section, lisibles sous un bandeau
+permanent « non vérifié », exportables seulement par leur propre bouton, après un second
+avertissement, vers un dossier distinct dont le nom et chaque fichier portent l'étiquette
+`not-verified` ; jamais mêlés au témoignage vérifié, à ses compteurs ni à sa vérification
+OTS. Aucune version actuelle n'écrit plus dans `Download/Frappuccino/`.
+
+Un secours d'une version antérieure (APK ou CLI) ne connaît pas la famille chaîne : il ne
+voit pas les rapports enregistrés après la mise à jour. Le listing d'un rapport n'est pas
+paginé et le client le plafonne à 4 Mio (`MAX_LISTING_BYTES`) : un rapport non clos de plus
+d'environ 46 000 objets n'est pas énumérable en entier (hors périmètre actuel).
 
 ---
 
@@ -931,7 +1097,10 @@ durci sur une instance de test Vultr.
 phrase/seed, PIN, identités réelles, IP dans les logs applicatifs.
 
 **Voit** (et c'est le vrai sujet, §8.5) : pks Ed25519 pseudonymes, batches publics et
-slots consommés, report_ids, tailles de blobs, timestamps, fréquences d'upload.
+slots consommés, report_ids et `report_pk`, noms d'objets (numéros de capture
+`NNNNNN.strm`, trous compris), tailles de blobs, timestamps, fréquences d'upload, et pour
+un rapport clos sa clôture signée et son manifeste (nombre d'objets, empreintes des
+blobs chiffrés). Il garde la signature d'écriture de chaque objet en métadonnée.
 
 ### 8.2 Auth V2 (`routes/auth_v2.py`)
 
@@ -955,8 +1124,10 @@ slots consommés, report_ids, tailles de blobs, timestamps, fréquences d'upload
   (`get_status` dans `protocol.rs`/`ffi`/`udl`, `getServerStatus` Kotlin, `protocol_probe`
   CLI) ferme réellement la surface ; la désambiguïsation post-échec passe désormais par un
   état local (`hasPendingServerEnrollment`).
-- JWT : durée bornée env-configurable (`JWT_EXPIRE_HOURS` ; jeton archive court à
-  30 min), **révocable** (`/auth/v2/logout` + blacklist persistée vérifiée avant decode).
+- JWT : durée bornée env-configurable (`JWT_EXPIRE_HOURS` ; il n'y a plus de jeton
+  d'archive, les lectures étant sans identité), **révocable** (`/auth/v2/logout` +
+  blacklist persistée vérifiée avant decode). C'est le **jeton** qui se révoque, pas
+  l'identité.
   Pas de refresh token - décision de design : en V2, re-s'authentifier consomme un slot
   éphémère, c'est-à-dire que le « refresh » est lui-même forward-secure ; un bearer
   long-vécu réintroduirait exactement ce que le ratchet élimine.
@@ -979,13 +1150,63 @@ timestamp par-record ni seuil d'âge stocké), TTL blobs
 résiduel est métadonnée/légal, pas contenu), audit horaire reports-vs-blobs en CSV,
 backup volumes + restore scriptés (chiffrement age opt-in).
 
+**Signature d'écriture conservée.** La `write_sig` (`0x08`) vérifiée d'un objet est
+stockée en métadonnée utilisateur `x-amz-meta-report-write-sig` (hex minuscule) **par le
+même `put_object` qui crée l'objet** ; un re-PUT identique d'un objet stocké sans elle la
+pose (copie en place, ce qui change son `last_modified`). L'archive la renvoie dans
+`X-Report-Write-Sig`. C'est une **donnée d'intégrité** : pour un rapport jamais clos,
+elle est la seule chose qui permette au secours de distinguer un objet signé par la clé
+du témoin d'un objet qui ne l'est pas. Toute migration de stockage doit donc copier les
+métadonnées utilisateur avec les octets ; `deploy/audit-reports-vs-blobs.sh` compte les
+objets qui en sont dépourvus (`without_write_sig`), à comparer avant et après.
+
+**Clôture.** `POST /close/{report_id}` (en-têtes `X-Report-PK`, `X-Report-Close-Sig`,
+`X-Report-Close-Seq-Limit` ; corps = manifeste `"FQM1" ‖ u32_be(count) ‖ count × (u32_be(seq) ‖
+sha256(blob))`, lu en flux, plafond 40 Mo) vérifie `report_id = H(pk)`, l'existence du
+rapport (425 sinon), la `report_pk` (409) et la signature `0x09` sur `report_id ‖
+u32_be(seq_limit) ‖ sha256(corps)` (403). Sous le verrou du registre, le manifeste est
+stocké en objet write-once `manifest` **avant** que la fiche dise « clos », puis la fiche
+reçoit `{seq_limit, manifest_sha256, sig}` et est sauvegardée durablement ; une clôture
+identique déjà enregistrée rend 204, une différente 409. Ni JWT ni budget. Le relais ne
+parse pas le manifeste au-delà de son en-tête et de sa longueur ; c'est le secours qui le
+vérifie.
+
+**Règle après clôture.** Une fois la clôture enregistrée, un PUT n'est accepté que si
+l'objet existe déjà (write-once : identique 204, différent 409) ou si son nom est
+`NNNNNN.strm` avec `NNNNNN < seq_limit` ; tout autre nom reçoit **409 `Report closed`**.
+Le contrôle de clôture, le test d'existence et l'écriture forment une section tenue sous
+le verrou du registre, sans `await`, si bien qu'aucune clôture ne peut s'intercaler. Le
+nom `manifest` est refusé en PUT (400). Une clôture legacy porte un manifeste vide
+(`seq_limit = 0`) : elle fige le rapport sans rien lister.
+
+**Pierres tombales.** Le reap horaire supprime la fiche d'un rapport **ouvert** dont tous
+les objets ont expiré au TTL. Une fiche **close** n'est jamais supprimée : quand tous ses
+objets, `manifest` compris, ont expiré, elle devient une pierre tombale qui refuse toute
+écriture, pour que la clôture ne soit jamais oubliée (sinon un PUT de création
+recréerait le rapport ouvert). L'archive répond 404 pour une pierre tombale vide, comme
+pour un rapport inconnu. Coût : une petite fiche par rapport clos, gardée sans date.
+
+**Registre durable et fail-closed.** `reports.json` est sauvegardé par
+écriture-renommage puis **fsync du répertoire** (sinon une coupure pourrait ramener une
+version antérieure et oublier une clôture déjà acquittée). Au démarrage, un fichier
+illisible ou mal formé **empêche le relais de démarrer**, au lieu de repartir d'un
+registre vide qui oublierait toutes les clôtures ; la réparation est la restauration d'une
+sauvegarde. Restaurer une sauvegarde **antérieure** perd les clôtures plus récentes : les
+rapports concernés se lisent alors « interrompus » au secours (résidu R6, §10.2).
+
+**Ordre de déploiement.** Le relais se déploie **avant** l'APK qui envoie des clôtures, et
+se vérifie par une sonde : `POST /close/<rid>` sans en-têtes doit rendre **400**, pas 404.
+Côté client, un 404 sur `/close` signifie « route absente » : la clôture est réessayée avec
+recul, jamais abandonnée.
+
 ### 8.4 Hardening
 
 Conteneurs non-root (uid 1001), FS read-only + tmpfs, `cap_drop ALL`,
 `no-new-privileges`, healthcheck Docker + moniteur externe, logs JSON structurés avec
 **blocklist d'IP** (toute clé IP-like droppée), `access_log off` nginx, uvicorn sans
 access-log, logs Docker bornés. Persistance JSON atomique (write-rename) pour le
-registre ratchet et les reports. État thread-safe sous lock global.
+registre ratchet et les reports, plus fsync du répertoire pour les reports (§8.3). État
+thread-safe sous lock global.
 
 ### 8.5 Les métadonnées - le risque résiduel du relais
 
@@ -998,7 +1219,13 @@ aucune identité** (`owner`/`author`/`createdAt` retirés) et les clés par-repo
 repos. Le résidu n'est donc plus une corrélation par `owner_pk` (supprimée) mais une
 corrélation par **volume, horodatages et cadence** des blobs, plus la **liaison
 inter-sessions** que concentre le répertoire de rescue sous un identifiant opaque (résidu
-M-1 assumé, §8.7 : noms opaques, mais nombre et cadence restent visibles). Côté fil, le
+M-1 assumé, §8.7 : noms opaques, mais nombre et cadence restent visibles). La clôture
+ajoute peu à cette surface : l'objet `manifest` a un `last_modified` (l'heure de fin de
+l'enregistrement, que le dernier chunk donnait déjà à quelques secondes près) et une
+taille qui révèle le nombre d'objets, déjà visible au listing ; les numéros de capture
+révèlent les trous (chunks perdus à la capture). Les pierres tombales gardent sans limite
+de durée, sans date ni identité, une fiche par rapport clos : le registre conserve donc le
+compte des rapports clos au-delà du TTL de leurs objets. Côté fil, le
 transport **ObfQuic/Salamander** (§6.3/§10.4) rend la connexion inclassifiable tant que
 l'UDP passe ; le repli **DirectTls** (UDP bloqué) est classifiable et porte le **SNI en
 clair** du domaine. La cible non-fiable (foule/CDN ou rotation d'IP) et un éventuel mode
@@ -1047,30 +1274,84 @@ control-plane et la métadonnée / permanence.
 Un report n'est ni adressé ni autorisé par l'identité du témoin, mais par une clé
 **dérivée de la seed BIP-39** ([`crypto-rs/core/src/report.rs`](../crypto-rs/core/src/report.rs)).
 Le relais stocke `report_id → report_pk` et **jamais** le lien
-`identité → report → quand` : saisir le disque ne révèle aucun rattachement. La
-dérivation suit un contexte HKDF dédié (`stream.report.master.v1` → `report_master`
-mlock'd/PIN-scellé, puis `stream.report.key.v1 ‖ u32_be(n)` → `report_sk_n` transitoire),
-et `report_id_n = SHA-256("stream.report.id.v1" ‖ report_pk_n)[..16]`. Les écritures sont
+`identité → report → quand` : saisir le disque ne révèle aucun rattachement.
+`report_id_n = SHA-256("stream.report.id.v1" ‖ report_pk_n)[..16]`. Les écritures sont
 signées par capacité, domaine-séparées (R-C-1) : `0x07 ReportCreate` (création paresseuse
-au premier PUT) et `0x08 ReportWrite` (chaque chunk, lié au nom et au `sha256(body)`),
-miroir serveur dans `routes/upload.py`. Le témoin re-dérive n'importe quel `report_id_n`
-depuis la phrase seule au rescue (device sans état local).
+au premier PUT), `0x08 ReportWrite` (chaque objet, lié au nom et au `sha256(body)`) et
+`0x09 ReportClose` (la clôture), miroir serveur dans `routes/upload.py`. Le témoin
+re-dérive n'importe quel `report_id_n` depuis la phrase seule au rescue (device sans état
+local).
 
-Un **report-annuaire** singleton (contexte HKDF distinct, sans index) permet au device de
-rescue d'apprendre `n_max` **exactement** (un blob minuscule déposé par session) plutôt que
-de deviner où s'arrêter avec une tolérance-aux-trous. **M-1 (2026-06-28, commit `075ec6b`,
-audit 2026-06-26)** rend les **noms d'entrée de l'annuaire opaques**. Avant, chaque entrée
-était nommée par l'index décimal en clair (`%010d`), ce qui (a) signait l'annuaire comme un
-compteur de sessions et (b) laissait un opérateur de relais **lire le nombre de sessions du
-témoin et leur cadence** directement sur les noms. Désormais le nom est
-`hex(HKDF(report_master, "stream.report.directory.entry.v1" ‖ u32_be(n))[..16])` -
-opaque, indistinguable d'un autre blob. Point clé : il est dérivé du **secret
-`report_master`**, **jamais** du `directory_pk` public (sinon le relais, qui voit
-`directory_pk`, ré-énumérerait tous les noms et reconstruirait chaque index). Le **corps**
-de l'entrée ne porte plus l'index non plus (constant, 1 octet). Au rescue, le device
-re-dérive `directory_entry_name(0..)` et matche contre la liste de blobs de l'annuaire
-(*derive-and-match*) pour recouvrer `n_max` ; les entrées legacy `%010d` sont **lues en
-double** (forward-compat). Field-validé Seeker (`n_max=6`, 7 reports, 0 erreur).
+**Deux schémas de dérivation partagent un seul espace d'index.** Le schéma **legacy**
+(index `< k`) dérive `report_master = HKDF(seed, "stream.report.master.v1")` puis
+`report_sk_n = HKDF(report_master, "stream.report.key.v1" ‖ u32_be(n))` : n'importe quel
+index se redérive du maître, c'est pourquoi l'appareil ne le garde plus. Le schéma
+**chaîne** (index `≥ k`, `k = 0` pour une inscription neuve) est à sens unique :
+
+```
+C_0     = HKDF(report_master, "stream.report.chain.v2.root")
+C_{i+1} = HKDF(C_i, "stream.report.chain.v2.next")
+seed_i  = HKDF(C_i, "stream.report.chain.v2.key")      → report_sk_i, report_pk_i, report_id_i
+entrée d'annuaire i = hex(HKDF(C_i, "stream.report.chain.v2.directory-entry", 16))
+nom de la preuve OTS i = hex(HKDF(C_i, "stream.report.chain.v2.ots-name", 16))
+```
+
+L'appareil ne garde que `(i, C_i, graine d'annuaire)` (`report_state.bin`, scellé par la
+session PIN, §4.6), et jamais `report_master` après l'inscription ou la migration. Ouvrir
+le rapport `i` dérive sa clé de `C_i`, remplace `C_i` par `C_{i+1}`, efface `C_i`, et
+n'est rendu à l'appelant qu'une fois l'état avancé écrit durablement. **Conséquence :
+l'état ne permet plus de redériver la clé d'un rapport ouvert avant lui.** Il permet en
+revanche de dériver celles de **tous les rapports ouverts après lui** : la chaîne est
+déterministe, et elle doit l'être pour que la phrase seule retrouve tout au secours. Les
+copies antérieures de l'état restées sur la flash échappent à ce que le module peut
+effacer ; contre elles, le PIN n'oppose qu'un délai (Argon2id). Ces limites sont les
+résidus R1 et R1b (§10.2).
+
+**Cycle de vie d'un rapport chaîne.** L'écrivain (`ReportWriter`, Rust) scelle d'abord
+le JSON de métadonnées (seq 0, obligatoire avant tout chunk), puis chaque chunk sous son
+numéro de capture (seq ≥ 1, noms `NNNNNN.strm`, trous permis), et tient la table
+`seq → empreintes`. `close_report` construit le **manifeste** depuis cette table (seq
+strictement croissants, empreinte SHA-256 des octets exacts que stockera le relais),
+signe `0x09` sur `report_id ‖ u32_be(seq_limit) ‖ sha256(manifest)` (`seq_limit` = dernier
+seq + 1), écrit l'enveloppe de clôture, puis efface la clé ; ensuite tout appel échoue
+(`WriterClosed`). L'effacement d'urgence appelle `abort`, qui efface la clé sans clôture.
+Un rapport dont la clé disparaît avant l'écriture de sa clôture (mort du processus,
+borne de vidange dépassée, échec d'écriture, effacement d'urgence pendant
+l'enregistrement) n'est jamais clos : ses objets restent authentifiés un par un, sa fin
+n'est pas certifiée (résidu R2).
+
+**L'annuaire.** Un **report-annuaire** singleton (`stream.report.directory.v1`, la même
+clé pour les deux schémas) reçoit une entrée par rapport, au moment de son ouverture,
+signée par la clé d'annuaire persistante ; le secours y apprend quels index existent.
+**M-1 (2026-06-28, commit `075ec6b`, audit 2026-06-26)** a rendu les **noms d'entrée
+opaques** : nommer une entrée par l'index décimal en clair (`%010d`) signait l'annuaire
+comme un compteur de sessions et laissait un opérateur de relais **lire le nombre de
+sessions du témoin et leur cadence** directement sur les noms. Le nom legacy est
+`hex(HKDF(report_master, "stream.report.directory.entry.v1" ‖ u32_be(n))[..16])`, le nom
+chaîne est dérivé de `C_i` comme ci-dessus : dans les deux cas d'un **secret**, **jamais**
+du `directory_pk` public (sinon le relais, qui voit `directory_pk`, ré-énumérerait tous les
+noms et reconstruirait chaque index). Le **corps** de l'entrée ne porte pas l'index
+(constant, 1 octet). Au rescue, le device re-dérive les noms des deux familles et matche
+contre la liste de blobs de l'annuaire (*derive-and-match*) ; les entrées legacy `%010d`
+sont **lues en double** (forward-compat). La clé d'annuaire étant persistante, l'annuaire
+n'est jamais clos par l'appareil : le secours traite toute clôture d'annuaire comme une
+anomalie et sonde au-delà (R1b). Le M-1 legacy a été field-validé sur Seeker (`n_max=6`,
+7 reports, 0 erreur) ; le schéma chaîne n'a pas encore de validation terrain.
+
+**Migration des appareils existants.** Au premier déverrouillage après la mise à jour,
+hors du thread principal, et sans enregistrement possible tant qu'elle n'a pas fini
+(`LegacyReportMigration`) : les anciens travaux d'envoi sont annulés ; chaque session en
+attente sans index en reçoit un ; `k` est fixé au-delà de tout index legacy ; l'état chaîne
+est écrit à `k` (le maître est descellé dans Rust, il ne traverse pas la FFI) avec la clé de
+file ; chaque fichier legacy en attente (blobs `.strm` de la file et du cache, entrées
+d'annuaire, preuves OTS déjà reçues) devient une enveloppe **signée à ce moment** avec sa
+clé legacy, par ajout d'un en-tête puis renommage, avec contrôle d'espace libre ; une
+clôture legacy est écrite pour chaque index `< k` ; **enfin seulement**, le maître et la
+comptabilité legacy sont supprimés. Un fichier inconvertible est effacé et compté perdu ;
+les horodatages OTS demandés mais pas encore reçus sont annulés (la preuve opt-in est
+perdue, la vidéo ne l'est pas). Sur manque d'espace ou erreur, la migration s'arrête sans
+rien effacer et reprend au déverrouillage suivant. Les limites propres aux appareils
+migrés sont les résidus R3, R3b et R4 (§10.2).
 
 **Résidu honnête** : l'annuaire **relie toujours les sessions d'un témoin au repos** (leur
 nombre et leur cadence) sous un même `report_id`. Les noms opaques retirent le
@@ -1081,9 +1362,11 @@ le risque résiduel du relais (§8.5).
 ### 8.8 Frontière FFI sans export de secret (R-CR-1, Lot 4b)
 
 Corollaire de la discipline « tout secret matériel vit en Rust » (§3.5) durci à l'audit
-2026-06-26 : les secrets sensibles - le blob ratchet 50 clés, le `report_master`, la
-graine de provenance, et la clé de session dérivée Argon2id - **ne traversent plus la
-frontière FFI**. Ils restent côté Rust derrière un *handle* ; le sceau/descellement se font
+2026-06-26 : les secrets sensibles - le blob ratchet 50 clés, l'état de rapport (et le
+`report_master` legacy, le temps de la migration), les clés de rapport, la graine de
+provenance, et la clé de session dérivée Argon2id - **ne traversent plus la frontière
+FFI**. La clé de file fait exception, nommée : Kotlin la lit depuis son `EncryptedFile`
+en `ByteArray`, l'installe dans Rust (`queue_key_install`) et efface le tableau. Ils restent côté Rust derrière un *handle* ; le sceau/descellement se font
 **à l'intérieur de Rust en un seul appel** (`pin_session_*` dans
 [`crypto-rs/ffi/src/lib.rs`](../crypto-rs/ffi/src/lib.rs) ; orchestré côté Kotlin par
 `StreamUploadManager.kt`). La clé Argon2id de session est mise en cache dans un holder
@@ -1123,7 +1406,7 @@ Les chiffres courants sont dans le tableau ci-dessous ; le détail daté de chaq
 |---|---|---|---|
 | **Design / protocole** | Le protocole résiste-t-il à un attaquant réseau actif ? | Tamarin (Dolev-Yao) | 10/10 lemmes |
 | **Design / machine à états** | La FSM du ratchet peut-elle rollback/rejouer ? | TLA+/TLC | 2800 états, 0 erreur |
-| **Implémentation** | Le code réel panique-t-il sur une entrée adverse ? | Kani (model-checking borné), fuzz, mutation | 5/5 harnais, 0 crash, 98-100 % |
+| **Implémentation** | Le code réel panique-t-il sur une entrée adverse ? | Kani (model-checking borné), fuzz, mutation | 8/8 harnais vérifiés au dernier run daté (2026-10-25) ; 0 crash, 98-100 % |
 | **Compilateur** | Le wipe des secrets survit-il à l'optimiseur ? | Analyse LLVM IR + guard exécutable | 0 dead-store-elimination |
 | **Frontière inter-langages** | Kotlin et Rust voient-ils les mêmes octets ? | Fuzzing différentiel via bindings réels | 759/759 |
 
@@ -1152,7 +1435,7 @@ re-confirmé après le changement de protocole R-C-1 (bindings régénérés). C
 qui couvre la surface jugée la plus faible par les audits : la glu inter-langages.
 
 **③ Kani (model-checking borné du Rust réel)** - [`docs/KANI_PROOFS.md`](KANI_PROOFS.md).
-Cinq harnais, dont **trois sur `parse_header`** : **no-panic prouvé sur l'intégralité de
+Huit harnais, dont **trois sur `parse_header`** : **no-panic prouvé sur l'intégralité de
 l'espace d'entrée** borné (≤ 200 octets : un en-tête V3 complet plus une entrée de grant), postconditions garantissant que les slices
 dérivées sont sûres, et refus de tout en-tête portant un grant
 (`check_parse_header_rejects_any_grant`, qui verrouille en machine la décision de ne pas
@@ -1160,6 +1443,14 @@ exposer les grants). Les deux autres : confirmation machine que l'unique mutant 
 du parseur (`be_u16 : OR ≡ XOR sur bits disjoints`) est bien équivalent - la mutation
 l'avait conjecturé, Kani l'a prouvé - et le no-panic du dé-obfuscateur Salamander
 (`check_deobfuscate_in_place_never_panics`), qui lit des paquets UDP non authentifiés.
+La refonte des rapports en ajoute trois, sur l'enveloppe de file : le décodeur de
+l'en-tête déchiffré, en deux harnais (`check_envelope_trailer_decode_refuses_short_input`
+pour toute entrée plus courte que les champs fixes, `check_envelope_trailer_decode_never_panics`
+pour chaque longueur au-delà, jusqu'à un nom de 4 octets), et le cadrage de fin de fichier
+(`check_envelope_framing_accounts_for_the_whole_file`). Ni l'égalité du nom décodé avec ses
+octets ni l'effacement à la libération ne sont prouvés par Kani : le premier point est
+couvert par un test unitaire exhaustif sur les 256 valeurs d'octet. Le runner en attend
+huit ; le résultat daté est consigné dans `docs/KANI_PROOFS.md`.
 
 **④ TLA+/TLC (FSM du ratchet)** - [`docs/TLA_RATCHET.md`](TLA_RATCHET.md),
 `core/proofs/EphemeralRatchet.tla`. Exploration exhaustive de **2800 états** : batch
@@ -1195,7 +1486,9 @@ amélioré.
 - **proptest** (seeds figées, shrinking) : round-trip STRM encrypt/decrypt, round-trip
   sérialisation ratchet, invariants FSM sur schedules aléatoires.
 - **Parité cross-implémentation** : vecteurs KAT partagés Rust ⇄ Python (CLI/serveur),
-  lockstep test des 6 contextes HKDF (tout drift d'une constante casse le build).
+  lockstep test de 16 contextes HKDF (identité, ratchet, rapports legacy et chaîne) et de
+  l'AAD de l'état de rapport (`core/tests/hkdf_contexts_lockstep.rs` : tout drift d'une
+  constante casse le build) ; KAT figés du schéma chaîne (`core/tests/report_chain_kat.rs`).
 - **CI** : fmt + clippy `-D warnings` + tests `--locked` + cargo-deny/audit + Semgrep
   (4 packs + règles maison : tracker de pin TLS, anti-`fill(0)`, anti-secret-dans-les-logs).
 - **Anti-dérive modèle/code**, en deux moitiés. Côté **surface** : un test à `match`
@@ -1210,9 +1503,10 @@ amélioré.
   interruption est verrouillée en tests Rust déterministes (`core/src/ratchet.rs` :
   consume-non-persisté = no-op au reload · consume-persisté = slot brûlé-mais-sûr · blob
   torn-write rejeté par le MAC · rotation interrompue = même batch déterministe = retry
-  idempotent), et la durabilité de la file d'upload est testée **on-device**
-  (`ChunkUploadQueueDurabilityTest` : survie au process-restart, torn-write 0-octet non
-  remonté, ordre chronologique préservé).
+  idempotent), et la durabilité de la file d'enveloppes est testée **on-device**
+  (`EnvelopeQueueDurabilityTest`, instrumenté : survie au redémarrage du processus, `.part`
+  interrompu jamais remonté et balayé au démarrage, enveloppe de 0 octet ignorée,
+  enveloppe refusée conservée sans être renvoyée, ordre des noms préservé).
 
 ### 9.4 Audits adverses - dont l'audit inter-modèle
 
@@ -1261,6 +1555,9 @@ rotation (`0x02`) - 3/3 depuis le client Rust. Le chemin de reports relais-aveug
 identité ont été **field-validés sur device** (Seeker : `n_max=6`, 7 reports, 0 erreur ;
 §8.7), via la même primitive Rust que le CLI `fetch-archive`. Le serveur de test héberge
 ~4000 blobs réels issus des field tests multi-jours sur les deux devices de référence.
+Ces validations terrain sont antérieures au schéma chaîne, à la signature à la production,
+à la clôture et au secours vérifié (§6.3, §7.4, §8.3, §8.7) : ceux-ci sont couverts par les
+tests Rust, Kotlin et pytest, pas encore par une campagne sur appareil.
 
 ---
 
@@ -1269,19 +1566,37 @@ identité ont été **field-validés sur device** (Seeker : `n_max=6`, 7 reports
 Cette section est la contrepartie de tout ce qui précède. Elle est volontairement
 inconfortable : la crédibilité d'un outil pour personnes en danger se joue ici.
 
-### 10.1 Compromission device-level *live*
+### 10.1 Compromission device-level *live*, et extraction de l'état
 
 Un attaquant qui obtient **root sur le device pendant que l'app est déverrouillée** (ou
-qui dumpe la RAM d'un device saisi allumé et déverrouillé) peut lire **l'état courant**
-du ratchet : les slots éphémères non consommés et la chain key suivante. Conséquences
-précises :
+qui dumpe la RAM d'un device saisi allumé et déverrouillé, ou qui extrait le stockage et
+casse le PIN) peut lire **l'état courant** de l'appareil à l'instant `t` : les slots
+éphémères non consommés et la chain key suivante du ratchet, l'état de rapport `(i, C_i,
+graine d'annuaire)`, et, si un enregistrement est en cours et que l'extraction atteint la
+mémoire vive, la clé du rapport en cours. Conséquences précises :
 
-- il peut **signer en se faisant passer pour l'identité** sur les sessions futures,
-  jusqu'à révocation serveur ou rotation depuis un device sain ;
-- il **ne peut pas déchiffrer un seul stream passé** (pas de `x25519_sk`), ni **forger
-  une signature pour une session passée** (clés consommées détruites, HKDF
-  unidirectionnel) - la forward secrecy **tient**, c'est exactement la propriété prouvée
-  par Tamarin et le zeroize-audit.
+- il **ne peut pas déchiffrer un seul stream passé** (pas de `x25519_sk` sur l'appareil) ;
+- il **ne peut pas étendre ni réécrire un rapport clos avant `t`** : sa clé a été effacée
+  à la clôture et l'état ne la redérive pas (§8.7), et le relais refuse tout nom hors de
+  l'ensemble déclaré par la clôture. Une réserve : les versions antérieures de l'état
+  scellé restées sur la flash (résidu secdel-flash), contre lesquelles le PIN n'oppose
+  qu'un délai (Argon2id) ;
+- il **peut** s'authentifier comme l'identité (forward security de l'authentification :
+  les slots déjà consommés restent inutilisables, c'est la propriété prouvée par Tamarin et
+  le zeroize-audit), signer des objets du **rapport en cours à `t`**, signer **tous les
+  rapports ouverts après `t`** (la chaîne est déterministe, elle doit l'être pour que la
+  phrase seule les retrouve), et **écrire dans l'annuaire, voire le clore**, sans limite de
+  durée (la clé d'annuaire est persistante) ;
+- un rapport complet qu'il placerait à un index futur **n'est pas détectable
+  cryptographiquement** : il est signé par la bonne clé. Un 409, ou une incohérence de
+  manifeste, ne signale qu'une collision avec un usage réel du témoin au même index, et même
+  ce 409 n'est pas garanti sous écritures simultanées. Le secours affiche l'intervalle de
+  dates de chaque rapport pour aider le témoin à repérer ce qui est postérieur à une perte
+  ou une saisie, et traite une clôture d'annuaire comme une anomalie ;
+- il n'existe **pas de route de révocation d'identité** ; la parade disponible est une
+  ré-inscription avec une phrase neuve, donc une identité neuve.
+
+Ce sont les résidus R1 et R1b (§10.2).
 
 De même, un malware avec accès caméra/écran **avant** le chiffrement voit ce que voit le
 capteur : Frappuccino chiffre en aval de la capture, il ne prétend pas protéger contre
@@ -1305,14 +1620,53 @@ HTTP JVM ; heap-dump session active = `Bearer eyJ=0`), en plus de la neutralisat
 serveur déjà en place (write-once, combo-1 déployé). Il n'est donc **plus** un risque
 accepté ; les trois R-D-1/2, R-C-2 ci-dessus, eux, le restent.
 
+**Résidus des rapports figés (R1-R7).** La signature à la production et la clôture
+(§6.3, §8.3, §8.7) laissent des limites connues, tenues dans le registre
+[`ACCEPTED_RESIDUALS_2026-06-28.md`](ACCEPTED_RESIDUALS_2026-06-28.md) :
+
+- **R1 - capacité après extraction** : une extraction de l'état à l'instant `t` donne la
+  signature du rapport en cours à `t` et de tous les rapports ouverts après `t` ; un
+  rapport complet placé à un index futur n'est pas détectable cryptographiquement. Les
+  rapports clos avant `t` sont hors d'atteinte, sous réserve des versions antérieures de
+  l'état restées sur la flash (§10.1).
+- **R1b - annuaire** : la clé d'annuaire est persistante ; quiconque a extrait l'état peut
+  écrire dans l'annuaire et le clore, sans limite de durée. Le secours traite une clôture
+  d'annuaire comme une anomalie et sonde au-delà.
+- **R2 - rapport interrompu** : une clé perdue avant l'écriture de la clôture (mort du
+  processus, borne de vidange dépassée, échec d'écriture, effacement d'urgence pendant
+  l'enregistrement) laisse un rapport jamais clos : objets authentifiés un par un, fin non
+  certifiée.
+- **R3 - appareils migrés** : une extraction antérieure à la mise à jour a pu emporter
+  `report_master`, dont dérivent la chaîne **et** la clé d'annuaire. La migration clôt les
+  rapports legacy que le relais connaît et dont la file se vide ; les index legacy jamais
+  créés et l'annuaire restent inscriptibles par ce détenteur. La parade est une
+  ré-inscription avec une phrase neuve. Les objets legacy en attente à la migration sont
+  signés à la migration, pas à la production.
+- **R3b - authenticité legacy** : un objet legacy stocké sans signature n'est authentifié
+  que par son déchiffrement, or le scellement est anonyme (quiconque connaît la clé
+  publique d'archive peut sceller vers elle) ; il va dans la section « non vérifiable »,
+  jamais dans le témoignage vérifié. Une clôture legacy, vide, se lit « figé côté relais ».
+- **R4** - un rapport legacy dont la file ne se vide jamais reste ouvert.
+- **R5** - un objet refusé (409 rapport clos, ou conflit) reste sur le téléphone, dans le
+  répertoire d'échecs : il ne peut repartir sans nouvelle signature, et la clé n'existe plus.
+- **R6** - restaurer une sauvegarde antérieure du relais perd les clôtures plus récentes ;
+  les rapports concernés se lisent « interrompus » au secours.
+- **R7 - adresses en attente** : la file d'enveloppes chiffre ses en-têtes sous une clé
+  de file protégée par le Keystore (le niveau d'`EncryptedSharedPreferences`) ; une
+  extraction capable d'utiliser le Keystore de l'app lit les adresses (`report_id`, noms,
+  signatures) des enveloppes encore en attente, pas leur contenu.
+
 ### 10.3 Limites du panic wipe
 
 Le panic wipe est un **réducteur de surface**, pas une garantie absolue : il ne protège
 pas contre une image prise avant son déclenchement ; l'effacement physique sur NAND
-(wear-leveling) n'est pas démontrable depuis l'espace utilisateur ; il ne révoque pas
-l'identité côté serveur (choix délibéré : pas de signal réseau sous contrainte) ; et il
-suppose que l'utilisateur a pu le déclencher. Sa valeur réelle : après wipe, ce qui
-reste à extraire est un blob Argon2id sans son PIN et des blobs STRM sans leur phrase.
+(wear-leveling) n'est pas démontrable depuis l'espace utilisateur ; il n'efface pas les
+exports faits par le sélecteur de fichiers du système ; il ne révoque rien côté serveur
+(il n'existe pas de route de révocation d'identité, et le wipe n'émet volontairement aucun
+signal réseau sous contrainte) ; il abandonne le rapport en cours sans le clore (R2) et
+perd ce qui n'était pas encore envoyé ; et il suppose que l'utilisateur a pu le déclencher.
+Sa valeur réelle : après wipe, ce qui reste à extraire est un blob Argon2id sans son PIN et
+des blobs STRM sans leur phrase.
 
 ### 10.4 Métadonnées et couche réseau
 
@@ -1329,7 +1683,7 @@ de pertinence pour notre menace :
 
 - **Tor + service caché `.onion` (le plus ciblé).** Plutôt qu'obfusquer un tunnel vers
   une IP connue, exposer le relais en `.onion` V3 **supprime la destination
-  identifiable** : le client parle au réseau Tor, pas à `136.244.101.236:8443`, donc le
+  identifiable** : le client parle au réseau Tor, pas à l'IP fixe du relais, donc le
   signal « cet utilisateur parle au relais » disparaît à la racine. La résistance à la
   censure (pluggable transports obfs4 / Snowflake / meek) est maintenue et auditée par
   la communauté anti-censure. Coût réel : latence et jitter pénibles pour du streaming
@@ -1404,7 +1758,7 @@ destination reste un signal d'analyse de trafic. Et puisque le relais est désor
 par un **domaine** (§5.4), le `DirectTls` porte un **SNI en clair** ; Salamander le masque
 sur le chemin ObfQuic tant que l'UDP passe, mais **un État qui bloque UDP/443 force le
 downgrade `DirectTls` classifiable, qui ré-expose alors aussi le SNI**. C'est un **résidu
-assumé / hors-scope** (décision therealshulgin 2026-06-28) : pas de mode *fail-closed* offert (la
+assumé / hors-scope** (décision du mainteneur, 2026-06-28) : pas de mode *fail-closed* offert (la
 disponibilité du témoignage prime), Tor mesuré puis recalé (latence), et le sous-objectif
 « destination non corrélable » est **reporté au serveur de production final**. Le padding
 qui masquerait timing et volume est lui aussi hors scope (le débit prime pour du
@@ -1472,7 +1826,11 @@ obfuscation Salamander + fallback `DirectTls`, proxy de-obfs déployé sur le re
 clôturant le finding structurel D-1. Son code est couvert par la **vérification
 déterministe** (proptest round-trip + no-panic, Kani no-panic exhaustif sur les parseurs
 UDP hostiles, mutation), reflétée dans le `GUIDE_AUDITEUR`. S'ajoutent l'audit adverse
-2026-06-26 + sa remédiation (§8.9), le Lot 3 (D-1/D-2, §5.4/§10.4) et M-1 (§8.7).
+2026-06-26 + sa remédiation (§8.9), le Lot 3 (D-1/D-2, §5.4/§10.4) et M-1 (§8.7), puis la
+refonte des rapports : chaîne de clés à sens unique, signature à la production, clôture
+`0x09` et règle du relais après clôture, secours qui vérifie avant de ranger, lecture
+interne et effacement d'urgence étendu (§6.3, §7.3, §7.4, §8.3, §8.7). Elle est livrée en
+code et couverte par les tests ; sa validation sur appareil reste à faire.
 
 **Reste** - Phase 1 résiduelle : le DNS est **en place** (domaine `relay.shake-document-protect.org`,
 §5.4) avec cert auto-signé épinglé (stratégie bêta) ; reste la bascule Let's Encrypt à clé
@@ -1507,6 +1865,7 @@ cargo mutants                                  # mutation (config .cargo/mutants
 # Serveur
 cd server && python -m pytest tests/
 # Déploiement : docker compose build server && up -d server (MinIO reste up)
+# Le relais AVANT l'APK : sonde `POST /close/<rid>` sans en-têtes → 400 attendu, pas 404 (§8.3)
 ```
 
 ---
@@ -1544,17 +1903,35 @@ HKDF-SHA256 info :
   "frappuccino-v2-ratchet-batch-seeds"    (50 seeds par batch)
   "frappuccino-v2-ratchet-next-chain"     (chain suivante)
   "frappuccino-v2-ratchet-blob-mac"       (MAC du blob ratchet)
+  "stream.report.master.v1"               (maître des rapports legacy ; absent de l'appareil)
+  "stream.report.key.v1" ‖ u32_be(n)      (clé du rapport legacy n)
+  "stream.report.directory.v1"            (clé d'annuaire)
+  "stream.report.directory.entry.v1"      (noms d'entrée d'annuaire legacy)
+  "stream.report.chain.v2.root"           (C_0)
+  "stream.report.chain.v2.next"           (C_{i+1})
+  "stream.report.chain.v2.key"            (clé du rapport chaîne i)
+  "stream.report.chain.v2.directory-entry" (nom d'entrée d'annuaire i, 16 o)
+  "stream.report.chain.v2.ots-name"       (nom de la preuve OTS i, 16 o)
+report_id = SHA-256("stream.report.id.v1" ‖ report_pk)[..16]
+AAD de l'état de rapport = "frappuccino-report-state-v2" ; état = 0x02 ‖ u32_be(i) ‖ C_i(32) ‖ graine d'annuaire(32)
 
 # Ratchet
 BATCH_SIZE = 50 ; blob V2 = 4876 o (4844 payload + 32 MAC) ; auto-rotate ≤ 5 clés
 
 # Domaines de signature (R-C-1)
-# Miroir serveur byte-identique : 0x01-0x03, 0x07-0x08 (vérificateurs)
+# Miroir serveur byte-identique : 0x01-0x03, 0x07-0x09 (vérificateurs)
 # 0x04 : constante réservée côté serveur, sans vérificateur ; 0x05/0x06 : jamais de constante
 0x01 AuthChallenge · 0x02 BatchRotation · 0x03 Enrollment
 0x04 ArchiveAuth (RÉSERVÉ, retiré - archives sans identité, §8.7)
 0x05 ProvenanceManifest · 0x06 ProvenanceKeyAttestation (RÉSERVÉS, retirés - manifeste signé supprimé 2026-06-25)
-0x07 ReportCreate · 0x08 ReportWrite (capacités report relais-aveugles)
+0x07 ReportCreate · 0x08 ReportWrite · 0x09 ReportClose (capacités report relais-aveugles)
+
+# Rapports
+objet chaîne = "NNNNNN.strm" (seq de capture, 0 = métadonnées, ≤ 999 999) ; nom réservé "manifest"
+manifeste = "FQM1" ‖ u32_be(count) ‖ count × (u32_be(seq) ‖ sha256(blob)(32)), seq strictement croissants
+seq_limit = dernier seq + 1 (0 pour une clôture legacy, manifeste vide)
+métadonnée relais = x-amz-meta-report-write-sig (hex minuscule, 128 car.)
+enveloppe de file = payload ‖ en-tête XChaCha20-Poly1305 (clé de file, nonce 24 o) ‖ u32_be(len) ‖ "FQE1"
 
 # PIN store
 Argon2id m=256 MiB, t=4, p=1, tag=32 ; salt 16 ; XChaCha20-Poly1305 nonce 24 ;

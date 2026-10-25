@@ -53,9 +53,16 @@ content and no identity to read:
   phrase. A dump of the app's storage does not say *who*.
 - **The ratchet blob is sealed under the PIN.** The single-use signing keys are
   persisted only inside an Argon2id-wrapped, XChaCha20-Poly1305-sealed blob.
-  Coercing the PIN yields at worst a bounded, server-detectable window of *future*
-  signatures (every slot use is tracked, revocation cuts it off), never past
-  content.
+  Coercing the PIN yields no past content.
+- **A finished recording cannot be reopened.** Each recording is signed while it
+  is made, by a key of its own. When it stops, the phone signs a closure listing
+  exactly the recording's objects and erases that key; what it keeps (sealed under
+  the PIN) is one link of a one-way chain that derives the *next* recordings' keys,
+  never an earlier one. Once the relay holds the closure it refuses any new object
+  in that recording. The limit, stated plainly: whoever extracts that state can
+  sign the recording in progress and every later one, with no time limit and no
+  alert to the witness; the rescue shows each recording's dates to help spot what
+  follows a seizure.
 
 ### The plaintext window, and how it is closed
 
@@ -120,12 +127,12 @@ A forensic examiner does not stop at the filesystem.
   *inside* a decrypt could still leave a bounded register-proximal fragment, which
   is listed in the accepted-residuals file.
 - **One isolated `unsafe` module.** Long-term identity secrets (the Ed25519
-  signing key, the archive X25519 key, report and provenance keys) live in a
-  `LockedSecret` type that `mlock`s the pages against swap and zeroizes on drop.
+  signing key, the archive X25519 key, the provenance key, and the legacy report
+  master while an older install migrates) live in a `LockedSecret` type that `mlock`s the pages against swap and zeroizes on drop.
   That `mlock`/`munlock` is the only hand-written `unsafe` in the crypto core, in
   one commented module (the vetted dependencies contain `unsafe`, as every crypto
-  stack does). The ephemeral ratchet keys are zeroize-only by design: Android uses
-  zram rather than disk swap, so `mlock` buys little there and would touch the hot
+  stack does). The ephemeral ratchet keys and the report chain link are
+  zeroize-only by design: Android uses zram rather than disk swap, so `mlock` buys little there and would touch the hot
   path. That trade is in the design review.
 
 ## On the seized relay
@@ -183,7 +190,14 @@ court-grade chain of custody, is on
 - **Flash residue under a coerced PIN.** Secure deletion is best-effort on flash,
   and FBE only shields the residual from an attacker without the device key. Give
   an examiner the PIN and the two backstops that make the plaintext window small
-  are the ones doing the work, not a guarantee that no byte ever remains.
+  are the ones doing the work, not a guarantee that no byte ever remains. The same
+  caveat applies to earlier versions of the sealed report state: an old copy left
+  on flash would still derive the keys of recordings opened after it, and the PIN
+  is only a delay against it.
+- **Signing capacity going forward.** The extracted state signs the recording in
+  progress and every later one, and can write to the recording directory, with no
+  time limit. Closed recordings stay frozen. There is no identity revocation; the
+  way out is re-enrolling with a new phrase.
 
 ## Come break it
 

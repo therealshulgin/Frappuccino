@@ -20,6 +20,12 @@
 //!   `Arc<Self>` is `Send + Sync` without giving up `&mut self` semantics.
 //! * `EphemeralRatchet` similarly wraps in `Mutex<_>` for the same reason —
 //!   `sign_and_advance` + `advance_batch` need `&mut self`.
+//! * The report pipeline (`report_state`, `report_writer`, `envelopes`,
+//!   `rescue`) keeps the report keys and the device state inside Rust: Kotlin
+//!   passes file paths, moves envelope files whose trailers it cannot read,
+//!   and receives verdicts. The one secret that crosses is the queue key, out
+//!   once at generation and in at each process start, because Kotlin stores
+//!   it in the platform's protected storage.
 //!
 //! Note on lint overrides: the `UniFFI`-generated scaffolding emits
 //! `#[no_mangle]` functions and statics with the Rust ABI so the Kotlin
@@ -37,13 +43,42 @@ use frappuccino_crypto_core::pin_store as core_pin_store;
 use frappuccino_crypto_core::provenance as core_provenance;
 use frappuccino_crypto_core::ratchet as core_ratchet;
 use frappuccino_crypto_core::report as core_report;
+use frappuccino_crypto_core::report::ReportError as CoreReportError;
 use frappuccino_crypto_core::signature_domain::SignatureDomain;
 use frappuccino_crypto_core::CryptoError as CoreCryptoError;
 use frappuccino_crypto_stream::decrypt::decrypt as strm_core_decrypt;
+#[cfg(test)]
 use frappuccino_crypto_stream::encrypt::encrypt as strm_core_encrypt;
 use frappuccino_crypto_stream::{
     DecryptError as StreamDecryptError, EncryptError as StreamEncryptError,
-    ProtocolError as StreamProtocolError, SecureDeleteError as StreamSecureDeleteError,
+    EnvelopeError as StreamEnvelopeError, ProtocolError as StreamProtocolError,
+    SecureDeleteError as StreamSecureDeleteError,
+};
+
+// The report pipeline: the device state file, the writer that signs each
+// object when it is produced, the queue envelopes, and the rescue. Each module
+// keeps its own process-wide state; the UDL names their items at the crate
+// root, hence the re-exports.
+mod envelopes;
+mod report_state;
+mod report_writer;
+pub mod rescue;
+
+pub use envelopes::{
+    envelope_inspect, legacy_convert_directory_entry, legacy_convert_report_object,
+    legacy_write_closure, ots_proof_status, ots_ticket_commitment, ots_ticket_write,
+    pin_session_seal_ots_proof, queue_key_clear, queue_key_generate, queue_key_install,
+    queue_key_present, upload_send_envelope, EnvelopeInfo, EnvelopeKind, OtsStatus,
+};
+pub use report_state::{
+    pin_session_create_report_state, pin_session_migrate_report_state, pin_session_open_report,
+    report_state_wipe, report_writer_abort_live, report_writer_is_live,
+};
+pub use report_writer::{CloseInfo, ReportWriter, SealedChunk};
+pub use rescue::{
+    ArchiveClosureInfo, ArchiveFetchStatus, ArchiveListing, ArchiveObjectResult, ClosureState,
+    ObjectStatus, ReportCheck, ReportRescue, ReportScheme, ReportStatus, ReportVerdict,
+    RescuePlanner, RescueTarget, WriteSigState,
 };
 
 uniffi::include_scaffolding!("frappuccino");
@@ -84,6 +119,30 @@ pub enum FfiError {
     /// FS error (file gone, permission denied) from a logic bug.
     #[error("I/O error: {detail}")]
     Io { detail: String },
+    /// The report writer was closed or aborted: it seals nothing more.
+    #[error("report writer closed")]
+    WriterClosed,
+    /// A report writer is already live in this process. Close or abort it
+    /// before opening another one.
+    #[error("a report writer is already live")]
+    WriterBusy,
+    /// No queue key is installed, so no envelope can be written or read.
+    /// The envelope files stay where they are.
+    #[error("no queue key installed")]
+    NoQueueKey,
+    /// The envelope is damaged or does not verify. It must never be sent and
+    /// never be signed again.
+    #[error("envelope corrupt: {detail}")]
+    EnvelopeCorrupt { detail: String },
+    /// The report layer refused the operation: a sequence number out of
+    /// order or already sealed, a migration point behind the state on disk,
+    /// and the like. Retrying the same call fails the same way.
+    #[error("report refused: {detail}")]
+    ReportRefused { detail: String },
+    /// The relay answered 429. Wait at least `retry_after_secs` before the
+    /// next request.
+    #[error("rate limited, retry after {retry_after_secs}s")]
+    RateLimited { retry_after_secs: u64 },
 }
 
 impl From<CoreCryptoError> for FfiError {
@@ -150,6 +209,66 @@ impl From<StreamProtocolError> for FfiError {
             StreamProtocolError::Invalid(m) => Self::InvalidBlob { detail: m },
             StreamProtocolError::Io(io) => Self::Io {
                 detail: io.to_string(),
+            },
+            StreamProtocolError::RateLimited { retry_after } => Self::RateLimited {
+                retry_after_secs: retry_after.as_secs(),
+            },
+        }
+    }
+}
+
+impl From<CoreReportError> for FfiError {
+    fn from(e: CoreReportError) -> Self {
+        // Exhaustive on purpose: a new report error must be classified here.
+        match e {
+            CoreReportError::Crypto(c) => Self::from(c),
+            CoreReportError::WriterClosing => Self::WriterClosed,
+            CoreReportError::InvalidSignature => Self::InvalidSignature,
+            CoreReportError::InvalidState(_)
+            | CoreReportError::InvalidManifest(_)
+            | CoreReportError::SeqLimitMismatch
+            | CoreReportError::InvalidPublicKey => Self::InvalidBlob {
+                detail: e.to_string(),
+            },
+            CoreReportError::IndexExhausted
+            | CoreReportError::MigrationIndexTooLarge { .. }
+            | CoreReportError::SeqOutOfRange(_)
+            | CoreReportError::SeqReservedForMetadata
+            | CoreReportError::MetadataRequired
+            | CoreReportError::DuplicateSeq(_)
+            | CoreReportError::ForeignPreparation => Self::ReportRefused {
+                detail: e.to_string(),
+            },
+        }
+    }
+}
+
+impl From<StreamEnvelopeError> for FfiError {
+    fn from(e: StreamEnvelopeError) -> Self {
+        // Exhaustive on purpose, like the report errors above.
+        match e {
+            StreamEnvelopeError::NotFound | StreamEnvelopeError::Io { .. } => Self::Io {
+                detail: e.to_string(),
+            },
+            StreamEnvelopeError::NoTrailer
+            | StreamEnvelopeError::Malformed(_)
+            | StreamEnvelopeError::Undecryptable
+            | StreamEnvelopeError::ReportIdMismatch
+            | StreamEnvelopeError::PayloadMismatch
+            | StreamEnvelopeError::Verification(_) => Self::EnvelopeCorrupt {
+                detail: e.to_string(),
+            },
+            StreamEnvelopeError::Signing(report) => Self::from(report),
+            StreamEnvelopeError::InvalidFields(_)
+            | StreamEnvelopeError::NoCreateSig
+            | StreamEnvelopeError::CreationNotApplicable => Self::ReportRefused {
+                detail: e.to_string(),
+            },
+            StreamEnvelopeError::InvalidQueueKey => Self::InvalidBlob {
+                detail: e.to_string(),
+            },
+            StreamEnvelopeError::Rng | StreamEnvelopeError::Seal => Self::Internal {
+                detail: e.to_string(),
             },
         }
     }
@@ -762,10 +881,15 @@ struct StrmPlaintext {
 /// Encrypt `plaintext` as a self-sealed STRM blob. Picks SINGLE or CHUNKED
 /// automatically based on size (`> 10 MiB` = CHUNKED).
 ///
+/// Test-only, not FFI-exported: the app encrypts inside the report writer
+/// (`ReportWriter::seal_chunk_file`), which reads the plaintext from disk, so
+/// no plaintext buffer crosses the FFI to be encrypted.
+///
 /// # Errors
 /// Forwards [`StreamEncryptError`] via [`FfiError`].
+#[cfg(test)]
 #[allow(clippy::needless_pass_by_value)]
-pub fn strm_encrypt(plaintext: &[u8], author: Arc<StreamIdentity>) -> Result<Vec<u8>, FfiError> {
+fn strm_encrypt(plaintext: &[u8], author: Arc<StreamIdentity>) -> Result<Vec<u8>, FfiError> {
     strm_core_encrypt(plaintext, &author.inner).map_err(FfiError::from)
 }
 
@@ -779,68 +903,6 @@ pub fn strm_encrypt(plaintext: &[u8], author: Arc<StreamIdentity>) -> Result<Vec
 #[must_use]
 pub fn archive_blob_filename_is_safe(name: &str) -> bool {
     frappuccino_crypto_stream::is_safe_blob_filename(name)
-}
-
-/// Phase 6.1.4-C — variante "le plaintext ne touche jamais la JVM heap".
-///
-/// Lit `input_path` (typiquement un MP4 plaintext sur disk produit par `CameraX`),
-/// chiffre en STRM, écrit le résultat à `output_path`. Le plaintext est
-/// chargé en `Zeroizing<Vec<u8>>` côté Rust : la mémoire est wipée
-/// automatiquement au drop (via `volatile_set_memory` du crate zeroize,
-/// résistant aux optimisations LLVM).
-///
-/// Pourquoi : avant ce refactor, `strm_encrypt` recevait un `&[u8]` que
-/// Kotlin construisait via `chunkFile.readBytes()` — le plaintext existait
-/// donc en heap JVM pendant ~10ms (durée de la copie + FFI). Un dump heap
-/// pendant ce temps exposait la vidéo en clair. Maintenant Rust ouvre
-/// directement le file et le `ByteArray` Kotlin n'existe pas.
-///
-/// Retourne la taille du blob écrit (octets) pour log côté caller.
-///
-/// # Errors
-/// [`FfiError::Io`] sur erreur I/O (file not found, permission denied,
-/// disk full). [`FfiError::Internal`] / autres pour erreurs crypto.
-#[allow(clippy::needless_pass_by_value)]
-pub fn strm_encrypt_file(
-    input_path: &str,
-    output_path: &str,
-    author: Arc<StreamIdentity>,
-) -> Result<u64, FfiError> {
-    use zeroize::Zeroizing;
-    // Lit le file en Vec<u8> et wrap immédiatement en Zeroizing pour wipe
-    // au drop. Le crate zeroize utilise `volatile_set_memory` que LLVM ne
-    // peut pas éliminer (= équivalent du ZeroizeOnDrop pattern).
-    let plaintext = Zeroizing::new(std::fs::read(input_path).map_err(|e| FfiError::Io {
-        detail: format!("read {input_path}: {e}"),
-    })?);
-    let blob = strm_core_encrypt(&plaintext, &author.inner).map_err(FfiError::from)?;
-    let blob_len = blob.len() as u64;
-    // WP-D (audit H1) — fsync the .strm BEFORE returning. The caller
-    // (StreamChunkEncryptor.encryptChunk) secure-deletes the plaintext MP4 the
-    // instant this returns, and THAT delete is synced. With a bare
-    // `std::fs::write` the blob's data blocks can still sit in the page cache
-    // while the only other copy (the plaintext) is durably destroyed — a
-    // power-loss in that window is total, silent loss of the chunk. File::create
-    // + write_all + sync_all forces the blob to stable storage first.
-    let mut f = std::fs::File::create(output_path).map_err(|e| FfiError::Io {
-        detail: format!("create {output_path}: {e}"),
-    })?;
-    std::io::Write::write_all(&mut f, &blob).map_err(|e| FfiError::Io {
-        detail: format!("write {output_path}: {e}"),
-    })?;
-    f.sync_all().map_err(|e| FfiError::Io {
-        detail: format!("sync {output_path}: {e}"),
-    })?;
-    drop(f);
-    // Best-effort fsync of the parent directory so the new file's directory
-    // entry is durable too (the data sync above covers the blocks; the entry
-    // needs a dir fsync on some filesystems). Unix-only (Android target); a
-    // no-op elsewhere where a directory can't be opened as a File.
-    #[cfg(unix)]
-    if let Some(parent) = std::path::Path::new(output_path).parent() {
-        let _ = std::fs::File::open(parent).and_then(|d| d.sync_all());
-    }
-    Ok(blob_len)
 }
 
 /// Decrypt a STRM blob under `archive`. Returns plaintext + metadata.
@@ -873,8 +935,7 @@ fn strm_decrypt(blob: &[u8], archive: Arc<ArchiveIdentity>) -> Result<StrmPlaint
 }
 
 /// Phase H2-B.18 (Red MED-4 fix, 2026-05-19) — `strm_decrypt` variant
-/// where the plaintext never touches the JVM heap, mirroring
-/// [`strm_encrypt_file`].
+/// where the plaintext never touches the JVM heap.
 ///
 /// Reads the encrypted STRM blob from `input_path` (encrypted, so safe
 /// to materialise as a regular `Vec<u8>` here), decrypts inside Rust
@@ -1072,11 +1133,17 @@ fn hex_lower(bytes: &[u8]) -> String {
     s
 }
 
-/// FFI wrapper for `core::report::ReportKeyring` — the witness's per-report
-/// capability keyring (Phase C relay-blind reports). Derives a per-report key
-/// `R_n` from the BIP-39 seed under a dedicated HKDF context; the relay stores
-/// `report_id → report_pk`, never the identity. Immutable after construction
-/// (`report_master` stays mlock'd inside) → no lock, like [`ProvenanceSigner`].
+/// FFI wrapper for `core::report::ReportKeyring`, the legacy per-index report
+/// keyring derived from `report_master`.
+///
+/// Its only remaining role is the migration of a device enrolled before the
+/// chained scheme: Kotlin reloads it from the PIN-sealed master with
+/// [`pin_session_open_report_keyring`] and hands it to the
+/// `legacy_convert_*` / `legacy_write_closure` calls, which sign the legacy
+/// objects still pending and close the legacy reports. Nothing else takes it,
+/// and no method exposes its derivations: a migrated device must not keep
+/// producing legacy addresses. Immutable after construction (`report_master`
+/// stays mlock'd inside), so no lock, like [`ProvenanceSigner`].
 pub struct ReportKeyring {
     inner: core_report::ReportKeyring,
 }
@@ -1088,33 +1155,14 @@ impl std::fmt::Debug for ReportKeyring {
 }
 
 impl ReportKeyring {
-    /// Enrollment-time derivation from a BIP-39 mnemonic. UTF-8 bytes (the
-    /// mnemonic never touches the Java intern pool), like
-    /// [`ProvenanceSigner::from_mnemonic`]. The caller PIN-seals the master
-    /// in-crate afterwards via [`Self::seal_with_session`] (no secret crosses).
-    ///
-    /// # Errors
-    /// [`FfiError::InvalidMnemonic`] if not UTF-8; otherwise any derivation error.
-    pub fn from_mnemonic(mnemonic: &[u8], passphrase: &[u8]) -> Result<Self, FfiError> {
-        let mnemonic_s = std::str::from_utf8(mnemonic).map_err(|e| FfiError::InvalidMnemonic {
-            detail: format!("mnemonic bytes are not valid UTF-8: {e}"),
-        })?;
-        let passphrase_s =
-            std::str::from_utf8(passphrase).map_err(|e| FfiError::InvalidMnemonic {
-                detail: format!("passphrase bytes are not valid UTF-8: {e}"),
-            })?;
-        core_report::ReportKeyring::from_mnemonic(mnemonic_s, passphrase_s)
-            .map(|inner| Self { inner })
-            .map_err(FfiError::from)
-    }
-
-    /// Recording-time reconstruction from the persisted 32-byte `report_master`
-    /// (unsealed from the PIN store at unlock).
+    /// Reconstruction from the 32-byte `report_master` unsealed from the PIN
+    /// store. Not exported: [`pin_session_open_report_keyring`] is the only
+    /// caller, so the master never crosses the FFI.
     ///
     /// # Errors
     /// [`FfiError::InvalidBlob`] if `report_master` isn't 32 bytes;
     /// [`FfiError::DerivationFailed`] on an mlock failure.
-    pub fn from_seed(report_master: &[u8]) -> Result<Self, FfiError> {
+    fn from_seed(report_master: &[u8]) -> Result<Self, FfiError> {
         let arr: [u8; 32] = report_master
             .try_into()
             .map_err(|_| FfiError::InvalidBlob {
@@ -1126,110 +1174,6 @@ impl ReportKeyring {
         core_report::ReportKeyring::from_seed(&arr)
             .map(|inner| Self { inner })
             .map_err(FfiError::from)
-    }
-
-    /// Lot 4b (OPTION B) — seal the report master with the held PIN-session key,
-    /// all in-crate. Returns the sealed blob; the 32-byte master never crosses
-    /// the FFI (the enrollment master-seal path — the secret never touches the
-    /// JVM; the old `master_bytes()` export was retired in P6).
-    ///
-    /// # Errors
-    /// [`FfiError::Internal`] if no PIN session is active; seal errors forward.
-    pub fn seal_with_session(&self) -> Result<Vec<u8>, FfiError> {
-        self.inner.with_master_bytes(|master| {
-            match with_pin_session(|key, salt| core_pin_store::seal_with_key(key, salt, master)) {
-                Some(res) => res.map_err(FfiError::from),
-                None => Err(FfiError::Internal {
-                    detail: "seal report master: no active PIN session".into(),
-                }),
-            }
-        })
-    }
-
-    /// `report_id_n` as 32 lowercase hex chars — the identity-free URL address
-    /// of report `n` (`PUT`/`GET /file/{report_id}/...`).
-    ///
-    /// # Errors
-    /// Derivation errors forward from core.
-    pub fn report_id_hex(&self, n: u32) -> Result<String, FfiError> {
-        let id = self.inner.report_id(n).map_err(FfiError::from)?;
-        Ok(hex_lower(&id))
-    }
-
-    /// `report_pk_n` (32 bytes) — the `X-Report-PK` header value (the relay
-    /// binds `report_id == H(report_pk)` at creation).
-    ///
-    /// # Errors
-    /// Derivation errors forward from core.
-    pub fn report_pk(&self, n: u32) -> Result<Vec<u8>, FfiError> {
-        self.inner
-            .report_pk(n)
-            .map(|pk| pk.to_vec())
-            .map_err(FfiError::from)
-    }
-
-    /// `create_sig` (64 bytes) = `Ed25519(R_n, 0x07 ‖ report_id ‖ report_pk)`.
-    /// The `X-Report-Create-Sig` header on the first chunk PUT.
-    ///
-    /// # Errors
-    /// Derivation errors forward from core.
-    pub fn sign_create(&self, n: u32) -> Result<Vec<u8>, FfiError> {
-        self.inner
-            .sign_create(n)
-            .map(|s| s.to_vec())
-            .map_err(FfiError::from)
-    }
-
-    /// `write_sig` (64 bytes) = `Ed25519(R_n, 0x08 ‖ report_id ‖ filename ‖
-    /// body_sha256)`. The `X-Report-Write-Sig` header on every chunk PUT.
-    /// `body_sha256` is the 32-byte SHA-256 of the sealed `.strm` the relay
-    /// stores (must match the relay's streaming hash byte-for-byte).
-    ///
-    /// # Errors
-    /// [`FfiError::InvalidBlob`] if `body_sha256` isn't 32 bytes; derivation
-    /// errors forward from core.
-    pub fn sign_write(
-        &self,
-        n: u32,
-        filename: &str,
-        body_sha256: &[u8],
-    ) -> Result<Vec<u8>, FfiError> {
-        let hash: [u8; 32] = body_sha256.try_into().map_err(|_| FfiError::InvalidBlob {
-            detail: format!("body_sha256 must be 32 bytes, got {}", body_sha256.len()),
-        })?;
-        self.inner
-            .sign_write(n, filename.as_bytes(), &hash)
-            .map(|s| s.to_vec())
-            .map_err(FfiError::from)
-    }
-
-    /// `report_id` of the report DIRECTORY (the singleton, phrase-derived report
-    /// whose blob names are the allocated report indices) as 32 lowercase hex —
-    /// the identity-free address the rescue device fetches to learn `n_max`, and
-    /// the device writes one entry to per session. The directory's `report_pk` +
-    /// create/write sigs are derived + applied INSIDE
-    /// [`upload_put_directory_entry`], so they never cross the FFI separately.
-    ///
-    /// # Errors
-    /// Derivation errors forward from core.
-    pub fn directory_id_hex(&self) -> Result<String, FfiError> {
-        let id = self.inner.directory_id().map_err(FfiError::from)?;
-        Ok(hex_lower(&id))
-    }
-
-    /// The opaque blob NAME (32 lowercase hex) of directory entry `n` (M-1) — the
-    /// relay-visible filename the writer PUTs for session `n`'s directory entry,
-    /// and the value the rescue device re-derives + matches to recover `n_max`.
-    /// Hex of [`frappuccino_crypto_core::report::ReportKeyring::directory_entry_name`]
-    /// (secret-derived from `report_master`, so the relay cannot enumerate it).
-    /// Replaces the old plain `%010d` index, which fingerprinted the directory and
-    /// leaked the session count/cadence off the names.
-    ///
-    /// # Errors
-    /// Derivation errors forward from core.
-    pub fn directory_entry_name_hex(&self, n: u32) -> Result<String, FfiError> {
-        let name = self.inner.directory_entry_name(n).map_err(FfiError::from)?;
-        Ok(hex_lower(&name))
     }
 }
 
@@ -1537,10 +1481,11 @@ pub fn pin_session_open_provenance_signer(
     // seed (Zeroizing) drops here → wiped.
 }
 
-/// FFI — unlock reload (OPTION B): unseal the report master with the held
-/// PIN-session key and reconstruct the keyring, all in-crate. The 32-byte master
-/// never crosses the FFI (replaces `pin_store_open_with_key` +
-/// `ReportKeyring.from_seed`).
+/// FFI — migration only: unseal the legacy `report_master` with the held
+/// PIN-session key and rebuild the legacy keyring, all in-crate. The 32-byte
+/// master never crosses the FFI. The keyring is what the `legacy_convert_*`
+/// and `legacy_write_closure` calls sign with; a device that has migrated, or
+/// that enrolled under the chained scheme, has no master and never calls this.
 ///
 /// # Errors
 /// [`FfiError::WrongPin`] on a bad blob, [`FfiError::Internal`] if no PIN session
@@ -1560,312 +1505,64 @@ pub fn pin_session_open_report_keyring(sealed_blob: &[u8]) -> Result<Arc<ReportK
     // master (Zeroizing) drops here → wiped.
 }
 
-/// Transport selector for [`upload_put_report_chunk`] and
-/// [`upload_put_directory_entry`].
+/// Transport selector for [`upload_send_envelope`].
 #[derive(Debug, Clone, Copy)]
 pub enum TransportMode {
-    /// Pinned TLS-over-TCP transport (`reqwest::blocking`) — Phase 1.
+    /// Pinned TLS-over-TCP transport (`reqwest::blocking`).
     DirectTls,
-    /// Pinned HTTP/3-over-QUIC transport (`quinn` + `h3` + BBR) — Phase 3a, with
-    /// an automatic QUIC->`DirectTls` fallback (Phase 3b brick 3): a QUIC
-    /// transport-establishment failure routes the chunk over `DirectTls` for the
-    /// same bearer, and latches so subsequent chunks skip QUIC until the next
-    /// auth clear. A `.so` built without the `quic` feature behaves as
-    /// `DirectTls`.
+    /// Pinned HTTP/3-over-QUIC transport (`quinn` + `h3` + BBR, under the
+    /// Salamander obfuscation), with an automatic fallback to `DirectTls`: a
+    /// QUIC attempt that fails without an HTTP status is re-sent over TLS in
+    /// the same call, and a connection that cannot be established latches QUIC
+    /// off until [`upload_transport_rearm`] or an auth clear. A `.so` built
+    /// without the `quic` feature behaves as `DirectTls`.
     ObfQuic,
 }
 
-/// Result of [`upload_put_report_chunk`] and [`upload_put_directory_entry`].
-/// `http_status == 0` means no HTTP response
-/// (connect / TLS / timeout / IO, or no bearer); `error_detail` is a short
-/// machine tag (`no_bearer`, `file_missing`, `timeout`, `network`,
-/// `client_build`). The Kotlin worker maps `http_status` through its existing
-/// status-code branches unchanged.
+impl From<TransportMode> for frappuccino_crypto_stream::Transport {
+    fn from(mode: TransportMode) -> Self {
+        match mode {
+            TransportMode::DirectTls => Self::DirectTls,
+            TransportMode::ObfQuic => Self::ObfQuic,
+        }
+    }
+}
+
+/// Result of [`upload_send_envelope`]. `http_status == 0` means no HTTP
+/// response was obtained; `error_detail` is then a short machine tag (see
+/// [`upload_send_envelope`] for the tags it can carry). The Kotlin worker maps
+/// `http_status` through its status-code table.
 #[derive(Debug, Clone)]
 pub struct PutOutcome {
     /// HTTP status, or `0` when no response was obtained.
     pub http_status: u16,
     /// Wall-clock duration of the attempt, milliseconds.
     pub upload_ms: u64,
-    /// Phase 3.49 (2026-06-23) — signal-A goodput. Transfer-only duration in
-    /// ms (`send`/`do_put`, excluding setup + connect); `0` on failure / no
-    /// transfer. Logging-only: the Kotlin worker emits `goodputKbps` from it
-    /// but the adaptive decision still rides `upload_ms`. See
+    /// Transfer-only duration in ms (excluding setup and connect); `0` on
+    /// failure. Logging only: the Kotlin worker derives a goodput figure from
+    /// it, the adaptive decision rides `upload_ms`. See
     /// [`frappuccino_crypto_stream::PutResult::transfer_ms`].
     pub transfer_ms: u64,
-    /// Short machine tag when `http_status == 0`, else `None`.
+    /// Short machine tag when `http_status == 0`; with a response, only
+    /// `report_closed` (a 409 for a name the report's closure does not
+    /// cover), else `None`.
     pub error_detail: Option<String>,
-    /// Which transport actually delivered this chunk (Lot 3 B observability):
-    /// `"obfquic"` (Salamander/QUIC established + delivered), `"directtls"`
-    /// (release path or a no-`quic` `.so`), `"directtls_fallback"` (QUIC tried
-    /// but failed to deliver → this chunk re-PUT over TLS), `"directtls_degraded"`
-    /// (QUIC latched degraded this session → skipped), or `"none"` (failed before
-    /// any PUT: no bearer / missing blob). Surfaced in the `StreamMetrics`
-    /// `transport=` field so a field-test SHOWS whether the wire is obfuscated or
-    /// silently fell back to the classifiable direct path (D-1).
+    /// Which transport actually carried the request: `"obfquic"`,
+    /// `"directtls"`, `"directtls_fallback"` (QUIC tried, re-sent over TLS),
+    /// `"directtls_degraded"` (QUIC latched off), or `"none"` (failed before
+    /// any request). Logged so a field test shows whether the wire was
+    /// obfuscated or fell back to the direct path.
     pub transport_used: String,
 }
 
-// `upload_put_chunk` REMOVED (2026-09-03). It was the Phase 1 chunk PUT, taking
-// only a bearer, and it lost its last caller when Phase C made every write carry
-// a per-report capability signature (`upload_put_report_chunk` /
-// `upload_put_directory_entry` below). It had no Kotlin caller left, in
-// production or in any harness.
-//
-// It went with `stream::put_chunk` and `stream::put_chunk_quic`, of which it was
-// the sole caller. That second half is the part worth remembering: both are
-// `pub` and re-exported from the stream crate, so removing only this function
-// would have left them with zero callers and NO dead-code warning, and the
-// shipped .so would have carried two unreachable transport entry points while
-// the FFI surface looked smaller. Reducing a surface means reducing what the
-// binary contains, not what the header advertises.
-
-/// Streaming SHA-256 of a file (the ciphertext `.strm`) — byte-identical to the
-/// relay's `hashlib.sha256(body)` over the streamed request body. Returns `None`
-/// on a missing / empty / unreadable file (the concurrent-upload race the
-/// transport reports as `file_missing`). Streamed in 8 KiB reads so a large
-/// media PUT never materializes the whole blob in RAM.
-const SHA256_STREAM_BUF: usize = 8 * 1024; // 8 KiB — bounded RAM regardless of blob size.
-fn sha256_file(path: &str) -> Option<[u8; 32]> {
-    use sha2::{Digest, Sha256};
-    use std::io::Read as _;
-    let mut file = std::fs::File::open(path).ok()?;
-    if file.metadata().ok()?.len() == 0 {
-        return None;
-    }
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; SHA256_STREAM_BUF];
-    loop {
-        let read = file.read(&mut buf).ok()?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buf[..read]);
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&hasher.finalize());
-    Some(out)
-}
-
-/// Phase C (relay-blind reports) — PUT one already-encrypted `.strm` chunk over
-/// the pinned Rust transport, authorized by the per-report capability key `R_n`
-/// (`core::report`) instead of by the identity. EVERY chunk carries
-/// `X-Report-PK` + `X-Report-Write-Sig` (`0x08`, over `report_id ‖ filename ‖
-/// sha256(body)`); ONLY the creating chunk additionally carries
-/// `X-Report-Create-Sig` (`0x07`) + the stream JWT bearer (proof of enrollment;
-/// the relay discards the identity after its anti-abuse counter).
-///
-/// The `.strm` is hashed IN Rust (streaming, ciphertext) so the body hash signed
-/// here is byte-identical to the relay's hash over the request body. The keyring
-/// re-derives `report_pk` / `report_id` / signatures from `n` internally
-/// (`report_id == H(report_pk)` by construction); no secret crosses the FFI.
-/// Never throws — every failure is reported in the [`PutOutcome`]
-/// (`file_missing` on a concurrent-upload race, `no_report_sk` if signing fails,
-/// `no_bearer` if a creating chunk has no held bearer).
-// `keyring` is taken by value (`Arc<ReportKeyring>`): UniFFI passes interface
-// handles as an owned `Arc`, so the scaffolding requires this signature even
-// though the body only calls `&self` methods (same as
-// `provenance_ots_commitment`). The lint can't see the FFI ABI constraint.
-#[must_use]
-#[allow(clippy::needless_pass_by_value)]
-pub fn upload_put_report_chunk(
-    url: &str,
-    blob_path: &str,
-    mode: TransportMode,
-    keyring: Arc<ReportKeyring>,
-    n: u32,
-    filename: &str,
-    is_creation: bool,
-) -> PutOutcome {
-    let fail = |detail: &str| PutOutcome {
-        http_status: 0,
-        upload_ms: 0,
-        transfer_ms: 0,
-        error_detail: Some(detail.to_owned()),
-        transport_used: "none".to_owned(),
-    };
-
-    // Hash the .strm (streaming, ciphertext) — byte-identical to the relay's
-    // streaming hash over the request body. Missing/empty = the concurrent-
-    // upload race the transport reports as `file_missing` (caller treats as
-    // success); surface the same tag without sending anything.
-    let Some(body_sha256) = sha256_file(blob_path) else {
-        return fail("file_missing");
-    };
-
-    // Derive + sign inside Rust (the keyring re-derives report_pk/report_id from
-    // n; no secret crosses the FFI).
-    let (Ok(report_pk), Ok(write_sig)) = (
-        keyring.report_pk(n),
-        keyring.sign_write(n, filename, &body_sha256),
-    ) else {
-        return fail("no_report_sk");
-    };
-    let report_pk_hex = hex_lower(&report_pk);
-    let write_sig_hex = hex_lower(&write_sig);
-
-    // Owned holders for the creation-only headers (empty when not creating).
-    let mut create_sig_hex = String::new();
-    let mut bearer = zeroize::Zeroizing::new(String::new());
-    if is_creation {
-        let Ok(cs) = keyring.sign_create(n) else {
-            return fail("no_report_sk");
-        };
-        create_sig_hex = hex_lower(&cs);
-        // The bearer is read inside Rust from the holder; it never crosses the
-        // FFI. TOCTOU: if it was cleared between the gate and here, fail cleanly
-        // (the chunk stays on disk, the worker retries).
-        match upload_jwt_guard().as_ref() {
-            Some(z) => bearer = zeroize::Zeroizing::new(z.as_str().to_owned()),
-            None => return fail("no_bearer"),
-        }
-    }
-
-    let mut headers: Vec<(&str, &str)> = vec![
-        ("X-Report-PK", report_pk_hex.as_str()),
-        ("X-Report-Write-Sig", write_sig_hex.as_str()),
-    ];
-    if is_creation {
-        headers.push(("X-Report-Create-Sig", create_sig_hex.as_str()));
-        headers.push(("Authorization", bearer.as_str()));
-    }
-
-    dispatch_capability_put(url, blob_path, mode, &headers)
-}
-
-/// Shared transport dispatch for the capability PUT paths
-/// ([`upload_put_report_chunk`] / [`upload_put_directory_entry`]): the same mode
-/// selection + QUIC->DirectTls fallback over a pre-built header set, so the two
-/// entry points stay byte-for-byte identical on the wire and the transport logic
-/// has one home.
-fn dispatch_capability_put(
-    url: &str,
-    blob_path: &str,
-    mode: TransportMode,
-    headers: &[(&str, &str)],
-) -> PutOutcome {
-    let (r, transport_used) = match mode {
-        TransportMode::DirectTls => (
-            frappuccino_crypto_stream::put_chunk_with_headers(url, blob_path, headers),
-            "directtls",
-        ),
-        TransportMode::ObfQuic => {
-            #[cfg(not(feature = "quic"))]
-            {
-                (
-                    frappuccino_crypto_stream::put_chunk_with_headers(url, blob_path, headers),
-                    "directtls",
-                )
-            }
-            #[cfg(feature = "quic")]
-            {
-                if frappuccino_crypto_stream::quic_is_degraded() {
-                    (
-                        frappuccino_crypto_stream::put_chunk_with_headers(url, blob_path, headers),
-                        "directtls_degraded",
-                    )
-                } else {
-                    let q = frappuccino_crypto_stream::put_chunk_quic_with_headers(
-                        url, blob_path, headers,
-                    );
-                    let transport_failed = q.http_status == 0
-                        && !matches!(q.error_detail.as_deref(), Some("file_missing" | "bad_url"));
-                    if transport_failed {
-                        let mut tls = frappuccino_crypto_stream::put_chunk_with_headers(
-                            url, blob_path, headers,
-                        );
-                        if tls.http_status == 0 {
-                            let qt = q.error_detail.as_deref().unwrap_or("quic");
-                            let tt = tls.error_detail.as_deref().unwrap_or("network");
-                            tls.error_detail = Some(format!("quic_fallback:{qt}->{tt}"));
-                        }
-                        (tls, "directtls_fallback")
-                    } else {
-                        (q, "obfquic")
-                    }
-                }
-            }
-        }
-    };
-    PutOutcome {
-        http_status: r.http_status,
-        upload_ms: r.upload_ms,
-        transfer_ms: r.transfer_ms,
-        error_detail: r.error_detail,
-        transport_used: transport_used.to_owned(),
-    }
-}
-
-/// Phase C (relay-blind reports) — PUT one report-DIRECTORY entry: a tiny blob
-/// whose `filename` is the opaque [`ReportKeyring::directory_entry_name_hex`] of
-/// an allocated report index (M-1 — secret-derived, not the plain index), written
-/// to the witness's singleton directory report so the rescue device can recover
-/// the authoritative `n_max` by re-deriving + matching the entry names
-/// (derive-and-match) and enumerate reports EXACTLY rather than guessing where to
-/// stop. The body carries no index (it is stored unsealed; M-1). Identical capability contract +
-/// transport as [`upload_put_report_chunk`], but addressed/signed by the
-/// directory key (`keyring.inner.directory_*`) rather than a per-index key.
-/// `is_creation` is true only for the entry that lazily creates the directory
-/// report (the first one to land; subsequent entries 425-retry until then).
-/// Never throws — failures are reported in the [`PutOutcome`].
-#[must_use]
-#[allow(clippy::needless_pass_by_value)]
-pub fn upload_put_directory_entry(
-    url: &str,
-    blob_path: &str,
-    mode: TransportMode,
-    keyring: Arc<ReportKeyring>,
-    filename: &str,
-    is_creation: bool,
-) -> PutOutcome {
-    let fail = |detail: &str| PutOutcome {
-        http_status: 0,
-        upload_ms: 0,
-        transfer_ms: 0,
-        error_detail: Some(detail.to_owned()),
-        transport_used: "none".to_owned(),
-    };
-
-    let Some(body_sha256) = sha256_file(blob_path) else {
-        return fail("file_missing");
-    };
-
-    // Derive + sign with the DIRECTORY key inside Rust (no secret crosses the FFI).
-    let (Ok(report_pk), Ok(write_sig)) = (
-        keyring.inner.directory_pk(),
-        keyring
-            .inner
-            .sign_directory_write(filename.as_bytes(), &body_sha256),
-    ) else {
-        return fail("no_report_sk");
-    };
-    let report_pk_hex = hex_lower(&report_pk);
-    let write_sig_hex = hex_lower(&write_sig);
-
-    let mut create_sig_hex = String::new();
-    let mut bearer = zeroize::Zeroizing::new(String::new());
-    if is_creation {
-        let Ok(cs) = keyring.inner.sign_directory_create() else {
-            return fail("no_report_sk");
-        };
-        create_sig_hex = hex_lower(&cs);
-        match upload_jwt_guard().as_ref() {
-            Some(z) => bearer = zeroize::Zeroizing::new(z.as_str().to_owned()),
-            None => return fail("no_bearer"),
-        }
-    }
-
-    let mut headers: Vec<(&str, &str)> = vec![
-        ("X-Report-PK", report_pk_hex.as_str()),
-        ("X-Report-Write-Sig", write_sig_hex.as_str()),
-    ];
-    if is_creation {
-        headers.push(("X-Report-Create-Sig", create_sig_hex.as_str()));
-        headers.push(("Authorization", bearer.as_str()));
-    }
-
-    dispatch_capability_put(url, blob_path, mode, &headers)
-}
+// `upload_put_report_chunk` and `upload_put_directory_entry` are gone. They
+// signed each object at SEND time, from a keyring kept live for the whole
+// session, which is exactly what the report rework removes: every object is now
+// signed when it is produced, the signature travels in a queue envelope, and
+// [`upload_send_envelope`] only reads it. Legacy objects still pending at the
+// migration are signed once, by the `legacy_convert_*` calls, and then sent as
+// envelopes like the rest. Their private helpers (`sha256_file`,
+// `dispatch_capability_put`) went with them.
 
 /// Re-arm the QUIC transport at the start of a recording (Phase 3b brick 3).
 ///
@@ -2051,175 +1748,58 @@ impl StreamServerClient {
     }
 
     // =========================================================================
-    // Phase 4.4.2 (rescue device client, 2026-05-19) — archive retrieval FFI.
-    //
-    // Mirror of the four `frappuccino_crypto_stream::StreamServerClient`
-    // archive methods, plus a combined download+decrypt-to-file convenience
-    // that keeps the ciphertext in Rust memory only (never lands on disk
-    // before decryption). The Android client (ArchiveModeActivity) drives
-    // the full rescue flow through these four entry points.
-    //
-    // Phase C relay-blind reports — reads are **identity-free**: the
-    // phrase-derived `report_id` IS the capability, so no bearer, no
-    // `archive_auth`, no `archive_list_reports`. The rescue device enumerates
-    // its own `report_id`s by derivation (ReportKeyring.report_id_hex(n)) and
-    // probes each via `archive_list_blobs` (None = 404 = a hole). The relay
-    // stores `report_id → report_pk` and never the identity.
+    // Archive reads (rescue). Identity-free: the phrase-derived `report_id` is
+    // the read capability, so no bearer. What the relay returns is input to
+    // the rescue's own verification (`rescue::ReportCheck`), never a verdict;
+    // nothing here decrypts, and the encrypted objects go to disk, never into
+    // the JVM.
     // =========================================================================
 
-    /// `GET /api/v2/archive/reports/{report_id}/blobs` — list every blob in a
-    /// report. **Phase C relay-blind: identity-free** — no bearer; the
-    /// phrase-derived `report_id` is the capability.
+    /// `GET /api/v2/archive/reports/{report_id}/blobs` — the report's stored
+    /// objects and its recorded closure, if any.
     ///
-    /// Returns `None` on **404** (no record at this `report_id` — a *hole* in
-    /// the rescue enumeration: an index allocated but never uploaded, or the
-    /// end of the range), `Some(blobs)` when the report exists.
+    /// Returns `None` on 404 (no record at this `report_id`: a hole in the
+    /// rescue enumeration). A malformed closure is an error, not an absent one.
     ///
     /// # Errors
-    /// [`FfiError::Network`] on real transport failures (5xx / TLS / DNS),
-    /// which the caller retries and NEVER mistakes for a hole.
-    pub fn archive_list_blobs(
-        &self,
-        report_id: &str,
-    ) -> Result<Option<Vec<ArchiveBlobInfo>>, FfiError> {
+    /// [`FfiError::RateLimited`] on 429; [`FfiError::Network`] on any other
+    /// failure status or transport error, which the caller retries and never
+    /// mistakes for a hole; [`FfiError::InvalidBlob`] for a malformed
+    /// `report_id` or listing.
+    pub fn archive_list(&self, report_id: &str) -> Result<Option<ArchiveListing>, FfiError> {
         self.inner
-            .archive_list_blobs(report_id)
-            .map(|opt| opt.map(|v| v.into_iter().map(ArchiveBlobInfo::from).collect()))
+            .archive_list(report_id)
+            .map(|listing| listing.map(ArchiveListing::from))
             .map_err(FfiError::from)
     }
 
-    /// `GET /api/v2/archive/reports/{report_id}/{filename}` then
-    /// [`strm_decrypt_to_file`] would do, in one shot — though it calls
-    /// [`strm_core_decrypt`] directly rather than that function, which is why
-    /// the latter never acquired a Kotlin caller and left the FFI surface on
-    /// 2026-09-03. The encrypted blob is
-    /// streamed into a `Zeroizing<Vec<u8>>` buffer in Rust, decrypted
-    /// against `archive`, and the plaintext is written directly to
-    /// `output_path`. The encrypted blob **never touches disk** — it only
-    /// exists in Rust memory for the duration of the call, which is wiped
-    /// on drop.
+    /// `GET /api/v2/archive/reports/{report_id}/{filename}` — fetch one stored
+    /// object, as stored (encrypted), to `output_path`. The write-signature
+    /// header is read before the body; the file is written durably and hashed
+    /// as it is written, and nothing is left at `output_path` on error.
     ///
-    /// Why combined : mirrors the security shape of [`strm_encrypt_file`]
-    /// on the upload side — plaintext only ever lands on disk after the
-    /// crypto layer says it's authentic. If we exposed download and
-    /// decrypt as separate FFI calls, the encrypted blob would land on
-    /// disk as a STRM file even when the recipient is wrong — a Red
-    /// Team-style attacker swapping STRM payloads would have a one-frame
-    /// window to read pre-decrypt bytes via heap dump / file-system race.
-    ///
-    /// Returns the [`BlobMetadata`] (non-secret) plus the number of
-    /// plaintext bytes written.
+    /// This only fetches. Whether the object is kept is decided by a
+    /// [`ReportCheck`], which runs the same fetch and then verifies it.
     ///
     /// # Errors
-    /// [`FfiError::Network`] on HTTP failure (incl. 401 token expired),
-    /// [`FfiError::WrongPin`] if the blob wasn't sealed for `archive`,
-    /// [`FfiError::InvalidBlob`] for structural issues, [`FfiError::Io`]
-    /// on the final write step.
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn archive_download_and_decrypt(
+    /// As [`Self::archive_list`], plus [`FfiError::Io`] for a failure while
+    /// streaming or writing, and [`FfiError::InvalidBlob`] for a name that is
+    /// not a relay object name or a body over the size cap.
+    pub fn archive_fetch_object(
         &self,
         report_id: &str,
         filename: &str,
         output_path: &str,
-        archive: Arc<ArchiveIdentity>,
-    ) -> Result<ArchiveDownloadResult, FfiError> {
-        use zeroize::Zeroizing;
-        // M-1 (WP-C): the relay supplies `filename`; the caller derives the local
-        // write target (output_path) from it. Reject anything that is not a single
-        // safe path component before any network/disk work, so a coerced relay
-        // cannot path-traverse the rescue device. Defence in depth with the
-        // Kotlin-side pre-check (archive_blob_filename_is_safe) and the relay's
-        // own upload-time guard.
-        if !frappuccino_crypto_stream::is_safe_blob_filename(filename) {
-            return Err(FfiError::InvalidBlob {
-                detail: format!("unsafe relay blob filename: {filename:?}"),
-            });
-        }
-        // Download the encrypted blob into a Zeroizing<Vec<u8>> so the
-        // ciphertext (which contains the nonce + sealed envelope — non-
-        // secret per se but worth defensive zeroize) is wiped on drop.
-        let mut buf: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
-        let downloaded = self
-            .inner
-            .archive_download_blob(report_id, filename, &mut *buf)
-            .map_err(FfiError::from)?;
-        // Decrypt into Zeroizing<Vec<u8>>, write plaintext to disk.
-        let (plaintext_z, meta) =
-            strm_core_decrypt(&buf, &archive.inner).map_err(FfiError::from)?;
-        if let Err(e) = std::fs::write(output_path, plaintext_z.as_slice()) {
-            // Same best-effort cleanup pattern as `strm_decrypt_to_file`.
-            let _ =
-                frappuccino_crypto_stream::secure_delete_file(std::path::Path::new(output_path));
-            return Err(FfiError::Io {
-                detail: format!("write {output_path}: {e}"),
-            });
-        }
-        let plen = u64::try_from(meta.plaintext_len).map_err(|_| FfiError::Internal {
-            detail: "plaintext_len overflows u64 (impossible)".to_string(),
-        })?;
-        Ok(ArchiveDownloadResult {
-            downloaded_bytes: downloaded,
-            plaintext_bytes: plen,
-            metadata: BlobMetadata {
-                version: meta.version,
-                mode: meta.mode,
-                grant_count: meta.grant_count,
-                plaintext_len: plen,
-            },
-        })
-    }
-
-    /// `GET /api/v2/archive/reports/{report_id}/{filename}` and write the raw
-    /// blob bytes to `output_path` **as-is, with NO STRM decryption**.
-    ///
-    /// §10.11 (provenance durability, 2026-06-24) — the provenance manifest
-    /// (`<sessionId>.fpm`) is a `crypto_box_seal` envelope, **not** a STRM
-    /// blob, so it must be fetched raw and unsealed/verified offline by the
-    /// recipient (against the published provenance pubkey). Routing it through
-    /// [`Self::archive_download_and_decrypt`] would fail the STRM header parse
-    /// and abort the rescue batch. The bytes written are exactly the sealed
-    /// envelope as stored on the relay — non-secret (the relay is blind; only
-    /// the recipient's X25519 secret can open it), so no `Zeroizing` buffer is
-    /// warranted here unlike the decrypt path.
-    ///
-    /// Returns the number of bytes written.
-    ///
-    /// # Errors
-    /// [`FfiError::Network`] on HTTP failure (incl. 401 token expired),
-    /// [`FfiError::Io`] on the final write step.
-    pub fn archive_download_raw(
-        &self,
-        report_id: &str,
-        filename: &str,
-        output_path: &str,
-    ) -> Result<u64, FfiError> {
-        // M-1 (WP-C): validate the relay-supplied filename before any disk write
-        // (see archive_download_and_decrypt for the rationale).
-        if !frappuccino_crypto_stream::is_safe_blob_filename(filename) {
-            return Err(FfiError::InvalidBlob {
-                detail: format!("unsafe relay blob filename: {filename:?}"),
-            });
-        }
-        let mut buf: Vec<u8> = Vec::new();
-        let downloaded = self
-            .inner
-            .archive_download_blob(report_id, filename, &mut buf)
-            .map_err(FfiError::from)?;
-        if let Err(e) = std::fs::write(output_path, &buf) {
-            // Best-effort cleanup of any partial write, mirroring the
-            // decrypt path's failure handling.
-            let _ =
-                frappuccino_crypto_stream::secure_delete_file(std::path::Path::new(output_path));
-            return Err(FfiError::Io {
-                detail: format!("write {output_path}: {e}"),
-            });
-        }
-        Ok(downloaded)
+    ) -> Result<ArchiveObjectResult, FfiError> {
+        self.inner
+            .archive_fetch_object(report_id, filename, std::path::Path::new(output_path))
+            .map(ArchiveObjectResult::from)
+            .map_err(FfiError::from)
     }
 }
 
-/// Per-blob metadata returned by [`StreamServerClient::archive_list_blobs`].
-/// Mirrors [`frappuccino_crypto_stream::ArchiveBlobInfo`].
+/// Per-object metadata of an [`ArchiveListing`]. Mirrors
+/// [`frappuccino_crypto_stream::ArchiveBlobInfo`]; relay-supplied, unverified.
 #[derive(Debug, Clone)]
 pub struct ArchiveBlobInfo {
     pub filename: String,
@@ -2237,32 +1817,62 @@ impl From<frappuccino_crypto_stream::ArchiveBlobInfo> for ArchiveBlobInfo {
     }
 }
 
-/// Result returned by [`StreamServerClient::archive_download_and_decrypt`].
-/// Carries both the network-side download size and the decrypted plaintext
-/// size so the caller can detect a partial download (rare given the FFI
-/// surfaces an error before this returns, but cheap to expose).
-#[derive(Debug, Clone)]
-pub struct ArchiveDownloadResult {
-    pub downloaded_bytes: u64,
-    pub plaintext_bytes: u64,
-    pub metadata: BlobMetadata,
-}
-
 // ============================================================================
 // Tests
 // ============================================================================
 
+/// Fixtures shared by the tests of every module of this crate.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+    use super::{pin_session_store, queue_key_install, ArchiveIdentity, StreamIdentity};
+
+    /// The fixed test phrase of the core KATs.
+    pub(crate) const MN_FIXED: &str = "abaisser abandon abdiquer abeille abolir aborder aboutir aboyer abrasif abreuver abriter abroger";
+
+    /// Serializes every test that touches a process-wide holder (PIN session,
+    /// upload bearer, queue key, report state lock): the harness runs tests in
+    /// parallel threads.
+    static GLOBALS: Mutex<()> = Mutex::new(());
+
+    pub(crate) fn globals() -> MutexGuard<'static, ()> {
+        GLOBALS.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A PIN session with a fixed key (no Argon2id) and a fixed queue key.
+    pub(crate) fn install_session() {
+        pin_session_store(&[0x5Au8; 32], &[0x11u8; 16]).unwrap();
+        queue_key_install(&[0x42u8; 32]).unwrap();
+    }
+
+    /// The public identity of the test phrase, the author of every object.
+    pub(crate) fn author() -> Arc<StreamIdentity> {
+        ArchiveIdentity::from_mnemonic(MN_FIXED.as_bytes(), b"")
+            .unwrap()
+            .identity()
+    }
+
+    /// A fresh, empty directory unique to this process and `name`.
+    pub(crate) fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("frap_ffi_{}_{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::{globals, MN_FIXED};
     use super::*;
 
-    const MN_FIXED: &str = "abaisser abandon abdiquer abeille abolir aborder aboutir aboyer abrasif abreuver abriter abroger";
-
     // §10.6 — the process-global upload-bearer holder: store -> header copy ->
-    // clear -> empty. A single test owns the static for its whole sequence (no
-    // other test touches UPLOAD_JWT), so there is no cross-test interference.
+    // clear -> empty.
     #[test]
     fn upload_auth_holder_roundtrip_then_clear() {
+        let _g = globals();
         upload_auth_clear();
         assert_eq!(upload_auth_header(), None);
         upload_auth_store("Bearer eyJhbGciOiJIUzI1Ni.test".to_string());
@@ -2279,13 +1889,8 @@ mod tests {
         assert_eq!(upload_auth_header(), None);
     }
 
-    // Both PIN-session tests mutate the process-global PIN_SESSION static; this
-    // guard serializes them (the harness runs tests in parallel threads).
-    static PIN_SESSION_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn pin_session_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        PIN_SESSION_TEST_GUARD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        globals()
     }
 
     // Lot 4b P1 — the PIN-session holder: store -> borrow -> replace -> clear.
@@ -2370,13 +1975,19 @@ mod tests {
             signer.ots_salt(&rid).unwrap()
         );
 
-        // Report keyring (OPTION B): seal + reload in-crate; master never crosses.
-        let keyring = ReportKeyring::from_mnemonic(MN_FIXED.as_bytes(), b"").unwrap();
-        let rep_sealed = keyring.seal_with_session().unwrap();
+        // Legacy report keyring (migration only): the master sealed by an old
+        // enrollment reloads in-crate; it never crosses the FFI.
+        let keyring = core_report::ReportKeyring::from_mnemonic(MN_FIXED, "").unwrap();
+        let rep_sealed = keyring
+            .with_master_bytes(|master| {
+                with_pin_session(|key, salt| core_pin_store::seal_with_key(key, salt, master))
+            })
+            .unwrap()
+            .unwrap();
         let rep_reloaded = pin_session_open_report_keyring(&rep_sealed).unwrap();
         assert_eq!(
-            rep_reloaded.report_id_hex(0).unwrap(),
-            keyring.report_id_hex(0).unwrap()
+            rep_reloaded.inner.report_id(0).unwrap(),
+            keyring.report_id(0).unwrap()
         );
 
         // After clear, every holder-backed call fails (no session).
@@ -2404,90 +2015,64 @@ mod tests {
     }
 
     #[test]
-    fn report_keyring_derivation_deterministic_and_pk_binding() {
-        let mn = MN_FIXED.as_bytes();
-        let k1 = ReportKeyring::from_mnemonic(mn, b"").unwrap();
-        let k2 = ReportKeyring::from_mnemonic(mn, b"").unwrap();
-        // Deterministic per index (re-derivable at rescue from the phrase).
-        assert_eq!(k1.report_id_hex(0).unwrap(), k2.report_id_hex(0).unwrap());
-        assert_eq!(k1.report_pk(4).unwrap(), k2.report_pk(4).unwrap());
-
-        // report_id_hex shape: exactly 32 lowercase hex chars.
-        let id = k1.report_id_hex(0).unwrap();
-        assert_eq!(id.len(), 32);
-        assert!(id
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
-
-        // report_pk shape: 32 bytes; and report_id == H(report_pk) (the binding
-        // the relay re-checks at creation).
-        let pk = k1.report_pk(0).unwrap();
-        assert_eq!(pk.len(), 32);
-        let pk_arr: [u8; 32] = pk.as_slice().try_into().unwrap();
-        assert_eq!(id, hex_lower(&core_report::report_id_from_pk(&pk_arr)));
-
-        // The master -> from_seed roundtrip is now exercised end-to-end in-crate
-        // (no secret crosses the FFI) by `pin_session_combined_calls_roundtrip`
-        // via `seal_with_session` + `pin_session_open_report_keyring`; the raw
-        // `master_bytes()` export was retired in Lot 4b P6.
-    }
-
-    #[test]
-    fn report_keyring_signature_shapes_and_input_errors() {
-        let k = ReportKeyring::from_mnemonic(MN_FIXED.as_bytes(), b"").unwrap();
-        assert_eq!(k.sign_create(1).unwrap().len(), 64);
-        assert_eq!(k.sign_write(1, "blob.strm", &[0u8; 32]).unwrap().len(), 64);
-        // Different index => different create signature.
-        assert_ne!(k.sign_create(1).unwrap(), k.sign_create(2).unwrap());
-        // Different filename / body => different write signature.
-        assert_ne!(
-            k.sign_write(1, "a.strm", &[0u8; 32]).unwrap(),
-            k.sign_write(1, "b.strm", &[0u8; 32]).unwrap()
-        );
-
-        // from_seed with a wrong-length master => InvalidBlob (not a panic).
+    fn the_legacy_keyring_only_reloads_from_a_32_byte_master() {
         let err = ReportKeyring::from_seed(&[0u8; 31]).unwrap_err();
         assert!(matches!(err, FfiError::InvalidBlob { .. }));
-        // sign_write with a wrong-length body hash => InvalidBlob.
-        let err = k.sign_write(1, "blob.strm", &[0u8; 16]).unwrap_err();
-        assert!(matches!(err, FfiError::InvalidBlob { .. }));
-    }
-
-    #[test]
-    fn sha256_file_is_byte_identical_to_known_digest() {
-        // The write-sig the relay verifies covers sha256(body); the device must
-        // hash the .strm to the EXACT same digest the relay computes streaming.
-        use sha2::{Digest, Sha256};
-        let path = std::env::temp_dir().join("frap_sha256_file_test.bin");
-        let content = b"relay-blind report chunk ciphertext bytes";
-        std::fs::write(&path, content).unwrap();
-        let got = sha256_file(path.to_str().unwrap()).unwrap();
-        let expected: [u8; 32] = Sha256::digest(content).into();
-        assert_eq!(got, expected);
-        // Empty file => None (the file_missing race tag, treated as success).
-        std::fs::write(&path, b"").unwrap();
-        assert!(sha256_file(path.to_str().unwrap()).is_none());
-        let _ = std::fs::remove_file(&path);
-        // Missing file => None.
-        assert!(sha256_file("/no/such/frap/blob.strm").is_none());
-    }
-
-    #[test]
-    fn upload_put_report_chunk_missing_file_is_file_missing() {
-        // A missing blob (concurrent-upload race) is reported as file_missing
-        // WITHOUT contacting the network — no server needed for this path.
-        let keyring = ReportKeyring::from_mnemonic(MN_FIXED.as_bytes(), b"").unwrap();
-        let outcome = upload_put_report_chunk(
-            "https://relay/file/aa/c.strm",
-            "/no/such/frap/blob.strm",
-            TransportMode::DirectTls,
-            std::sync::Arc::new(keyring),
-            0,
-            "c.strm",
-            false,
+        let master = [7u8; 32];
+        let ring = ReportKeyring::from_seed(&master).unwrap();
+        assert_eq!(
+            ring.inner.report_pk(4).unwrap(),
+            core_report::ReportKeyring::from_seed(&master)
+                .unwrap()
+                .report_pk(4)
+                .unwrap()
         );
-        assert_eq!(outcome.http_status, 0);
-        assert_eq!(outcome.error_detail.as_deref(), Some("file_missing"));
+        assert_eq!(format!("{ring:?}"), "ReportKeyring(<opaque>)");
+    }
+
+    #[test]
+    fn report_errors_map_to_their_ffi_class() {
+        use core_report::ReportError as E;
+        assert!(matches!(
+            FfiError::from(E::WriterClosing),
+            FfiError::WriterClosed
+        ));
+        assert!(matches!(
+            FfiError::from(E::DuplicateSeq(3)),
+            FfiError::ReportRefused { .. }
+        ));
+        assert!(matches!(
+            FfiError::from(E::MetadataRequired),
+            FfiError::ReportRefused { .. }
+        ));
+        assert!(matches!(
+            FfiError::from(E::InvalidState("x")),
+            FfiError::InvalidBlob { .. }
+        ));
+        assert!(matches!(
+            FfiError::from(E::InvalidSignature),
+            FfiError::InvalidSignature
+        ));
+        assert!(matches!(
+            FfiError::from(E::Crypto(CoreCryptoError::WrongPin)),
+            FfiError::WrongPin
+        ));
+        assert!(matches!(
+            FfiError::from(StreamEnvelopeError::Undecryptable),
+            FfiError::EnvelopeCorrupt { .. }
+        ));
+        assert!(matches!(
+            FfiError::from(StreamEnvelopeError::NotFound),
+            FfiError::Io { .. }
+        ));
+        assert!(matches!(
+            FfiError::from(StreamProtocolError::RateLimited {
+                retry_after: std::time::Duration::from_secs(61)
+            }),
+            FfiError::RateLimited {
+                retry_after_secs: 61
+            }
+        ));
     }
 
     #[test]
@@ -2684,11 +2269,9 @@ mod tests {
 
     #[test]
     fn strm_decrypt_to_file_roundtrip() {
-        // Phase H2-B.18 (Red MED-4) — roundtrip via the path-based
-        // variant. Encrypts a plaintext to a tmp file using
-        // strm_encrypt_file, then decrypts it back via
-        // strm_decrypt_to_file, and asserts the recovered file matches
-        // the original bytes + the metadata stays consistent.
+        // Roundtrip through the path-based decrypt: a blob written to a tmp
+        // file is decrypted back with strm_decrypt_to_file, and the recovered
+        // file must match the original bytes, with consistent metadata.
         let kit = EnrollmentKit::from_mnemonic(MN_FIXED.as_bytes(), b"").unwrap();
         let author = kit.identity().unwrap();
         let archive = Arc::new(ArchiveIdentity::from_mnemonic(MN_FIXED.as_bytes(), b"").unwrap());
@@ -2706,14 +2289,9 @@ mod tests {
         let payload = b"H2-B.17 Red MED-4 plaintext-to-file roundtrip".to_vec();
         std::fs::write(&plaintext_in, &payload).unwrap();
 
-        // Encrypt via file path (Phase 6.1.4-C path).
-        let blob_len = strm_encrypt_file(
-            plaintext_in.to_str().unwrap(),
-            blob_path.to_str().unwrap(),
-            author,
-        )
-        .unwrap();
-        assert!(blob_len > 0);
+        let blob = strm_encrypt(&std::fs::read(&plaintext_in).unwrap(), author).unwrap();
+        assert!(!blob.is_empty());
+        std::fs::write(&blob_path, &blob).unwrap();
 
         // Decrypt to file (Phase H2-B.17 path under test).
         let meta = strm_decrypt_to_file(
@@ -2759,12 +2337,8 @@ mod tests {
         let plaintext_out = tmpdir.join("plaintext-out.bin");
 
         std::fs::write(&plaintext_in, b"sealed-for-author-only").unwrap();
-        strm_encrypt_file(
-            plaintext_in.to_str().unwrap(),
-            blob_path.to_str().unwrap(),
-            author,
-        )
-        .unwrap();
+        let blob = strm_encrypt(&std::fs::read(&plaintext_in).unwrap(), author).unwrap();
+        std::fs::write(&blob_path, &blob).unwrap();
 
         let err = strm_decrypt_to_file(
             blob_path.to_str().unwrap(),

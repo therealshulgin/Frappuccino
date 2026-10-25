@@ -162,10 +162,15 @@ class PinUnlockActivity : AppCompatActivity(), PinLockListener {
             // BT-HIGH-15 — reset persistant du compteur sur succès.
             PinAttemptTracker.recordSuccess(this)
             Timber.d("Ratchet unlocked successfully")
-            // The ratchet is now open; kick a one-shot orphan
-            // sweep so any backlog from a session that stopped offline starts
-            // draining immediately instead of waiting for the 30-min periodic
-            // tick (which bails while locked). Closes gap C (2026-06-18).
+            // A device updated from the legacy report scheme migrates at its
+            // first unlock: the migration needs the PIN session that just
+            // opened, and runs off the main thread (a no-op once done).
+            rs.readahead.washington.mobile.util.jobs.LegacyMigrationWorker
+                .start(applicationContext)
+            // The PIN session is open; kick a one-shot sweep so that envelopes
+            // needing a bearer (a report's first object, a directory entry)
+            // can get one and go now, instead of waiting for the 30-min
+            // periodic tick. Closes gap C (2026-06-18).
             rs.readahead.washington.mobile.util.jobs.OrphanSweepWorker
                 .scheduleOneShot(applicationContext)
             setResult(RESULT_OK)

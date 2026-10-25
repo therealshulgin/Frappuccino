@@ -28,14 +28,16 @@ import uniffi.frappuccino.ArchiveIdentity as FfiArchiveIdentity
  *
  * La session key et le plaintext ne traversent jamais la JVM : la classe est
  * passee comme handle au chemin de dechiffrement cote Rust
- * (`StreamServerClient.archiveDownloadAndDecrypt` via [inner]), qui descelle et
- * ecrit le clair dans un fichier.
+ * (`strmDecryptToFile` via [inner], appele par
+ * [org.stream.crypto.upload.ArchiveSession.decryptToFile]), qui descelle et
+ * ecrit le clair dans un fichier. Ce chemin ne verifie rien : il ne s'applique
+ * qu'a un fichier que la verification du secours a deja classe VERIFIED.
  *
  * ```
  * val mnBytes = ...  // UTF-8 bytes du mnemonic
  * try {
  *   ArchiveIdentity.fromMnemonic(mnBytes).use { archive ->
- *     ArchiveSession(...).download(archive, ...)  // dechiffre cote Rust -> fichier
+ *     session.decryptToFile(verified, plainOut, archive)  // dechiffre cote Rust -> fichier
  *   }  // -> x25519_sk wipe cote Rust
  * } finally {
  *   org.stream.crypto.SecureWipe.wipe(mnBytes)
@@ -53,8 +55,8 @@ import uniffi.frappuccino.ArchiveIdentity as FfiArchiveIdentity
  *
  * Consommateur de production :
  * [rs.readahead.washington.mobile.views.activity.ArchiveModeActivity] (mode
- * archive explicite), via `StreamUploadManager.createArchiveIdentity` — c'est la
- * qu'on va verifier que le wipe appelant est bien fait.
+ * archive explicite), qui appelle [fromMnemonic] directement — c'est la qu'on
+ * va verifier que le wipe appelant est bien fait.
  */
 class ArchiveIdentity private constructor(
     private val ffi: FfiArchiveIdentity,
@@ -69,7 +71,7 @@ class ArchiveIdentity private constructor(
      * Handle FFI brut, tenu hors de l'API publique : `internal` porte sur le
      * module Gradle `stream-crypto`, ce qui suffit a
      * [org.stream.crypto.upload.ArchiveSession] pour forwarder l'appel a
-     * `archiveDownloadAndDecrypt` sans wrap/unwrap intermediaire (Phase 4.4.2).
+     * `strmDecryptToFile` sans wrap/unwrap intermediaire.
      */
     internal val inner: FfiArchiveIdentity get() {
         check(!closed) { "ArchiveIdentity is closed" }

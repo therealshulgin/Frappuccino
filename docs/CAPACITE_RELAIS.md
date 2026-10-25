@@ -51,6 +51,15 @@ Rien ne se libère en face pendant le test : le TTL des blobs est de **six mois*
 (`config.py:71`), et le reap des reports ne s'occupe que de ceux dont tous les blobs ont
 déjà été purgés. Sur la durée d'un test fermé, la consommation est donc **cumulative**.
 
+Depuis la refonte des rapports, deux postes s'ajoutent, tous deux négligeables devant la
+vidéo : un objet `manifest` par rapport clos (8 octets plus 36 par objet, soit environ
+26 Ko pour une heure d'enregistrement en chunks de 5 s : 721 objets), et dans
+`reports.json` une fiche
+par rapport clos qui n'est **jamais** supprimée : à expiration de ses objets, elle reste en
+pierre tombale (de l'ordre de quelques centaines d'octets, sans date). Le registre croît
+donc avec le nombre de rapports clos, sans borne de temps ; à l'échelle d'un test fermé,
+c'est sans effet sur la capacité.
+
 ## 4. Combien de temps tiennent 7,6 Go
 
 | Scénario | Débit | Le disque se remplit en |

@@ -63,37 +63,14 @@
   <!-- Common back button -->
   <string name="action_back">Back</string>
 
-  <!-- Archive mode -->
+  <!-- Archive mode. The rest of the rescue screens' strings are in strings_archive.xml. -->
   <string name="archive_title">ARCHIVE MODE</string>
   <string name="archive_prompt">ENTER YOUR BIP-39 PHRASE\nTO DECRYPT YOUR STREAMS</string>
-  <string name="archive_warning">⚠ THE PHRASE STAYS ON THIS SCREEN.\nNEVER SHARE IT.\nPRESS ← TO ERASE EVERYTHING.</string>
+  <string name="archive_warning">⚠ THE PHRASE STAYS ON THIS SCREEN. NEVER SHARE IT.\nRecovered videos stay encrypted inside the app and are decrypted only while you watch them. They are erased when you close this screen and by the emergency wipe. An export leaves the app\'s protection.</string>
   <string name="archive_input_hint">12 words separated by spaces</string>
   <string name="archive_unlock">UNLOCK</string>
-  <string name="archive_close">← Close and clear session</string>
-  <!-- Phase 4.4.2 (2026-05-19) — archive retrieval flow strings. -->
+  <string name="archive_close">← Close: cancel the download and erase the recovered copies</string>
   <string name="archive_retrieve_btn">RECOVER MY STREAMS</string>
-  <string name="archive_retrieving_auth">Authenticating with server…</string>
-  <string name="archive_retrieving_reports">Listing your reports…</string>
-  <string name="archive_retrieving_blob">Downloading %1$s (%2$d/%3$d)…</string>
-  <string name="archive_no_reports">No reports found for this identity.</string>
-  <string name="archive_auth_refused">Server refused : check your phrase + server connectivity.</string>
-  <string name="archive_open_folder">OPEN FOLDER</string>
-  <string name="archive_report_summary">%1$d blob(s) • %2$s</string>
-  <!-- List-persist UX (2026-05-20). -->
-  <string name="archive_download_all_btn">DOWNLOAD ALL</string>
-  <string name="archive_report_downloaded">✓</string>
-  <string name="archive_download_all_progress">Report %1$d/%2$d : %3$s…</string>
-  <string name="archive_download_all_done">All %1$d report(s) downloaded into %2$s</string>
-  <string name="archive_download_all_partial">Stopped at report %1$d/%2$d — re-tap DOWNLOAD ALL to resume.</string>
-  <!-- UX bugs (2026-05-20) — race + accidental overwrite guards. -->
-  <string name="archive_busy">A download is already in progress, hold on.</string>
-  <string name="archive_redownload_title">Re-download this report ?</string>
-  <string name="archive_redownload_message">This report is already saved in Downloads/Frappuccino/. Re-downloading will replace the existing files.</string>
-  <string name="archive_redownload_confirm">RE-DOWNLOAD</string>
-  <string name="archive_redownload_cancel">CANCEL</string>
-  <!-- Download foreground service (2026-05-30). -->
-  <string name="archive_fgs_starting">Starting download…</string>
-  <string name="archive_fgs_progress">Downloading archive — report %1$d/%2$d</string>
 
   <!-- PIN unlock screen -->
   <string name="pin_unlock_title">PIN TO UNLOCK</string>
@@ -138,7 +115,7 @@
   <string name="stream_settings_lock_dialog_message">The ratchet will be wiped from RAM. You will need to re-enter your PIN to stream.</string>
   <string name="stream_settings_lock_dialog_action">Lock</string>
   <string name="stream_settings_wipe_dialog_title">WIPE ALL?</string>
-  <string name="stream_settings_wipe_dialog_message">This wipes the V2 IDENTITY and the RATCHET:\n- Public identity (ed25519_pk + x25519_pk)\n- Current ratchet (batch + ephemeral keys)\n- Local blobs (chunks pending upload)\n\nOnly your BIP-39 phrase will recover already-uploaded streams (via Archive Mode).\n\nFor a full app reset (including the Tella PIN), uninstall and reinstall.\n\nThis action is IRREVERSIBLE.</string>
+  <string name="stream_settings_wipe_dialog_message">This erases from this phone:\n- the V2 identity and the ratchet (public keys, current batch, ephemeral keys)\n- the report state, from which this phone signs its next recordings\n- the upload queue, including recordings not uploaded yet and those that failed\n- the videos recovered for viewing inside the app\n- the recordings that earlier versions of this app exported to Download/Frappuccino\n\nNot erased: files you exported through the system file picker. They are outside the app\'s reach.\n\nErasing overwrites then deletes; on flash memory this is best effort, an old copy of a block can survive.\n\nOnly your BIP-39 phrase will recover the streams already uploaded (via Archive Mode). Recordings not uploaded yet are lost.\n\nFor a full app reset (including the Tella PIN), uninstall and reinstall.\n\nThis action is IRREVERSIBLE.</string>
   <string name="stream_settings_wipe_dialog_action">WIPE</string>
   <string name="stream_settings_wipe_confirm_title">Final confirmation</string>
   <string name="stream_settings_wipe_confirm_message">Really wipe the V2 identity?</string>
@@ -188,11 +165,9 @@
     <string name="stream_settings_shake_med">Medium</string>
     <string name="stream_settings_shake_high">High</string>
 
-    <!-- Orphan fragments banner (in-app; no notification). -->
-    <string name="orphan_banner_at_risk">%1$d unsent fragment(s) waiting — tap</string>
-    <string name="orphan_banner_deleted">%1$d unsent fragment(s) deleted — tap</string>
-    <string name="orphan_dialog_title">Pending fragments</string>
-    <string name="orphan_dialog_at_risk">%1$d fragment(s) from a recording haven\'t reached the server yet (oldest from %2$s). Without a usable network they will be deleted automatically around %3$s, so no plaintext trace is left behind. Reconnect, or tap Retry.</string>
+    <!-- Reports dialog buttons, and the alert left by builds that deleted
+         unsent fragments (in-app; no notification). The rest is in
+         strings_reports.xml. -->
     <string name="orphan_dialog_deleted">%1$d unsent fragment(s) were deleted (oldest was from %2$s). They could not reach the server in time.</string>
     <string name="orphan_action_retry">Retry upload</string>
     <string name="orphan_action_ack">Got it</string>

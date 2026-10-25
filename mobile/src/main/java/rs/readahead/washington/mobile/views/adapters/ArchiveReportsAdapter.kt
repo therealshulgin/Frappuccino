@@ -1,132 +1,232 @@
 package rs.readahead.washington.mobile.views.adapters
 
+import android.content.Context
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.widget.TextView
+import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.RecyclerView
-import org.stream.crypto.upload.DiscoveredReport
 import rs.readahead.washington.mobile.R
+import rs.readahead.washington.mobile.archive.ExportOutcome
+import rs.readahead.washington.mobile.archive.FailureReason
+import rs.readahead.washington.mobile.archive.RescueNames
+import rs.readahead.washington.mobile.archive.RescueSession
+import uniffi.frappuccino.ClosureState
+import uniffi.frappuccino.OtsStatus
+import uniffi.frappuccino.ReportScheme
+import uniffi.frappuccino.ReportStatus
+import uniffi.frappuccino.ReportVerdict
 
 /**
- * RecyclerView adapter for the archive retrieval reports list. The relay is
- * blind (Phase C), so a row has no title and no creation date to show: it
- * carries the identity-free report id, the derivation index it was derived
- * from, and the blob count plus total size. Never "restore" a title or a
- * `createdAt` here — that would mean asking the relay to hold data it must
- * never hold.
+ * Rows of the rescue list: one per report the enumeration found, with what
+ * its verification concluded.
  *
- * Do not be misled by the view names: the [ViewHolder] still binds layout
- * views called `title` and `createdAt`, but they are reused slots. `title`
- * receives the report id, `createdAt` receives `#<derivation index>`, and
- * [DiscoveredReport] has no title or timestamp field to put in them.
+ * A row shows the report's position in the list and its derivation index,
+ * never its `report_id`: the id is the report's address on the relay and has
+ * nothing to tell the witness. The relay is blind, so there is no title and no
+ * creation date to show either; the date range comes from the relay's own
+ * storage clock and the screen says so.
  *
- * Never dismiss or clear the list once a report has been downloaded. It used
- * to be hidden on the first tap, and the user then could not tell which
- * reports had already been picked. Downloaded rows stay in place and are
- * flagged instead, so a partial batch can be resumed or a report fetched
- * again.
+ * Every status and counter comes from the Rust verdict, unchanged: this class
+ * chooses wording and colour, never the verdict. A legacy object stored
+ * without a signature is not counted among the verified ones here; the
+ * screen lists those in a separate section.
  *
- * No DiffUtil and no item-level animations: the list is fetched once per
- * session and never mutates in place, so a full `notifyDataSetChanged()` is
- * the right refresh.
- *
- * Tap fires [onClick] with the underlying [DiscoveredReport]. Download
- * progress ([markDownloaded], [pendingReports]) is tracked in memory only,
- * for the lifetime of this adapter. Introduced in 4.4.2, the downloaded
- * flagging in 4.4.5.
+ * No DiffUtil: a whole list rebinds on each change of [RescueSession], which
+ * happens a few times per second at most.
  */
 class ArchiveReportsAdapter(
-    private val items: MutableList<DiscoveredReport>,
-    private val onClick: (DiscoveredReport) -> Unit,
+    private val onVerify: (Int) -> Unit,
+    private val onPlay: (Int) -> Unit,
+    private val onExport: (Int) -> Unit,
 ) : RecyclerView.Adapter<ArchiveReportsAdapter.ViewHolder>() {
 
-    // IDs of reports the user has already downloaded
-    // during THIS activity lifetime. Reset on activity recreation
-    // (intentional : downloads are permanent in Downloads/Frappuccino
-    // but the in-memory "we already did this one" hint is purely a
-    // UX nicety and doesn't need to survive process death).
-    private val downloaded: MutableSet<String> = mutableSetOf()
+    private var items: List<RescueSession.EntryView> = emptyList()
 
     class ViewHolder(view: View) : RecyclerView.ViewHolder(view) {
         val title: TextView = view.findViewById(R.id.reportTitle)
-        val summary: TextView = view.findViewById(R.id.reportSummary)
-        val createdAt: TextView = view.findViewById(R.id.reportCreatedAt)
-        val check: TextView = view.findViewById(R.id.reportDownloadedCheck)
+        val subtitle: TextView = view.findViewById(R.id.reportSubtitle)
+        val status: TextView = view.findViewById(R.id.reportStatus)
+        val counters: TextView = view.findViewById(R.id.reportCounters)
+        val dates: TextView = view.findViewById(R.id.reportDates)
+        val ots: TextView = view.findViewById(R.id.reportOts)
+        val anomaly: TextView = view.findViewById(R.id.reportAnomaly)
+        val export: TextView = view.findViewById(R.id.reportExportState)
+        val verifyBtn: TextView = view.findViewById(R.id.reportVerifyBtn)
+        val playBtn: TextView = view.findViewById(R.id.reportPlayBtn)
+        val exportBtn: TextView = view.findViewById(R.id.reportExportBtn)
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ViewHolder {
-        val v = LayoutInflater.from(parent.context)
-            .inflate(R.layout.item_archive_report, parent, false)
+        val v = LayoutInflater.from(parent.context).inflate(R.layout.item_archive_report, parent, false)
         return ViewHolder(v)
-    }
-
-    override fun onBindViewHolder(holder: ViewHolder, position: Int) {
-        val r = items[position]
-        // Phase C relay-blind: no title — the identity-free report id IS the row
-        // label. The derivation index is a short, human-friendly secondary tag.
-        holder.title.text = r.reportId
-        holder.summary.text = holder.itemView.context.getString(
-            R.string.archive_report_summary,
-            r.blobCount,
-            humanBytes(r.totalBytes),
-        )
-        holder.createdAt.text = "#${r.reportIndex}"
-
-        // Visually flag already-downloaded reports.
-        val isDownloaded = downloaded.contains(r.reportId)
-        holder.check.visibility = if (isDownloaded) View.VISIBLE else View.GONE
-        holder.itemView.alpha = if (isDownloaded) 0.55f else 1f
-
-        holder.itemView.setOnClickListener { onClick(r) }
     }
 
     override fun getItemCount(): Int = items.size
 
-    fun submit(newItems: List<DiscoveredReport>) {
-        items.clear()
-        items.addAll(newItems)
+    @Suppress("NotifyDataSetChanged") // see the class comment
+    fun submit(newItems: List<RescueSession.EntryView>) {
+        items = newItems
         notifyDataSetChanged()
     }
 
-    /**
-     * Record that [reportId] has been fully downloaded
-     * during this activity session and refresh its row to show the
-     * checkmark + faded look. Idempotent : re-calling with the same
-     * id is a no-op (the set ignores duplicates).
-     */
-    fun markDownloaded(reportId: String) {
-        if (downloaded.add(reportId)) {
-            val idx = items.indexOfFirst { it.reportId == reportId }
-            if (idx >= 0) notifyItemChanged(idx)
+    override fun onBindViewHolder(holder: ViewHolder, position: Int) {
+        val e = items[position]
+        val ctx = holder.itemView.context
+        val index = (e.index ?: 0L).toInt()
+        holder.title.text = ctx.getString(R.string.archive_report_title, e.ordinal)
+        holder.subtitle.text = ctx.getString(
+            if (e.scheme == ReportScheme.CHAIN) R.string.archive_report_subtitle_chain
+            else R.string.archive_report_subtitle_legacy,
+            index,
+        )
+
+        val verdict = e.verdict.takeIf { e.state == RescueSession.EntryState.VERIFIED }
+        holder.status.text = statusText(ctx, e, verdict)
+        holder.status.setTextColor(
+            ContextCompat.getColor(ctx, if (isWarning(e, verdict)) R.color.wa_orange else R.color.wa_white),
+        )
+
+        show(holder.counters, verdict?.let { countersText(ctx, it) })
+        show(holder.dates, datesText(ctx, verdict))
+        show(holder.ots, if (verdict != null) e.ots?.let { otsText(ctx, it) } else null)
+        show(
+            holder.anomaly,
+            if (verdict?.closureAnomaly == true) ctx.getString(R.string.archive_anomaly_closure_invalid) else null,
+        )
+        show(holder.export, exportText(ctx, e))
+        holder.export.setTextColor(
+            ContextCompat.getColor(ctx, if (hasExclusions(e.exportOutcome)) R.color.wa_orange else R.color.wa_white),
+        )
+
+        val idle = e.state != RescueSession.EntryState.VERIFYING
+        holder.verifyBtn.visibility =
+            if (idle && e.state != RescueSession.EntryState.VERIFIED) View.VISIBLE else View.GONE
+        holder.playBtn.visibility = if (verdict != null && e.playableChunks > 0) View.VISIBLE else View.GONE
+        holder.exportBtn.visibility =
+            if (verdict != null && verdict.verified > 0u && e.exportState != RescueSession.ExportState.RUNNING) {
+                View.VISIBLE
+            } else {
+                View.GONE
+            }
+        holder.verifyBtn.setOnClickListener { onVerify(e.ordinal) }
+        holder.playBtn.setOnClickListener { onPlay(e.ordinal) }
+        holder.exportBtn.setOnClickListener { onExport(e.ordinal) }
+    }
+
+    private fun show(view: TextView, text: CharSequence?) {
+        if (text.isNullOrEmpty()) {
+            view.visibility = View.GONE
+        } else {
+            view.text = text
+            view.visibility = View.VISIBLE
         }
     }
 
-    /**
-     * Returns the reports still pending download (i.e.
-     * never touched yet by the user this session). Used by the
-     * "TOUT TÉLÉCHARGER" flow to skip what this session has already
-     * marked, so a re-tap after a partial batch resumes from where it
-     * stopped instead of redoing everything. The tracking lives in
-     * memory, not on disk: once the activity has been recreated,
-     * reports already written to Downloads/Frappuccino can be
-     * downloaded again.
-     */
-    fun pendingReports(): List<DiscoveredReport> =
-        items.filter { it.reportId !in downloaded }
+    private fun statusText(ctx: Context, e: RescueSession.EntryView, verdict: ReportVerdict?): String =
+        when (e.state) {
+            RescueSession.EntryState.LISTED ->
+                ctx.resources.getQuantityString(R.plurals.archive_report_listed, e.objectCount, e.objectCount)
+            RescueSession.EntryState.VERIFYING ->
+                ctx.getString(R.string.archive_status_verifying, e.fetched, e.objectCount)
+            RescueSession.EntryState.FAILED ->
+                ctx.getString(R.string.archive_status_failed, reasonText(ctx, e.failure))
+            RescueSession.EntryState.VERIFIED -> when (verdict?.status) {
+                ReportStatus.COMPLETE -> ctx.getString(R.string.archive_status_complete)
+                ReportStatus.INCOMPLETE -> ctx.getString(R.string.archive_status_incomplete)
+                ReportStatus.ALTERED -> ctx.getString(R.string.archive_status_altered)
+                ReportStatus.INTERRUPTED -> ctx.getString(R.string.archive_status_interrupted)
+                ReportStatus.LEGACY, ReportStatus.DIRECTORY, null ->
+                    if (verdict?.closure == ClosureState.VALID) {
+                        ctx.getString(R.string.archive_status_legacy_frozen)
+                    } else {
+                        ctx.getString(R.string.archive_status_legacy)
+                    }
+            }
+        }
 
-    /**
-     * (UX bug 2) — used by the activity to detect a tap
-     * on an already-downloaded row and surface a confirmation dialog
-     * before re-downloading (prevents accidental overwrites on a
-     * finger-slip).
-     */
-    fun isDownloaded(reportId: String): Boolean = reportId in downloaded
+    private fun isWarning(e: RescueSession.EntryView, verdict: ReportVerdict?): Boolean = when {
+        e.state == RescueSession.EntryState.FAILED -> true
+        verdict == null -> false
+        else -> verdict.status == ReportStatus.ALTERED ||
+            verdict.status == ReportStatus.INCOMPLETE ||
+            verdict.status == ReportStatus.INTERRUPTED ||
+            verdict.closureAnomaly
+    }
 
-    private fun humanBytes(b: Long): String = when {
-        b < 1024L -> "$b B"
-        b < 1024L * 1024L -> "${b / 1024L} KB"
-        b < 1024L * 1024L * 1024L -> "${b / (1024L * 1024L)} MB"
-        else -> "%.1f GB".format(b.toDouble() / (1024.0 * 1024.0 * 1024.0))
+    private fun countersText(ctx: Context, v: ReportVerdict): String {
+        val r = ctx.resources
+        val parts = ArrayList<String>()
+        fun add(id: Int, count: UInt, always: Boolean = false) {
+            val n = count.toInt()
+            if (n > 0 || always) parts.add(r.getQuantityString(id, n, n))
+        }
+        add(R.plurals.archive_count_verified, v.verified, always = true)
+        add(R.plurals.archive_count_missing, v.missing)
+        add(R.plurals.archive_count_foreign, v.foreign)
+        add(R.plurals.archive_count_unexpected, v.unexpected)
+        add(R.plurals.archive_count_unexpected_signed, v.unexpectedSigned)
+        add(R.plurals.archive_count_invalid, v.invalid)
+        add(R.plurals.archive_count_unverifiable, v.unverifiable)
+        add(R.plurals.archive_count_unchecked, v.unchecked)
+        return parts.joinToString(" · ")
+    }
+
+    private fun datesText(ctx: Context, v: ReportVerdict?): String? {
+        val first = v?.firstModified ?: return null
+        val last = v.lastModified ?: return null
+        return ctx.getString(R.string.archive_dates_range, RescueNames.displayDate(first), RescueNames.displayDate(last))
+    }
+
+    private fun otsText(ctx: Context, ots: OtsStatus?): String = when (ots) {
+        OtsStatus.MATCH -> ctx.getString(R.string.archive_ots_match)
+        OtsStatus.MISMATCH -> ctx.getString(R.string.archive_ots_mismatch)
+        OtsStatus.ABSENT, null -> ctx.getString(R.string.archive_ots_absent)
+    }
+
+    private fun exportText(ctx: Context, e: RescueSession.EntryView): String? = when (e.exportState) {
+        RescueSession.ExportState.NONE -> null
+        RescueSession.ExportState.RUNNING -> ctx.getString(R.string.archive_export_running, e.exportDone, e.exportTotal)
+        RescueSession.ExportState.DONE -> exportDoneText(ctx, e.exportOutcome, R.string.archive_export_done)
+        RescueSession.ExportState.FAILED -> ctx.getString(R.string.archive_export_failed)
+    }
+
+    companion object {
+        /** Whether the export left out objects that did not decrypt: an
+         *  anomaly, shown in the warning colour. */
+        fun hasExclusions(outcome: ExportOutcome?): Boolean = (outcome?.undecryptable ?: 0) > 0
+
+        /**
+         * The line of a finished export: [done] when nothing was excluded;
+         * otherwise how many objects did not decrypt and were excluded, and
+         * whether the timestamp proof went with them.
+         */
+        fun exportDoneText(ctx: Context, outcome: ExportOutcome?, done: Int): String {
+            val excluded = outcome?.undecryptable ?: 0
+            if (outcome == null || excluded == 0) return ctx.getString(done)
+            val r = ctx.resources
+            if (outcome.nothingWritten) {
+                return r.getQuantityString(R.plurals.archive_export_nothing_decrypted, excluded, excluded)
+            }
+            val parts = arrayListOf(
+                ctx.getString(done),
+                r.getQuantityString(R.plurals.archive_export_undecryptable, excluded, excluded),
+            )
+            if (outcome.timestampLeftOut) parts.add(ctx.getString(R.string.archive_export_timestamp_left_out))
+            return parts.joinToString(" ")
+        }
+
+        /** The wording of a [FailureReason]. */
+        fun reasonText(ctx: Context, reason: FailureReason?): String = ctx.getString(
+            when (reason) {
+                FailureReason.RATE_LIMITED -> R.string.archive_reason_rate_limited
+                FailureReason.NETWORK -> R.string.archive_reason_network
+                FailureReason.STORAGE -> R.string.archive_reason_storage
+                FailureReason.REFUSED -> R.string.archive_reason_refused
+                FailureReason.PROBE_CAP -> R.string.archive_reason_probe_cap
+                FailureReason.OTHER, null -> R.string.archive_reason_other
+            },
+        )
     }
 }

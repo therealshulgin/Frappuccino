@@ -35,7 +35,18 @@ Frappuccino est un fork de Tella FOSS : une application Android de
 **témoignage vidéo chiffré de bout en bout** pour militants et journalistes en
 contexte de saisie ou de coercition. Le design rend délibérément le contenu
 passé **irrécupérable depuis le seul appareil** - seule la phrase BIP-39 papier
-ré-dérive l'identité d'archive.
+ré-dérive l'identité d'archive (les seules copies en clair qu'une version courante
+laisse hors de l'app sont les exports que le témoin fait lui-même, explicitement et
+après un avertissement).
+
+- **Les rapports sont signés à la production et figés à la clôture.** Chaque objet est
+  signé quand il est produit, par une clé propre à son rapport ; à l'arrêt, la clôture
+  `0x09` engage la liste exacte des objets et la clé est effacée de l'appareil ; le relais
+  refuse ensuite tout nom hors de cet ensemble ; le secours revérifie tout sous la clé
+  publique re-dérivée de la phrase. La garantie « pas de forge du passé » vaut pour les
+  rapports **clos** ; elle ne couvre ni le rapport en cours ni les rapports ouverts après
+  une extraction de l'état (§8.7, résidu R1). Ce mécanisme n'a **pas** de modèle Tamarin :
+  il repose sur des tests, des KAT croisés et la revue.
 
 - **Le cœur d'audit est la couche cryptographique V2, écrite à 100 % en Rust**
   (`crypto-rs/`). Aucune primitive cryptographique n'est écrite par nous : nous
@@ -61,8 +72,9 @@ ré-dérive l'identité d'archive.
   parité, diff-fuzz).
 - **Robustesse crash / mort anormale.** La récupération du ratchet à travers une
   interruption (consume / persist / reload, rotation) est verrouillée en tests Rust
-  déterministes, et la durabilité de la file d'upload est validée **on-device**
-  (`ChunkUploadQueueDurabilityTest`).
+  déterministes, et la durabilité de la file d'upload est couverte par un test
+  instrumenté **on-device** (`EnvelopeQueueDurabilityTest`) ; l'écriture atomique des
+  enveloppes elle-même est testée en Rust (`crypto-rs/stream/src/durable.rs`).
 - **Deux audits adverses inter-modèles** (red+blue exécutés par un modèle
   distinct, arbitrés) ont précédé cette remise. Le premier (avril→juin) a produit
   **deux bloquants**, déjà corrigés, et un **registre de risque-accepté** ; le
@@ -112,7 +124,10 @@ assumés**, et des **questions pour un futur auditeur**.
    il nomme les **3-4 paris porteurs** dont dépend tout le système (BET A : la
    phrase papier est la racine unique et réellement hors-appareil ; BET B : la
    forward secrecy est réelle au niveau octet, donc un appareil *saisi* n'expose
-   rien du passé ; BET C : le relais est aveugle au repos et le résidu d'identité
+   rien du passé - formulation de la revue du 2026-06-28, à lire aujourd'hui en deux
+   moitiés : la confidentialité du passé tient à l'absence de `x25519_sk` sur
+   l'appareil, la forward security prouvée porte sur l'authentification, et
+   l'intégrité du passé repose sur la clôture des rapports (§8.7) ; BET C : le relais est aveugle au repos et le résidu d'identité
    au repos n'est « qu'un nombre » ; BET D, plus faible : l'artefact expédié est
    l'artefact audité et le canal reste up).
 2. **Vérifiez les paris porteurs.** Un faux sur l'un d'eux casse de grandes
@@ -181,9 +196,11 @@ papier (mode archive).
 | MITM actif avec chaîne CA valide | Oui | Pin SPKI (rejet *avant* validation de chaîne) **et** vérification de la signature `CertificateVerify` (post-RT-01) |
 | Opérateur serveur lit les blobs | Oui (confidentialité) | `crypto_box_seal` → seule la clé d'archive x25519 descelle |
 | Opérateur serveur altère les blobs | Oui | Tag XChaCha20-Poly1305, AAD lie l'en-tête + `chunk_count` (AAD CHUNKED) |
+| Opérateur serveur ajoute, remplace ou retire des objets d'un rapport | Partiel | Rapport clos : le manifeste signé `0x09` fixe l'ensemble, le secours classe tout écart (`FOREIGN`, `MISSING`, `UNEXPECTED`) et l'exclut. Rapport non clos : chaque objet est vérifié par sa `write_sig`, mais la fin n'est pas certifiée. Retenir un rapport entier reste indétectable avec un relais unique |
 | Saisie appareil, PIN **connu** | Non (chemin assumé) | L'app déverrouille ; voie de déni assumée |
-| Saisie appareil, PIN **inconnu** | Partiel | Argon2id 256 MiB × 4 garde le ratchet scellé ; ≠ phrase |
-| Saisie appareil, bouton wipe martelé | Oui | Fichier ratchet wipé ; archive récupère via phrase papier seule |
+| Saisie appareil, PIN **inconnu** | Partiel | Argon2id 256 MiB × 4 garde le ratchet et l'état de rapport scellés ; ≠ phrase |
+| Extraction de l'état de l'appareil (PIN cassé, root) | Partiel | Aucun contenu passé lisible ; rapports **clos** figés. En revanche : signature du rapport en cours et de tous les rapports ouverts après l'extraction, écriture dans l'annuaire, sans limite de durée (§8.7, R1/R1b) |
+| Saisie appareil, bouton wipe martelé | Oui | Écrivain abandonné, ratchet, état de rapport, clé de file, files et copies du lecteur interne effacés, anciennes exportations de cette installation purgées ; les exports faits par le sélecteur de fichiers du système restent hors de portée ; archive récupère via phrase papier seule |
 | Rejeu d'une signature de verify capturée | Oui | Nonce atomic-pop + skew timestamp ±30 s |
 | Troncation d'un blob CHUNKED au repos | Oui | AAD lie `chunk_count` (AAD CHUNKED) |
 | Dump RAM cold-boot d'un appareil verrouillé | Best-effort | `mlock` + `zeroize`, `FLAG_SECURE` sur les écrans sensibles |
@@ -291,7 +308,7 @@ pytest tests/
 
 Déploiement gaté à `--workers 1` (le cache de nonce est in-process - voir §6,
 hypothèse de confiance). Le relais Vultr est joignable par **domaine**
-(`relay.shake-document-protect.org`, A-record → `136.244.101.236`) pour la durée
+(`relay.shake-document-protect.org`, A-record vers l'IP du relais) pour la durée
 de l'audit ; cert **auto-signé épinglé par SPKI** (stratégie *bêta*, **pas**
 Let's Encrypt) ; **pins et hôte = ceux de `pin.rs`** (les 3 pins de l'union, hôte
 = le domaine). MinIO est désormais lié à **127.0.0.1:9000** (loopback uniquement,
@@ -396,11 +413,16 @@ les frontières.**
 > donc la preuve no-panic ne couvrait plus le format expédié ; c'est fermé) · **④ TLA+/TLC** **4680 états**
 > exhaustif · **⑤ Tamarin** **10 lemmes + 2 contrôles négatifs** qui falsifient. En complément :
 > **`cargo test`** 257/257 (workspace, `--all-features`), **`clippy -D warnings`** vert, **`pytest`** serveur 86/86.
-> **État courant, mesuré le 2026-09-04** : Kani **5/5 harnais** (le cinquième prouve que
-> `parse_header` **refuse tout en-tête portant un grant**), TLC **2800 états** sur **six
-> invariants**, Tamarin 10 lemmes + 2 contrôles négatifs, `cargo test` **254 verts (plus 3 marqués `#[ignore]`, l'e2e exigeant un relais vivant)**, `pytest`
-> serveur **98/98**. Le serveur a changé depuis l'instantané : il a perdu deux routes de
-> compatibilité Tella le 2026-09-03. Dates
+> **Mesuré le 2026-10-25, avec la refonte des rapports** : Kani **8/8 harnais** (dont le
+> refus par `parse_header` de tout en-tête portant un grant, et trois sur l'enveloppe de
+> file), `cargo test --workspace` **427 verts (plus 3 marqués `#[ignore]`, l'e2e exigeant un
+> relais vivant)**, `pytest` serveur **222 verts, 1 sauté** (le fsync de répertoire, qui
+> n'existe que sous POSIX, sur une machine Windows). **Mesuré le 2026-09-04, non rejoué
+> depuis** : TLC **2800 états** sur **six invariants**, Tamarin 10 lemmes + 2 contrôles
+> négatifs (la refonte des rapports ne touche pas au ratchet, que ces deux modèles
+> couvrent ; les rapports eux-mêmes n'ont pas de modèle formel). Le serveur a changé depuis
+> l'instantané : il a perdu deux routes de compatibilité Tella le 2026-09-03, et gagné la
+> route de clôture des rapports. Dates
 > par-preuve dans `docs/{ZEROIZE_AUDIT_RATCHET,KANI_PROOFS,TLA_RATCHET,TAMARIN_RATCHET}.md` ; les runners
 > ci-dessous sont inchangés. *(② diff-fuzz Kotlin↔Rust et `crypto-rs/fuzz/` = recherche non-déterministe,
 > hors de cette passe de re-vérification déterministe.)*
@@ -414,6 +436,7 @@ les frontières.**
 | **⑤ Tamarin** (protocole Dolev-Yao) | Secrecy éph.+ltk, authentification slot, anti-rejeu, inforgeabilité RotationProof, no-rogue-batch, forward secrecy, **séparation de domaine** | Crypto **parfaite** + keygen **honnête** ; 1 slot représentatif/batch. Pas le code serveur réel, pas les canaux auxiliaires |
 | **proptest** | Round-trips STRM/ratchet + invariants FSM sur schedules aléatoires | Test, pas preuve ; borné à la distribution des générateurs |
 | **cargo-mutants** (decrypt 100 %, header 98 %) | Mutants logiques tués dans `core`/`stream` | Exclut `ffi/`, `cli/`, tests. Survivant `be_u16` prouvé équivalent |
+| **Rapports figés** (tests Rust `core::report`, KAT `report_chain_kat.rs`, pytest `test_report_close*.py`, `test_report_tombstone.py`, tests JVM de la file et du secours) | Chaîne à sens unique, clôture `0x09` sur le manifeste exact, règle du relais après clôture, pierres tombales, statuts du secours | **Aucun modèle formel** (ni Tamarin ni TLA+ pour les rapports). Ne couvre pas le rapport en cours ni ceux ouverts après une extraction (R1) ; pas encore validé sur appareil |
 
 **Anti-pattern de réfutation que nous nous interdisons** (et que nous vous
 signalons pour que vous nous teniez honnêtes) : *« TLA+ prouve le no-rollback,
@@ -502,9 +525,13 @@ crypto-rs/run-kani.sh --harness check_be_u16_big_endian_and_or_equals_xor
 
 Le runner verifie contre une copie jetable du workspace (pin 1.88 retiré pour ne
 pas écraser la toolchain Kani) ; l'arbre réel n'est jamais modifié. Harnais
-`#[cfg(kani)]`-gatés (invisibles à `cargo build/test/clippy`). Baseline : **5/5
-vérifiés, 0 échec** (Kani 0.67, backend CBMC). Le runner **compte** les harnais et
-échoue s'il n'en revient pas exactement cinq : `cargo kani` sort déjà non-zéro sur
+`#[cfg(kani)]`-gatés (invisibles à `cargo build/test/clippy`). Depuis la refonte des
+rapports, trois harnais s'ajoutent sur l'enveloppe de file (le décodeur de l'en-tête
+déchiffré, en deux harnais, et le cadrage de fin de fichier) et le runner en attend
+**huit** ; run daté du 2026-10-25 : **8/8 vérifiés, 0 échec** (Kani 0.67, backend CBMC).
+Ce que ces harnais ne prouvent pas (l'égalité du nom décodé avec ses octets, l'effacement
+à la libération) est listé dans `docs/KANI_PROOFS.md`. Le runner **compte** les harnais et échoue s'il n'en revient pas exactement
+le nombre attendu : `cargo kani` sort déjà non-zéro sur
 une preuve qui échoue, mais rien ne voyait une preuve qui **cesse d'exister**
 (harnais supprimé, renommé, attribut retiré, sorti du build). Un `selftest` éprouve
 l'analyse du résumé sans Kani, y compris sur le cas qui compte : un résumé
@@ -644,6 +671,9 @@ mirroré byte-pour-byte par le serveur avant vérification :
 | `0x02` | `BatchRotation` | slot éphémère | `concat(50 pk)` | `/auth/v2/rotate-batch` |
 | `0x03` | `Enrollment` | long-terme | `concat(50 pk)` | `/auth/v2/enroll` |
 | `0x04` | `ArchiveAuth` (**RETIRÉ**, Phase C) | long-terme | (n/a) | (lectures d'archive sans-identité) |
+| `0x07` | `ReportCreate` | clé de rapport | `report_id(16)‖report_pk(32)` | `PUT /file/{rid}/{name}` (création) |
+| `0x08` | `ReportWrite` | clé de rapport | `report_id(16)‖filename‖sha256(body)(32)` | `PUT /file/{rid}/{name}` ; revérifiée au secours |
+| `0x09` | `ReportClose` | clé de rapport | `report_id(16)‖u32_be(seq_limit)‖sha256(manifest)(32)` | `POST /close/{rid}` ; revérifiée au secours |
 
 > **Mise à jour 2026-06-28 - le schéma de tags a grandi.** Le domaine `0x04
 > ArchiveAuth` est désormais **retiré par construction** : la Phase C
@@ -654,9 +684,12 @@ mirroré byte-pour-byte par le serveur avant vérification :
 > été spécifiés pour un modèle de provenance à manifeste signé, supprimé par le recul
 > métadonnées du 2026-06-25 au profit du modèle hash + Bitcoin, qui ne stocke ni
 > manifeste ni signature. Rien ne les émet, rien ne les vérifie ; ne cherchez pas de
-> signatures hors-ligne à auditer. Le seul **vrai** ajout au-delà des 4 tags d'origine
-> est `0x07`/`0x08` (capabilities de report relais-aveugle Phase C, vérifiées par le
-> relais sur `PUT /file/{rid}/{name}`). La table de
+> signatures hors-ligne à auditer. Les **vrais** ajouts au-delà des 4 tags d'origine
+> sont `0x07`/`0x08` (capabilities de report relais-aveugle Phase C, vérifiées par le
+> relais sur `PUT /file/{rid}/{name}`) et `0x09` (la clôture d'un rapport, vérifiée par
+> le relais sur `POST /close/{rid}`). Les trois sont revérifiés au secours sous la clé
+> publique re-dérivée de la phrase ; un KAT croisé (`server/tests/test_report_close_kat.py`)
+> vérifie en Python des valeurs figées par Rust sans jamais re-signer. La table de
 > référence vivante et autoritaire est l'en-tête de
 > `crypto-rs/core/src/signature_domain.rs`.
 
@@ -853,6 +886,22 @@ stream/archive sur **toutes** les routes, IDOR sur les reports, anti-rejeu de
 nonce sous concurrence. (Nous avons confirmé ces points fermés ; ils dépendent de
 `--workers 1`.)
 
+**7. Les rapports figés (aucun modèle formel derrière).** Ce mécanisme ne repose que sur
+des tests et la revue ; il mérite donc un regard d'autant plus frais. Ce qu'il faut
+pouvoir confirmer : (a) aucun état persistant de l'appareil ne permet de redériver la clé
+d'un rapport ouvert avant lui (`crypto-rs/core/src/report/chain.rs`, et l'ordre
+« état avancé écrit durablement, puis écrivain rendu » de `crypto-rs/ffi/src/report_state.rs`) ;
+(b) la clôture engage exactement la table des objets enregistrés, et aucun objet ne
+peut être signé entre son écriture et son enregistrement
+(`crypto-rs/ffi/src/report_writer.rs`) ; (c) côté relais, le contrôle de clôture, le
+test d'existence et l'écriture ne laissent aucune fenêtre (`server/app/routes/upload.py`,
+`storage.upload_blob_stream_write_once`, `reports.close_report`) ; (d) le secours ne
+vérifie jamais sous une clé reçue du relais et n'accepte comme `VERIFIED` que ce que la
+clôture ou la `write_sig` couvre (`crypto-rs/ffi/src/rescue.rs`) ; (e) l'enveloppe de file
+est revérifiée avant tout envoi et son parseur ne panique pas (`crypto-rs/stream/src/envelope.rs`,
+proptest et harnais Kani). Dites-nous aussi si les résidus R1-R7 (§8.7) vous semblent
+correctement bornés pour la population visée.
+
 **Surfaces qu'aucune des passes précédentes n'avait couvertes** (signalées par le
 contre-audit historique, `OLD/BLUE_TEAM_COUNTERAUDIT_2026-04-21.md §5.4`, et
 depuis traitées mais qui méritent votre regard frais) : les contextes HKDF
@@ -896,7 +945,8 @@ corrigés** ; un latent **corrigé** ; quatre sont **risque-accepté documenté*
 - **R-C-1 (corrigé `da56da4` + Tamarin `6b3701e`).** Voir §5.
 
 **Risque-accepté documenté (réels, bornés, device-dépendants - ils n'exposent
-PAS les rushes passés, la forward secrecy tient) :**
+PAS le contenu des rushes passés, faute de `x25519_sk` sur l'appareil, et la forward
+security de l'authentification tient) :**
 
 - **R-D-1 - PIN 6 chiffres, pas de wipe-after-N, binding Keystore faible.** Borné
   par Argon2id 256 MiB **et** par un premier gate `EncryptedSharedPreferences`/
@@ -967,8 +1017,11 @@ red/blue, 7 rapports) a précédé cette remise. La remédiation a été livrée
 - **MinIO en loopback (R-SRV-2).** Lié à **127.0.0.1:9000** uniquement ; logs
   Docker bornés ; `access_log` nginx `off`.
 - **No-export FFI (Lot 4b, R-CR-1).** Les secrets sensibles (blob ratchet 50
-  clés, master des reports, seed de provenance, clé de session Argon2) **ne
-  traversent plus la FFI**. Ils restent en Rust derrière un handle ; scellement et
+  clés, état de rapport et clés de rapport - le master des reports legacy n'existe
+  plus sur l'appareil qu'au cours de la migration -, seed de provenance, clé de
+  session Argon2) **ne traversent plus la FFI**. Exception nommée : la clé de file,
+  lue par Kotlin depuis son `EncryptedFile` en `ByteArray`, installée dans Rust puis
+  effacée. Ils restent en Rust derrière un handle ; scellement et
   descellement se font **dans Rust en un seul appel** (`pin_session_*` dans
   `crypto-rs/ffi/src/lib.rs` ; `StreamUploadManager.kt`). Field-validé sur OnePlus
   (33 min / 396 chunks, 0 erreur). C'est la version la plus forte du contrat
@@ -1014,8 +1067,12 @@ report) est au §8.6.**
   courant V3 a **retiré** l'`author_ed25519_pk` de l'en-tête (F-C1/WP-A) : il n'y
   a donc plus aucun autorat — signé ou non — au repos. Un relais aveugle peut
   toujours fabriquer des blobs auto-adressés, mais ils ne portent désormais
-  **aucune identité** ; la confidentialité reste assurée (`crypto_box_seal`) et
-  l'impact résiduel est « spam dans l'archive », pas une compromission. L'UI
+  **aucune identité** ; la confidentialité reste assurée (`crypto_box_seal`). Depuis
+  la signature à la production, un tel blob n'entre plus dans le témoignage vérifié :
+  le secours n'accepte que ce que couvre une `write_sig` ou la clôture d'un rapport,
+  sous la clé re-dérivée de la phrase. Seuls les objets legacy stockés sans signature
+  restent indiscernables, et ils sont tenus à part, en section « non vérifiable »
+  (R3b, §8.7). L'UI
   n'affiche aucune attribution d'auteur (audité,
   `docs/UI_FINGERPRINT_AUDIT_2026-05-07.md`). La question déférée (signer
   l'auteur) est sans objet : il n'y a plus de champ auteur à signer. Les blobs
@@ -1084,7 +1141,7 @@ vendaient un design **« IP brute, sans-SNI »** comme un contrôle anti-métado
 du chemin **`DirectTls` porte donc un nom d'hôte SNI en clair aujourd'hui**. Sur le
 chemin **`ObfQuic`**, le SNI est **masqué par Salamander tant que l'UDP est ouvert**.
 
-**État assumé (décision therealshulgin 2026-06-28, hors scope) :** un État peut bloquer
+**État assumé (décision du mainteneur, 2026-06-28, hors scope) :** un État peut bloquer
 l'UDP/443 pour **forcer le downgrade vers le `DirectTls` classifiable** - qui
 expose alors aussi le SNI. C'est un **résidu accepté**, pas un fix futur :
 
@@ -1109,12 +1166,14 @@ témoin + sa cadence** dans les noms. Désormais chaque nom d'entrée est **opaq
 dérivé d'un secret** :
 
 ```
-nom = hex( HKDF(report_master, "stream.report.directory.entry.v1" ‖ u32_be(n))[..16] )
+nom legacy = hex( HKDF(report_master, "stream.report.directory.entry.v1" ‖ u32_be(n))[..16] )
+nom chaîne = hex( HKDF(C_i, "stream.report.chain.v2.directory-entry", 16) )
 ```
 
-- Dérivé du **secret `report_master`** (`crypto-rs/core/src/report.rs`,
-  contexte `CTX_REPORT_DIR_ENTRY`), **jamais** du `directory_pk` public (sinon le
-  relais pourrait ré-énumérer). Le relais voit `directory_pk`, pas `report_master`.
+- Dérivé d'un **secret** (`report_master` pour les index legacy, le maillon `C_i`
+  pour les index chaîne ; `crypto-rs/core/src/report.rs` et `report/chain.rs`),
+  **jamais** du `directory_pk` public (sinon le relais pourrait ré-énumérer). Le
+  relais voit `directory_pk`, pas ces secrets.
 - Le **corps** de l'entrée ne porte plus l'index non plus (constant, 1 octet).
 - La récupération retrouve `n_max` par **dérive-et-match**, en **dual-lisant** les
   éventuelles entrées legacy `%010d` (forward-compat).
@@ -1125,6 +1184,47 @@ témoin (compteur + cadence) sous un seul `report_id`. Les noms opaques retirent
 **fingerprint trivial** et l'**index lisible**, mais **pas** la liaison
 structurelle. Le motto strict (pas d'identité, pas de contenu) tient ; le résidu
 est de la catégorie « un nombre, pas une carte » (synthèse design §4.3).
+
+### 8.7 Rapports figés et secours vérifié - garanties et résidus R1-R7
+
+**Ce qui est garanti** (code : `crypto-rs/core/src/report/`, `crypto-rs/ffi/src/{report_state,report_writer,envelopes,rescue}.rs`,
+`server/app/routes/{upload,reports,archive}.py` ; architecture §6.3, §7.4, §8.3, §8.7) :
+
+- **Rapport terminé figé.** À l'arrêt, l'appareil signe la clôture `0x09` puis efface
+  la clé du rapport ; l'état persistant `(i, C_i, graine d'annuaire)` ne permet plus de
+  la redériver (chaîne HKDF à sens unique, `report_master` absent de l'appareil). Une
+  fois la clôture reçue, le relais refuse tout nom hors de l'ensemble déclaré
+  (409 `Report closed`), et une fiche close n'est jamais oubliée (pierre tombale à
+  expiration des objets, chargement fail-closed de `reports.json`).
+- **Signature à la production.** Chaque objet (métadonnées, chunk, entrée d'annuaire,
+  clôture, preuve OTS) est signé quand il est produit ; l'envoi ne signe jamais et
+  revérifie l'enveloppe avant de l'envoyer.
+- **La phrase seule redérive tout** (ids, clés publiques, noms des deux familles).
+- **Le secours vérifie avant de ranger**, sous la clé publique re-dérivée ; ce qui ne
+  vérifie pas est exclu et compté ; les objets legacy sans signature sont tenus à part.
+- **Le ratchet n'est pas modifié** par ce mécanisme.
+
+**Résidus**, énoncés en termes de garanties (registre :
+[`ACCEPTED_RESIDUALS_2026-06-28.md`](ACCEPTED_RESIDUALS_2026-06-28.md)) :
+
+| Id | Ce que la garantie ne couvre pas |
+|---|---|
+| **R1** | Une extraction de l'état à l'instant `t` donne la capacité de signer le rapport en cours à `t` (sa clé est en mémoire jusqu'à la clôture) et tous les rapports ouverts après `t` (chaîne déterministe, imposée par « la phrase seule redérive tout »). Un rapport complet placé à un index futur n'est pas détectable cryptographiquement ; un 409 ou une incohérence de manifeste ne signale qu'une collision avec un usage réel du témoin, et ce 409 n'est pas garanti sous écritures simultanées. Le secours affiche l'intervalle de dates de chaque rapport. Les rapports clos avant `t` sont hors d'atteinte, sous réserve des versions antérieures de l'état scellé restées sur la flash, contre lesquelles le PIN n'oppose qu'un délai (Argon2id) |
+| **R1b** | La clé d'annuaire est persistante : quiconque a extrait l'état peut écrire dans l'annuaire et le clore, sans limite de durée. Le secours traite une clôture d'annuaire comme une anomalie et sonde au-delà |
+| **R2** | Clé perdue avant l'écriture de la clôture (mort du processus, borne de vidange dépassée, échec d'écriture, effacement d'urgence pendant l'enregistrement) : rapport jamais clos, objets authentifiés un par un, fin non certifiée (`INTERRUPTED`) |
+| **R3** | Appareils migrés : une extraction antérieure à la mise à jour a pu emporter `report_master`, dont dérivent la chaîne et la clé d'annuaire. Sont clos à la migration les rapports legacy que le relais connaît et dont la file se vide ; les index legacy jamais créés et l'annuaire restent inscriptibles par ce détenteur. Parade : ré-inscription avec une phrase neuve. Les objets legacy en attente à la migration sont signés à la migration, pas à la production |
+| **R3b** | Un objet legacy sans signature stockée n'est authentifié que par son déchiffrement, or le scellement est anonyme : section « non vérifiable », jamais dans le témoignage vérifié. Une clôture legacy (vide) se dit « figé côté relais » |
+| **R4** | Un rapport legacy dont la file ne se vide jamais reste ouvert |
+| **R5** | Un objet refusé (409 clos ou conflit) reste sur le téléphone : il ne peut repartir sans nouvelle signature, et la clé n'existe plus |
+| **R6** | Restaurer une sauvegarde antérieure du relais perd les clôtures plus récentes (rapports vus « interrompus ») |
+| **R7** | La file d'enveloppes chiffre ses en-têtes sous une clé de file protégée par le Keystore (même niveau qu'`EncryptedSharedPreferences`) ; une extraction capable d'utiliser le Keystore de l'app lit les adresses des rapports en attente |
+
+**Déploiement.** Le relais doit être déployé avant l'APK, et vérifié par une sonde :
+`POST /close/<rid>` sans en-têtes rend 400, pas 404. Un client qui reçoit 404 sur
+`/close` réessaie avec recul et n'abandonne jamais. La métadonnée
+`report-write-sig` est une donnée d'intégrité : une migration de stockage doit
+préserver les métadonnées utilisateur (`deploy/audit-reports-vs-blobs.sh` compte les
+objets qui en sont dépourvus).
 
 ---
 

@@ -1,9 +1,14 @@
 import hashlib
 import io
 import logging
+import re
+from collections.abc import Mapping
+from typing import NamedTuple
+
 from minio import Minio
+from minio.commonconfig import REPLACE, CopySource
 from minio.error import S3Error
-from app import config
+from app import config, paths
 
 logger = logging.getLogger("stream.storage")
 
@@ -36,6 +41,43 @@ class WriteOnceConflictError(Exception):
     guarantee those paths rely on is preserved."""
 
 
+class ReportClosedError(Exception):
+    """Raised when a PUT would create a NEW object in a report whose closure
+    the relay has recorded, under a name that closure does not cover
+    (`paths.name_allowed_after_close`). The upload route maps it to 409
+    `{"detail": "Report closed"}`.
+
+    The decision is taken here, on the same `stat_object` that tells whether
+    the key is free, so "is this a new object?" and "may a new object be
+    written?" are one answer, not two probes. An object that already exists is
+    not a creation: it keeps the write-once semantics (identical re-PUT is a
+    no-op, different bytes raise WriteOnceConflictError) whatever the closure
+    says."""
+
+
+class BlobInfo(NamedTuple):
+    """What one `stat_object` says about a stored object."""
+
+    size: int
+    # The object's write signature (domain 0x08) as 128 lowercase hex chars, or
+    # None for an object stored before the relay kept it.
+    write_sig_hex: str | None
+
+
+# User metadata under which the relay keeps each object's write signature
+# (domain 0x08), as lowercase hex, written by the same `put_object` that
+# creates the object.
+#
+# It is integrity data, not a convenience. A report that was never closed has
+# no manifest, so the signature stored here is the only thing that lets the
+# rescue tell a chunk the witness's key signed from one it did not. A storage
+# migration that copies object bytes without their user metadata turns every
+# such chunk into an unverifiable one; `deploy/audit-reports-vs-blobs.sh`
+# counts the objects that lack it.
+WRITE_SIG_METADATA_KEY = "x-amz-meta-report-write-sig"
+_WRITE_SIG_RE = re.compile(r"[a-f0-9]{128}")
+
+
 # MinIO/S3 error codes meaning "out of storage". Matched leniently (exact
 # set + case-insensitive substring) because the exact code has varied
 # across MinIO releases — XMinioStorageFull historically, the generic S3
@@ -49,7 +91,18 @@ def _is_disk_full(e: S3Error) -> bool:
     return code in _DISK_FULL_CODES or "storagefull" in lc or "insufficientstorage" in lc
 
 
-def _put_object_guarded(path: str, data, length: int):
+def _raise_if_disk_full(e: S3Error, op: str, path: str) -> None:
+    """Re-raise a disk-full S3Error as [StorageFullError]; return otherwise,
+    so the caller re-raises every other S3Error unchanged."""
+    if _is_disk_full(e):
+        logger.error(
+            "MinIO disk-full on %s %s (code=%s) → StorageFullError",
+            op, path, getattr(e, "code", "?"),
+        )
+        raise StorageFullError(str(e)) from e
+
+
+def _put_object_guarded(path: str, data, length: int, metadata: dict | None = None):
     """Wraps client.put_object, translating a disk-full S3Error into
     [StorageFullError]. All other S3Errors propagate unchanged so they
     keep their existing (→ HTTP 500) transient-server semantics."""
@@ -58,14 +111,10 @@ def _put_object_guarded(path: str, data, length: int):
         client.put_object(
             config.MINIO_BUCKET, path, data, length,
             content_type="application/octet-stream",
+            metadata=metadata,
         )
     except S3Error as e:
-        if _is_disk_full(e):
-            logger.error(
-                "MinIO disk-full on PUT %s (code=%s) → StorageFullError",
-                path, getattr(e, "code", "?"),
-            )
-            raise StorageFullError(str(e)) from e
+        _raise_if_disk_full(e, "PUT", path)
         raise
 
 
@@ -100,16 +149,46 @@ def _object_path(report_id: str, filename: str) -> str:
     return f"{report_id}/{filename}"
 
 
-def get_blob_size(report_id: str, filename: str) -> int:
-    client = get_client()
+def _stat_or_none(path: str):
+    """`stat_object`, or None when the key is free. Any other S3Error
+    propagates."""
     try:
-        stat = client.stat_object(config.MINIO_BUCKET, _object_path(report_id, filename))
-        return stat.size
+        return get_client().stat_object(config.MINIO_BUCKET, path)
     except S3Error as e:
         if e.code == "NoSuchKey":
-            return 0
-        logger.error("S3 error checking blob size: %s", e)
+            return None
         raise
+
+
+def _write_sig_from_metadata(metadata) -> str | None:
+    """The write signature kept in an object's user metadata, or None.
+
+    The lookup ignores case: header names are case-insensitive, the store may
+    hand them back canonicalised (`X-Amz-Meta-Report-Write-Sig`), and while
+    the stat result's headers compare case-insensitively, a plain dict does
+    not. A value that is not 128 lowercase hex chars is treated as absent
+    rather than served: this relay only ever writes that form there.
+    """
+    if not isinstance(metadata, Mapping):
+        return None
+    for key, value in metadata.items():
+        if str(key).lower() != WRITE_SIG_METADATA_KEY:
+            continue
+        if isinstance(value, str) and _WRITE_SIG_RE.fullmatch(value) is not None:
+            return value
+        logger.warning("Ignoring malformed write-sig metadata")
+        return None
+    return None
+
+
+def stat_blob(report_id: str, filename: str) -> BlobInfo | None:
+    """Size and stored write signature of one object, or None if absent. One
+    `stat_object`, which the archive download reads for Content-Length and for
+    the `X-Report-Write-Sig` header."""
+    stat = _stat_or_none(_object_path(report_id, filename))
+    if stat is None:
+        return None
+    return BlobInfo(size=stat.size, write_sig_hex=_write_sig_from_metadata(stat.metadata))
 
 
 def upload_blob(report_id: str, filename: str, data: bytes):
@@ -130,10 +209,6 @@ def upload_blob(report_id: str, filename: str, data: bytes):
 
     Overwriting outright is also what RFC 9110 §9.3.4 asks of a PUT, and it
     makes the race benign: a duplicate PUT just rewrites the same bytes.
-
-    `existing_size` is not consulted here. `get_blob_size` itself is live in
-    production — the archive download reads it for Content-Length, and
-    `blob_exists` is built on it.
     """
     if len(data) == 0:
         return
@@ -164,9 +239,8 @@ def upload_blob_stream(report_id: str, filename: str, stream, length: int):
     _put_object_guarded(path, stream, length)
 
 
-def _existing_object_sha256(path: str) -> str | None:
-    """§10.6 write-once — SHA-256 (hex) of the object already stored at
-    `path`, or None if the key is free.
+def _stored_sha256(path: str) -> str:
+    """§10.6 write-once — SHA-256 (hex) of the object already stored at `path`.
 
     The hash is recomputed from the bytes on disk rather than read off an ETag
     or stored metadata, and that is not wasted work: MinIO ETags are irregular
@@ -178,15 +252,8 @@ def _existing_object_sha256(path: str) -> str | None:
 
     It stays cheap in practice: a brand-new chunk costs one `stat_object` that
     raises NoSuchKey, no GET. The read-back only happens on a *re-PUT* to an
-    occupied key, which the client avoids by HEADing first and skipping chunks
-    already stored."""
+    occupied key: a retry whose first response was lost, or a race."""
     client = get_client()
-    try:
-        client.stat_object(config.MINIO_BUCKET, path)
-    except S3Error as e:
-        if e.code == "NoSuchKey":
-            return None
-        raise
     obj = client.get_object(config.MINIO_BUCKET, path)
     h = hashlib.sha256()
     try:
@@ -201,8 +268,41 @@ def _existing_object_sha256(path: str) -> str | None:
     return h.hexdigest()
 
 
+def _attach_write_sig(path: str, write_sig_hex: str) -> None:
+    """Add the write-signature metadata to an object stored without it.
+
+    S3 has no in-place metadata edit: a copy of the object onto its own key
+    with the REPLACE directive is the operation for it. The bytes do not change,
+    but the object's `last_modified` becomes the time of the copy, and both the
+    retention TTL (blob_cleanup) and the rescue's per-report date range read
+    that field. It happens at most once per object: the first identical re-PUT
+    of an object stored before the relay kept signatures.
+    """
+    client = get_client()
+    try:
+        client.copy_object(
+            config.MINIO_BUCKET,
+            path,
+            CopySource(config.MINIO_BUCKET, path),
+            metadata={
+                "Content-Type": "application/octet-stream",
+                WRITE_SIG_METADATA_KEY: write_sig_hex,
+            },
+            metadata_directive=REPLACE,
+        )
+    except S3Error as e:
+        _raise_if_disk_full(e, "COPY", path)
+        raise
+
+
 def upload_blob_stream_write_once(
-    report_id: str, filename: str, stream, length: int, sha256_hex: str
+    report_id: str,
+    filename: str,
+    stream,
+    length: int,
+    sha256_hex: str,
+    write_sig_hex: str | None = None,
+    closed_seq_limit: int | None = None,
 ) -> str:
     """§10.6 write-once PUT — an existing object is immutable. A free key takes
     the bytes and returns "created", a byte-identical re-PUT is a no-op that
@@ -210,31 +310,51 @@ def upload_blob_stream_write_once(
     lean on), and a PUT that would replace stored bytes with different ones
     raises WriteOnceConflictError, which the route maps to 409.
 
+    `write_sig_hex`, when given, is the verified write signature of these
+    bytes. It is stored as user metadata by the `put_object` that creates the
+    object, never by a second request, so no object created through here with a
+    signature is ever visible without it. An identical re-PUT of an object that
+    lacks it (stored before the relay kept signatures) attaches it; one that
+    already has it leaves it alone, like the bytes.
+
+    `closed_seq_limit` is the seq_limit of the report's recorded closure, or
+    None while the report is open. When it is set, a free key is written only
+    if `paths.name_allowed_after_close` admits the name; otherwise
+    ReportClosedError. The upload route reads the closure under the registry
+    lock and holds that lock across this call, so a closure cannot be recorded
+    between that read and the write.
+
     Two things to keep if this is ever rewritten. The write itself must stay
     the length-known, non-multipart streaming PUT of `upload_blob_stream`, so
     a full disk keeps surfacing as StorageFullError and the route keeps
-    answering 507. And refusing to clobber an occupied key is the only
-    behaviour added on top of it — that refusal is what stops a leaked upload
-    JWT from corrupting already-stored witness chunks (threat model spelled
-    out on WriteOnceConflictError)."""
+    answering 507. And refusing to clobber an occupied key is, with the closure
+    rule, the only behaviour added on top of it — that refusal is what stops a
+    leaked upload JWT from corrupting already-stored witness chunks (threat
+    model spelled out on WriteOnceConflictError)."""
     if length <= 0:
         return "empty"
+    if write_sig_hex is not None and _WRITE_SIG_RE.fullmatch(write_sig_hex) is None:
+        raise ValueError("write signature must be 128 lowercase hex chars")
     path = _object_path(report_id, filename)
     incoming = (sha256_hex or "").strip().lower()
-    existing = _existing_object_sha256(path)
-    if existing is not None:
-        if existing == incoming:
-            return "identical"  # idempotent retry / race — leave the stored bytes
-        raise WriteOnceConflictError(
-            f"{path}: stored object differs from incoming bytes (write-once)"
-        )
-    # Phase 1.12 — disk-full → StorageFullError (route maps to 507).
-    _put_object_guarded(path, stream, length)
+    stat = _stat_or_none(path)
+    if stat is not None:
+        if _stored_sha256(path) != incoming:
+            raise WriteOnceConflictError(
+                f"{path}: stored object differs from incoming bytes (write-once)"
+            )
+        # Idempotent retry / race — leave the stored bytes.
+        if write_sig_hex is not None and _write_sig_from_metadata(stat.metadata) is None:
+            _attach_write_sig(path, write_sig_hex)
+        return "identical"
+    if closed_seq_limit is not None and not paths.name_allowed_after_close(
+        filename, closed_seq_limit
+    ):
+        raise ReportClosedError(f"{path}: report closed")
+    metadata = None if write_sig_hex is None else {WRITE_SIG_METADATA_KEY: write_sig_hex}
+    # Disk-full → StorageFullError (route maps to 507).
+    _put_object_guarded(path, stream, length, metadata)
     return "created"
-
-
-def blob_exists(report_id: str, filename: str) -> bool:
-    return get_blob_size(report_id, filename) > 0
 
 
 def list_blobs(report_id: str) -> list[dict]:

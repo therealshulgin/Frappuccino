@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  One report of the "not verifiable" section (ArchiveUnverifiableAdapter). The
+  buttons say NOT VERIFIED in their own label: they sit far from the report's
+  row, and a witness must never take what they open or export for the
+  verified testimony.
+
+  ArchiveUnverifiableAdapter sets the visibility of the export line and of
+  both buttons on every bind; do not fix it here.
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:layout_marginTop="8dp"
+    android:orientation="vertical">
+
+    <TextView
+        android:id="@+id/unverifiableTitle"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:textColor="@color/wa_white"
+        android:textSize="11sp"
+        android:fontFamily="monospace"
+        tools:text="Report 2: 14 objects" />
+
+    <TextView
+        android:id="@+id/unverifiableExportState"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:textColor="@color/wa_white"
+        android:textSize="11sp"
+        android:fontFamily="monospace"
+        android:visibility="gone" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:orientation="horizontal">
+
+        <TextView
+            android:id="@+id/unverifiablePlayBtn"
+            android:layout_width="0dp"
+            android:layout_height="40dp"
+            android:layout_weight="1"
+            android:layout_marginEnd="6dp"
+            android:gravity="center"
+            android:textColor="@color/wa_orange"
+            android:textSize="11sp"
+            android:fontFamily="monospace"
+            android:textStyle="bold"
+            android:background="@color/dark_purple"
+            android:clickable="true"
+            android:focusable="true"
+            android:text="@string/archive_unverifiable_play_btn"
+            android:visibility="gone" />
+
+        <TextView
+            android:id="@+id/unverifiableExportBtn"
+            android:layout_width="0dp"
+            android:layout_height="40dp"
+            android:layout_weight="1"
+            android:gravity="center"
+            android:textColor="@color/wa_orange"
+            android:textSize="11sp"
+            android:fontFamily="monospace"
+            android:textStyle="bold"
+            android:background="@color/dark_purple"
+            android:clickable="true"
+            android:focusable="true"
+            android:text="@string/archive_unverifiable_export_btn"
+            android:visibility="gone" />
+    </LinearLayout>
+
+</LinearLayout>

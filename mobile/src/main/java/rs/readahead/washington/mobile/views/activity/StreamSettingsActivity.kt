@@ -997,27 +997,21 @@ class StreamSettingsActivity : AppCompatActivity() {
             .setTitle(R.string.stream_settings_lock_dialog_title)
             .setMessage(R.string.stream_settings_lock_dialog_message)
             .setPositiveButton(R.string.stream_settings_lock_dialog_action) { _, _ ->
-                // Signal the recording service to stop BEFORE wiping the
-                // ratchet, and keep the two calls in that order. If a
-                // recording is active when the user taps Lock, the service
-                // would otherwise keep emitting frames and the next
-                // chunkEncryptor.encryptChunk() would crash on a wiped ratchet
-                // (null kit). Audit FRAG-R1-4, Phase 3.40.
-                //
-                // stopService is async — onDestroy takes up to ~6.5 s to
-                // drain : flushThread.join(3500) then a 3 s wait on
-                // pendingChunks (StreamRecordingService, raised from 1.5 s to
-                // 3 s by the Blue HIGH-2 fix). Encryption attempts during that
-                // window fail and skip gracefully rather than crash, which is
-                // the right semantics for an explicit Lock — don't "fix" that
-                // race by blocking the UI thread on a join.
-                stopService(Intent(this, rs.readahead.washington.mobile
-                    .service.StreamRecordingService::class.java))
+                // Ask a running recording to stop BEFORE locking (Audit
+                // FRAG-R1-4, Phase 3.40). The stop is asynchronous: the service
+                // closes the report while still in the foreground and stops
+                // itself. Locking does not get in its way: the report's writer
+                // holds its own key, in Rust, and seals the last chunks and the
+                // closure without the PIN session. What a lock does cost that
+                // recording is its opt-in timestamp, whose salt needs the
+                // provenance key the lock wipes. Don't "fix" the race by
+                // blocking the UI thread on the stop.
+                rs.readahead.washington.mobile.service.StreamRecordingService.requestStop(this)
 
                 StreamUploadManager.getInstance(this).lock()
                 // Clear the upload JWT on user-initiated
                 // lock. The token survives a plain `Stop recording`
-                // (so pending chunks drain), but a Lock is an
+                // (so pending creations can still go), but a Lock is an
                 // explicit "drop privileges now".
                 rs.readahead.washington.mobile.util.jobs
                     .UploadAuthHolder.clear()
@@ -1027,6 +1021,40 @@ class StreamSettingsActivity : AppCompatActivity() {
             .show()
     }
 
+    /** Cancel every WorkManager job and prune the finished rows (asynchronous). */
+    private fun cancelAndPruneWork() {
+        try {
+            val wm = androidx.work.WorkManager.getInstance(this)
+            wm.cancelAllWork()
+            wm.pruneWork()
+        } catch (e: Exception) {
+            timber.log.Timber.w(e, "WorkManager panic prune failed")
+        }
+    }
+
+    /**
+     * The emergency wipe, in this order:
+     *  0. mark the wipe as started ([StreamUploadManager.beginWipe]): from
+     *     here on nothing of this identity is scheduled or written any more,
+     *     not even by a seal that finishes while the writer is being aborted;
+     *  1. abort the live report writer, synchronously: its key goes now,
+     *     before anything else can still use it; the legacy keyring of a
+     *     migration in progress is destroyed in the same step
+     *     ([org.stream.crypto.upload.LegacyReportMigration.destroyLiveKeyring]);
+     *  2. cancel every WorkManager job (no upload may start against files
+     *     that are about to go);
+     *  3. stop the recording and the archive download services, and drop the
+     *     archive session's keys;
+     *  4. wipe keys, preferences, the queue key and the report state, then
+     *     rename the queues and scratch directories out of reach, the internal
+     *     archive viewer's with them, and overwrite them all in one background
+     *     pass, the plaintext of every part before any ciphertext
+     *     ([StreamUploadManager.panicWipe], given
+     *     [rs.readahead.washington.mobile.archive.ArchiveLocalData.detachForPanic]);
+     *     that pass also removes the exports this installation made to
+     *     Download/Frappuccino;
+     *  5. cancel and prune the jobs once more.
+     */
     private fun confirmPanicWipe() {
         AlertDialog.Builder(this, R.style.AlertDialogDarkTheme)
             .setTitle(R.string.stream_settings_wipe_dialog_title)
@@ -1037,17 +1065,52 @@ class StreamSettingsActivity : AppCompatActivity() {
                     .setTitle(R.string.stream_settings_wipe_confirm_title)
                     .setMessage(R.string.stream_settings_wipe_confirm_message)
                     .setPositiveButton(R.string.stream_settings_wipe_confirm_yes) { _, _ ->
-                        // FRAG-R1-4 — stop the recording
-                        // service before wiping. Same rationale as
-                        // confirmLock(): a panic wipe must terminate
-                        // any in-flight encryption before destroying
-                        // the keys it depends on. The blobs already on
-                        // disk are wiped by panicWipe() itself.
+                        // 0. Before anything else: a seal that completes while
+                        // the writer is aborted, a worker or a migration still
+                        // running, schedules no job and writes no alert after
+                        // this (they check this generation under the same lock).
+                        StreamUploadManager.beginWipe()
+
+                        // 1. The live writer, and the legacy keyring of a
+                        // migration in progress.
+                        try {
+                            uniffi.frappuccino.reportWriterAbortLive()
+                        } catch (e: Exception) {
+                            timber.log.Timber.w(e, "writer abort failed")
+                        }
+                        org.stream.crypto.upload.LegacyReportMigration.destroyLiveKeyring()
+
+                        // 2. Audit R-E-2 — cancel every queued job and prune
+                        // the finished rows: the paths, relay URL and tags
+                        // androidx.work.workdb (cleartext SQLite) keeps would
+                        // otherwise remain as an upload timeline on a seized
+                        // device. Asynchronous and best effort: the rows are
+                        // deleted, not overwritten, and SQLite can keep their
+                        // bytes in its free pages and write-ahead log.
+                        cancelAndPruneWork()
+
+                        // 3. Both services, and the archive session's keys.
+                        // stopService (not a stop request): the writer is
+                        // already aborted, there is nothing left to close.
                         stopService(Intent(this, rs.readahead.washington
                             .mobile.service.StreamRecordingService::class.java))
+                        try {
+                            rs.readahead.washington.mobile.archive.ArchiveLocalData
+                                .stopAndClearForPanic(this)
+                        } catch (e: Exception) {
+                            timber.log.Timber.w(e, "archive stop failed")
+                        }
 
-                        // Wipe V2 state (identité + ratchet + blobs)
-                        StreamUploadManager.getInstance(this).panicWipe()
+                        // 4. Keys, preferences, queue key, report state, and
+                        // the queues and scratch directories. The archive
+                        // viewer's directories are renamed in the same step,
+                        // right after the queues' and before any overwrite
+                        // starts, and erased in the same pass (panicWipe
+                        // catches a failure here and erases the rest).
+                        StreamUploadManager.getInstance(this).panicWipe {
+                            rs.readahead.washington.mobile.archive.ArchiveLocalData
+                                .detachForPanic(this)
+                        }
                         // §10.6 — also drop the upload bearer on the Kotlin
                         // side. panicWipe() already zeroizes the Rust-held
                         // holder ; this call keeps its reason to exist for the
@@ -1057,23 +1120,11 @@ class StreamSettingsActivity : AppCompatActivity() {
                         rs.readahead.washington.mobile.util.jobs
                             .UploadAuthHolder.clear()
 
-                        // Audit R-E-2 — purge the WorkManager history too.
-                        // androidx.work.workdb (cleartext SQLite) holds the
-                        // pending chunk file paths, the relay URL and report
-                        // IDs; panicWipe (stream-crypto) doesn't reach it, so on
-                        // a seized device it left a forensic upload timeline.
-                        // Cancel all queued work + prune the terminal rows.
-                        // Best-effort/async (UI callback): the cancel is
-                        // persisted immediately, pruneWork drops finished rows.
-                        try {
-                            val wm = androidx.work.WorkManager.getInstance(this)
-                            wm.cancelAllWork()
-                            wm.pruneWork()
-                        } catch (e: Exception) {
-                            android.util.Log.w(
-                                "StreamSettings", "WorkManager panic prune failed", e
-                            )
-                        }
+                        // 5. Once more: WorkManager runs its enqueues, cancels
+                        // and prunes in submission order, so this removes a
+                        // job a component without the wipe guard could have
+                        // added since step 2.
+                        cancelAndPruneWork()
 
                         // Lance OnBoardingActivity avec le flag IS_ONBOARD_LOCK_SET=true :
                         // Tella sait que le lock est déjà setup → saute directement à

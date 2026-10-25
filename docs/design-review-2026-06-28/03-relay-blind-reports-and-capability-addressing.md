@@ -2,6 +2,8 @@
 
 > Model: claude-opus-4-8[1m]. Date: 2026-06-28. Scope: how a report is named, authorized, isolated, and enumerated on a blind relay — the at-rest `identity → report → when` join, and why a capability address replaces an account model.
 
+> **Later change (2026-10-25), read before this report.** This review predates the frozen-report rework. Since then the device no longer keeps `report_master`: new reports follow a one-way HKDF chain, each object is signed when it is produced, a stopped recording is closed by a signed manifest (domain `0x09`) after which the relay refuses new names, and the rescue verifies every object under the re-derived report key. The statements below about `report_master` held on the device, signing at upload time, and the directory key are therefore about the legacy scheme, which still covers reports recorded before the update. Current state: `docs/ARCHITECTURE_TECHNIQUE_COMPLETE.md` §8.7; what the rework does not cover: `docs/ACCEPTED_RESIDUALS_2026-06-28.md` (R1-R7).
+
 This is a design-defense, not a vulnerability hunt. For each choice it makes the affirmative case, justifies the specific implementation against the alternatives, states the sharpest hostile objection, and then either rebuts it with code evidence or concedes it as a known residual. Every claim is grounded in the source at `file:line`.
 
 The governing motto: *tout quitte le téléphone & une saisie n'expose rien ; le téléphone est un relais, pas un coffre.* For this domain that translates into one at-rest property: **seizing the relay disk must reveal no `identity → which reports → when`.** The reference spec is `docs/RELAY_BLIND_REPORTS.md` (v3, implemented + deployed 2026-06-26).

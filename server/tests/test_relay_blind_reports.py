@@ -41,7 +41,7 @@ os.environ.setdefault("RATCHET_REGISTRY_FILE", os.path.join(_tmp, "registry.json
 os.environ.setdefault("REPORTS_DB_PATH", os.path.join(_tmp, "reports.json"))
 
 from fastapi.testclient import TestClient  # noqa: E402
-from app import auth, main, ratchet_registry, storage  # noqa: E402
+from app import auth, main, paths, ratchet_registry, storage  # noqa: E402
 from app.routes import reports as reports_mod  # noqa: E402
 
 CTX_ID = b"stream.report.id.v1"
@@ -84,17 +84,32 @@ def writing_headers(sk, pk, rid_hex, filename, body):
 
 
 # --- in-memory storage fake (backs every storage.* the routes call) ---------
+# It mirrors the storage contract the routes rely on, closure rule included, so
+# a test written against it cannot pass on behaviour the real store refuses.
+# The real storage code runs against an in-memory MinIO in test_report_close.py.
 
 class FakeStore:
     def __init__(self):
         self.blobs: dict[tuple[str, str], bytes] = {}
+        self.write_sigs: dict[tuple[str, str], str] = {}
 
-    def put(self, report_id, filename, fp, total, digest):
+    def put(self, report_id, filename, fp, total, digest,
+            write_sig_hex=None, closed_seq_limit=None):
         data = fp.read()
         key = (report_id, filename)
-        if key in self.blobs and self.blobs[key] != data:
-            raise storage.WriteOnceConflictError("differs")
+        if key in self.blobs:
+            if self.blobs[key] != data:
+                raise storage.WriteOnceConflictError("differs")
+            if write_sig_hex is not None:
+                self.write_sigs.setdefault(key, write_sig_hex)
+            return "identical"
+        if closed_seq_limit is not None and not paths.name_allowed_after_close(
+            filename, closed_seq_limit
+        ):
+            raise storage.ReportClosedError("closed")
         self.blobs[key] = data
+        if write_sig_hex is not None:
+            self.write_sigs[key] = write_sig_hex
         return "created"
 
     def list_blobs(self, rid):
@@ -104,11 +119,12 @@ class FakeStore:
             if r == rid
         ]
 
-    def blob_exists(self, rid, fn):
-        return (rid, fn) in self.blobs
-
-    def get_blob_size(self, rid, fn):
-        return len(self.blobs.get((rid, fn), b""))
+    def stat_blob(self, rid, fn):
+        if (rid, fn) not in self.blobs:
+            return None
+        return storage.BlobInfo(
+            size=len(self.blobs[(rid, fn)]), write_sig_hex=self.write_sigs.get((rid, fn))
+        )
 
     def iter_blob(self, rid, fn):
         yield self.blobs[(rid, fn)]
@@ -120,8 +136,7 @@ def env(monkeypatch):
     store = FakeStore()
     monkeypatch.setattr(storage, "upload_blob_stream_write_once", store.put)
     monkeypatch.setattr(storage, "list_blobs", store.list_blobs)
-    monkeypatch.setattr(storage, "blob_exists", store.blob_exists)
-    monkeypatch.setattr(storage, "get_blob_size", store.get_blob_size)
+    monkeypatch.setattr(storage, "stat_blob", store.stat_blob)
     monkeypatch.setattr(storage, "iter_blob", store.iter_blob)
     # Budget allowed by default (the budget itself is covered separately). The
     # gate now RESERVES atomically via reserve_report_creation (rolled back via
@@ -273,6 +288,8 @@ def test_archive_download_blob_identity_free(env):
     r = client.get(f"/api/v2/archive/reports/{rid}/c0.strm")
     assert r.status_code == 200
     assert r.content == body
+    # The write signature the PUT carried comes back with the bytes.
+    assert r.headers["X-Report-Write-Sig"] == sig_write(sk, rid, "c0.strm", body).hex()
 
 
 def test_archive_auth_endpoint_is_gone(env):

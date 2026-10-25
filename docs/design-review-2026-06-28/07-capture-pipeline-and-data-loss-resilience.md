@@ -2,6 +2,8 @@
 
 > Model: claude-opus-4-8[1m]. Date: 2026-06-28. Scope: the HEVC chunked stream-encrypt-upload-delete pipeline, the upload queue + circuit breaker + 507 disk-full handling, the data-loss trio (idempotent report / zombie sweep / dedup) + the no_auth_token fix, adaptive quality cap, and secure-delete's honest limits.
 
+> **Later change (2026-10-25), read before this report.** The pipeline this review describes (`StreamChunkEncryptor`, the `.strm` queue, signing at upload time, the 48 h `sweepStaleChunks` TTL) has since been replaced: each chunk is encrypted, signed and written as a durable queue envelope by the Rust report writer as it is produced, the MP4 is deleted only after that write succeeds, a stopped recording is closed by a signed manifest, and the TTL was removed because every queued envelope can now be sent. `ChunkUploadWorker` remains, one job per envelope. Current state: `docs/ARCHITECTURE_TECHNIQUE_COMPLETE.md` §6.3.
+
 This document is a design *defense*, written to feed a later adversarial audit. For each choice it makes the affirmative case, justifies the implementation against the alternatives, states the sharpest honest objection and either rebuts or concedes it, then lists what an auditor should probe. The motto governs everything: *tout quitte le téléphone & une saisie n'expose rien ; le téléphone est un relais, pas un coffre.*
 
 ---

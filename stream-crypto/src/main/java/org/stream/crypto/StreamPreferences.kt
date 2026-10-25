@@ -6,6 +6,7 @@ import android.util.Base64
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import org.stream.crypto.capture.StreamQuality
+import org.stream.crypto.upload.ReportAlerts
 
 /**
  * StreamPreferences — Stockage persistant des données non-secrètes + blob ratchet
@@ -23,8 +24,14 @@ import org.stream.crypto.capture.StreamQuality
  * EncryptedSharedPreferences chiffre les valeurs en AES-256-GCM sous une clé du
  * KeyStore Android (TEE sur Seeker) : protection AU REPOS seulement. Sur un
  * processus vivant, cette couche-là ne protège plus rien — d'où le second sceau
- * PIN sur le blob ratchet, la graine de provenance et le master report, qui eux
- * restent scellés tant que le PIN n'a pas été saisi.
+ * PIN sur le blob ratchet et la graine de provenance, qui eux restent scellés
+ * tant que le PIN n'a pas été saisi.
+ *
+ * L'état des rapports n'est PAS ici : il vit dans `filesDir/report_state.bin`,
+ * écrit et scellé par Rust, et ne traverse jamais la JVM. Ce qui reste ici du
+ * schéma de rapports précédent (master report scellé, correspondances
+ * session → index, compteur d'index) n'est lu que par la migration, qui
+ * l'efface une fois terminée.
  */
 object StreamPreferences {
 
@@ -37,14 +44,9 @@ object StreamPreferences {
     private const val KEY_PENDING_ENROLLMENT = "pending_enrollment_v1"
     private const val KEY_PENDING_ROTATIONS = "pending_rotations_v1"
     private const val KEY_ENROLLMENT_JUST_SUCCEEDED = "enrollment_just_succeeded_oneshot"
-    // Phase 3.26 — orphan sweep mappings + toggle.
+    // Legacy report scheme (read by the migration only, then deleted): the
+    // session → legacy index mappings and the legacy index counter.
     private const val KEY_SESSION_REPORTS = "session_reports_v1"
-    // Phase C (relay-blind reports) — monotone report-index counter. Each new
-    // session allocates the next index n; its report_id = reportKeyring
-    // .reportIdHex(n). Persistent + atomic so a retry/restart never reuses an
-    // index for a different session. Reset on panic wipe (fresh identity = fresh
-    // index space). The rescue tolerates skipped indices (gap tolerance), so a
-    // crash that advances the counter without saving the mapping is harmless.
     private const val KEY_NEXT_REPORT_INDEX = "next_report_index_v1"
     private const val KEY_AUTO_UPLOAD_ORPHANS = "auto_upload_orphans"
     // User-configurable max recording quality cap ("FHD"|"HD"|"SD").
@@ -70,15 +72,13 @@ object StreamPreferences {
     // default; only set during on-device QUIC reliability validation.
     private const val KEY_DEBUG_QUIC_TRANSPORT = "debug_quic_transport"
     // §10.11 — provenance : graine de la clé de signature dédiée (PIN-scellée,
-    // même format que le ratchet) + toggle (défaut ON, décision therealshulgin 2026-06-24).
+    // même format que le ratchet) + toggle (défaut ON, décision de projet du 2026-06-24).
     private const val KEY_PROVENANCE_SEED_BLOB = "provenance_seed_blob_b64"
     private const val KEY_PROVENANCE_ENABLED = "provenance_enabled"
 
-    // Phase C (relay-blind reports) — the report capability master seed
-    // (report_master, 32 bytes), PIN-sealed exactly like the provenance seed.
-    // Persisted at enrollment, reloaded at unlock to reconstruct the
-    // ReportKeyring that addresses + signs each report by a key derived from
-    // the phrase (never the identity). Wiped on panic.
+    // Legacy report scheme: the report master seed, PIN-sealed. A device
+    // enrolled under the chained scheme never has it. Its presence is what
+    // tells that the migration has not finished; the migration deletes it last.
     private const val KEY_REPORT_MASTER_BLOB = "report_master_blob_b64"
     // §10.11 Phase B — opt-in trustless OTS timestamp toggle (défaut OFF : un
     // .ots est une miette publique Bitcoin permanente).
@@ -150,7 +150,7 @@ object StreamPreferences {
     // (R-CR-1). Écrit à l'enrôlement, rechargeable seulement au unlock, pour
     // reconstruire le ProvenanceSigner.
     //
-    // Le toggle est ON par défaut (décision therealshulgin 2026-06-24) alors que l'app
+    // Le toggle est ON par défaut (décision de projet du 2026-06-24) alors que l'app
     // minimise ses métadonnées, et c'est tenable : le manifeste est scellé E2E
     // (relais aveugle, seul le témoin l'ouvre) et le lieu reste un opt-in séparé,
     // donc chaque enregistrement est prouvable sans rien fuiter. Le témoin peut
@@ -173,12 +173,8 @@ object StreamPreferences {
     fun hasProvenanceSeedBlob(context: Context): Boolean =
         getPrefs(context).getString(KEY_PROVENANCE_SEED_BLOB, null) != null
 
-    // Phase C (relay-blind reports) — report_master seed blob, PIN-sealed.
-
-    fun saveReportMasterBlob(context: Context, blob: ByteArray) {
-        val b64 = Base64.encodeToString(blob, Base64.NO_WRAP)
-        getPrefs(context).edit().putString(KEY_REPORT_MASTER_BLOB, b64).apply()
-    }
+    // Legacy report master (migration only). Never written any more: a device
+    // enrolled now gets its report state from Rust at enrollment.
 
     fun getReportMasterBlob(context: Context): ByteArray? {
         val b64 = getPrefs(context).getString(KEY_REPORT_MASTER_BLOB, null) ?: return null
@@ -222,21 +218,18 @@ object StreamPreferences {
             .remove(KEY_PENDING_ENROLLMENT)
             .remove(KEY_PENDING_ROTATIONS)
             .remove(KEY_ENROLLMENT_JUST_SUCCEEDED)
-            // Phase 3.26 — session→report mappings are user data too.
+            // Legacy session → report mappings and index counter: user data.
             .remove(KEY_SESSION_REPORTS)
-            // Phase C — reset the report-index counter (fresh identity at
-            // re-enroll = fresh index space).
             .remove(KEY_NEXT_REPORT_INDEX)
-            // Orphan deletion alerts (counts/dates, not secret
-            // but still user data tied to this identity).
-            .remove(KEY_ORPHAN_DELETIONS)
+            // Report alerts (counts and dates, not secret but still user data
+            // tied to this identity).
+            .remove(KEY_REPORT_ALERTS)
             // §10.11 — provenance signing seed (PIN-sealed) + opt-in toggle. The
             // seed is key material tied to this identity → must go on panic wipe.
             .remove(KEY_PROVENANCE_SEED_BLOB)
             .remove(KEY_PROVENANCE_ENABLED)
             .remove(KEY_PROVENANCE_TIMESTAMP_ENABLED)
-            // Phase C — report capability master seed (key material tied to this
-            // identity) must go on panic wipe.
+            // Legacy report master (key material) if the migration never ran.
             .remove(KEY_REPORT_MASTER_BLOB)
             .commit()
     }
@@ -495,133 +488,94 @@ object StreamPreferences {
         return v
     }
 
-    // -- Orphan upload sweep state --
+    // -- Legacy report bookkeeping (migration only) --
     //
-    // A persisted map of {sessionId → (reportId, retryCount)} so the
-    // OrphanSweepWorker can re-authenticate and finish uploading blobs whose
-    // recording session stopped before the queue drained. Stored as a JSON object :
-    //   { "<sessionId>": {"r": "<reportId>", "n": <retryCount>}, ... }
+    // Before the chained report scheme, each recording session got a legacy
+    // index `n` from a counter here, and a {sessionId → n} mapping kept the
+    // pending blobs of a session addressed to its report. The migration reads
+    // both to sign the blobs still pending with the right legacy key, then
+    // deletes them (clearLegacyReportState). Nothing else reads or writes them
+    // any more, and nothing may allocate a legacy index once the migration has
+    // written the report state: legacy indices live below the state's first
+    // index, and the rescue enumerates them there only.
     //
-    // retryCount is only bumped when a real upload attempt was made on a reachable
-    // server : network-absent skips must not burn the budget, because once it is
-    // spent (OrphanSweepWorker.MAX_RETRIES) the sweeper secure-deletes those blobs.
-    // A device kept out of network for a long time would otherwise lose fragments
-    // it never had a chance to upload.
+    // Stored JSON shape: { "<sessionId>": {"r": "<reportId>", "n": <retries>,
+    // "i": <index>}, ... }; only "i" is still read (-1 or absent = no usable
+    // index, as written by builds from before relay-blind reports).
     //
-    // The four mutating helpers below are called from at least two threads :
-    //   - StreamRecordingService.initServerSession (allocateReportIndexForSession)
-    //   - OrphanSweepWorker.doWork (increment / remove, and
-    //     allocateReportIndexForSession too on the offline-start rescue path)
-    //   - StreamPreferences.wipeAll on panic-wipe (removes the key)
-    // Hence the lock. Without it the read-modify-write pattern
-    // (`getSessionReports().toMutableMap()` then `writeSessionReports`) is a classic
-    // lost-update race : a concurrent `removeSessionReport` and
-    // `incrementSessionReportRetry` both read the same snapshot, mutate
-    // independently and write back, and one of the changes is silently lost. The
-    // two symptoms are an orphan that retries indefinitely, or a freshly-saved
-    // session that goes missing.
-    //
-    // Writes are `.commit()` (sync), not `.apply()` (async), so a process kill
-    // landing between the in-RAM Map update and the disk flush cannot lose the
-    // mapping (orphan blobs nothing ever picks up again) nor the bumped counter (an
-    // unbounded upload loop on an unrecoverable session). It costs ~5-30 ms on a
-    // healthy device and fires at most once per chunk session start plus once per
-    // 30 min sweep tick, which is what makes it affordable.
+    // Writes are `.commit()`: the migration relies on an allocation being
+    // durable before it signs anything with it.
 
     /** Guards the read-modify-write of session_reports. */
     private val sessionReportsLock = Any()
 
-    // Phase C — `reportIndex` is the report's derivation index n (report_id =
-    // reportKeyring.reportIdHex(n)). Defaults to -1 for legacy entries written
-    // before the relay-blind migration (those carry a server-assigned reportId
-    // and no index); a -1 index means "not a derived report".
-    data class SessionReportEntry(
-        val reportId: String,
-        val retryCount: Int,
-        val reportIndex: Int = -1,
-    )
-
-    fun saveSessionReport(context: Context, sessionId: String, reportId: String) {
+    /** {sessionId → legacy index}; sessions with no usable index are absent. */
+    fun getLegacySessionIndices(context: Context): Map<String, Int> {
         synchronized(sessionReportsLock) {
-            val map = getSessionReportsLocked(context).toMutableMap()
-            // If the entry already exists we keep its retryCount + index — we
-            // may be re-saving the same mapping after a process restart.
-            val existing = map[sessionId]
-            map[sessionId] = SessionReportEntry(
-                reportId, existing?.retryCount ?: 0, existing?.reportIndex ?: -1
-            )
-            writeSessionReports(context, map)
+            return readSessionReportsLocked(context)
+                .mapNotNull { (sid, i) -> if (i >= 0) sid to i else null }
+                .toMap()
         }
     }
 
+    /** The legacy index counter (the next index the old scheme would have used). */
+    fun getNextLegacyReportIndex(context: Context): Int =
+        getPrefs(context).getInt(KEY_NEXT_REPORT_INDEX, 0)
+
     /**
-     * Atomic and idempotent on [sessionId] : allocates (or reuses) the
-     * relay-blind report derivation index `n` and returns its
-     * [SessionReportEntry]. Call it once at session
-     * start, before any chunk is enqueued: a re-allocation after a crash can then
-     * never diverge from an already-uploaded chunk, since none exist yet.
+     * Migration only: the legacy index of [sessionId], allocating the next one
+     * if the session has none (an orphan whose mapping was lost, or one from a
+     * build that predates indices). Idempotent per session.
      *
-     * The counter is committed BEFORE the mapping, and the two writes must not be
-     * merged into a single edit. A crash between them only SKIPS an index, which is
-     * harmless because the rescue path tolerates gaps; what the order rules out is
-     * the same n being handed to two different sessions. Same n means same
-     * report_id, so two distinct recordings would end up glued under one report at
-     * the blind relay.
-     *
-     * A session that already has a mapping gets it back verbatim: a retry or a
-     * process restart reuses its n, never a 2nd report. Otherwise the next index
-     * comes off the monotone counter and its report_id is derived by
-     * [deriveReportId] (the caller passes `reportKeyring.reportIdHex(n)`).
+     * The counter is committed BEFORE the mapping, and the two writes must not
+     * be merged: a crash between them only skips an index (the rescue tolerates
+     * gaps), while the other order could hand one index to two sessions, gluing
+     * two recordings under one report.
      */
-    fun allocateReportIndexForSession(
-        context: Context,
-        sessionId: String,
-        deriveReportId: (Int) -> String,
-    ): SessionReportEntry {
+    fun ensureLegacyIndexForSession(context: Context, sessionId: String): Int {
         synchronized(sessionReportsLock) {
-            val map = getSessionReportsLocked(context).toMutableMap()
-            map[sessionId]?.let { return it }
+            val map = readSessionReportsLocked(context).toMutableMap()
+            map[sessionId]?.let { if (it >= 0) return it }
             val prefs = getPrefs(context)
             val n = prefs.getInt(KEY_NEXT_REPORT_INDEX, 0)
-            val entry = SessionReportEntry(deriveReportId(n), 0, n)
-            // Counter first (durable), then the mapping (see fn doc).
-            prefs.edit().putInt(KEY_NEXT_REPORT_INDEX, n + 1).commit()
-            map[sessionId] = entry
-            writeSessionReports(context, map)
-            return entry
-        }
-    }
-
-    fun getSessionReports(context: Context): Map<String, SessionReportEntry> {
-        // Read path is safe under the same lock — guarantees we never
-        // observe a torn JSON (impossible in practice because the
-        // underlying SharedPreferences is internally synchronized, but
-        // taking the lock here also keeps a writer from racing the
-        // post-read mutation in `incrementSessionReportRetry`).
-        synchronized(sessionReportsLock) {
-            return getSessionReportsLocked(context)
+            if (!prefs.edit().putInt(KEY_NEXT_REPORT_INDEX, n + 1).commit()) {
+                throw java.io.IOException("legacy index counter not persisted")
+            }
+            map[sessionId] = n
+            val obj = org.json.JSONObject()
+            for ((sid, i) in map) {
+                obj.put(sid, org.json.JSONObject().put("i", i))
+            }
+            if (!prefs.edit().putString(KEY_SESSION_REPORTS, obj.toString()).commit()) {
+                throw java.io.IOException("legacy session mapping not persisted")
+            }
+            return n
         }
     }
 
     /**
-     * Caller must already hold [sessionReportsLock]. Centralises the
-     * JSON deserialisation so the synchronized public API and the
-     * internal mutate-then-write helpers share one implementation.
+     * The migration's last step: delete the legacy master and bookkeeping.
+     * Returns whether the deletion reached the disk.
      */
-    private fun getSessionReportsLocked(context: Context): Map<String, SessionReportEntry> {
+    fun clearLegacyReportState(context: Context): Boolean {
+        synchronized(sessionReportsLock) {
+            return getPrefs(context).edit()
+                .remove(KEY_REPORT_MASTER_BLOB)
+                .remove(KEY_SESSION_REPORTS)
+                .remove(KEY_NEXT_REPORT_INDEX)
+                .commit()
+        }
+    }
+
+    private fun readSessionReportsLocked(context: Context): Map<String, Int> {
         val raw = getPrefs(context).getString(KEY_SESSION_REPORTS, null) ?: return emptyMap()
         return try {
             val obj = org.json.JSONObject(raw)
-            val out = mutableMapOf<String, SessionReportEntry>()
+            val out = mutableMapOf<String, Int>()
             val keys = obj.keys()
             while (keys.hasNext()) {
                 val sid = keys.next()
-                val entry = obj.getJSONObject(sid)
-                out[sid] = SessionReportEntry(
-                    reportId = entry.getString("r"),
-                    retryCount = entry.optInt("n", 0),
-                    reportIndex = entry.optInt("i", -1),
-                )
+                out[sid] = obj.getJSONObject(sid).optInt("i", -1)
             }
             out
         } catch (e: Exception) {
@@ -629,55 +583,11 @@ object StreamPreferences {
         }
     }
 
-    fun removeSessionReport(context: Context, sessionId: String) {
-        synchronized(sessionReportsLock) {
-            val map = getSessionReportsLocked(context).toMutableMap()
-            map.remove(sessionId)
-            writeSessionReports(context, map)
-        }
-    }
-
-    /** Returns the new count after increment. */
-    fun incrementSessionReportRetry(context: Context, sessionId: String): Int {
-        synchronized(sessionReportsLock) {
-            val map = getSessionReportsLocked(context).toMutableMap()
-            val existing = map[sessionId] ?: return 0
-            val next = SessionReportEntry(
-                existing.reportId, existing.retryCount + 1, existing.reportIndex
-            )
-            map[sessionId] = next
-            writeSessionReports(context, map)
-            return next.retryCount
-        }
-    }
-
-    private fun writeSessionReports(
-        context: Context,
-        map: Map<String, SessionReportEntry>,
-    ) {
-        val obj = org.json.JSONObject()
-        for ((sid, entry) in map) {
-            val e = org.json.JSONObject()
-            e.put("r", entry.reportId)
-            e.put("n", entry.retryCount)
-            e.put("i", entry.reportIndex)  // Phase C — derivation index n
-            obj.put(sid, e)
-        }
-        // .commit() (sync + fsync) instead of .apply()
-        // (async). Guarantees the retryCount increment and the
-        // {sessionId → reportId} mapping are durable before we return,
-        // so a process kill landing right after this point can't
-        // silently lose either the new session mapping or the bumped
-        // retry counter (the latter would re-allow an unbounded upload
-        // loop on an unrecoverable session).
-        getPrefs(context).edit().putString(KEY_SESSION_REPORTS, obj.toString()).commit()
-    }
-
-    // -- Phase 3.26 — auto-upload orphans toggle --
+    // -- Auto-upload toggle --
     //
-    // Default ON. The OrphanSweepWorker checks this flag at each tick
-    // and returns success-no-op when OFF, so the user can disable the
-    // background upload without disturbing the WorkManager schedule.
+    // Default ON. When OFF, OrphanSweepWorker re-schedules nothing: envelopes
+    // already scheduled still go, the others wait in the queue (nothing is
+    // deleted) until the toggle is back on or a recording schedules them.
 
     fun isAutoUploadOrphansEnabled(context: Context): Boolean =
         getPrefs(context).getBoolean(KEY_AUTO_UPLOAD_ORPHANS, true)
@@ -686,73 +596,50 @@ object StreamPreferences {
         getPrefs(context).edit().putBoolean(KEY_AUTO_UPLOAD_ORPHANS, enabled).apply()
     }
 
-    // -- Orphan deletion alerts: in-app only, never a system notification --
+    // -- Report alerts: in-app only, never a system notification --
     //
-    // These alerts must never be surfaced through a system notification
-    // (threat-model choice, therealshulgin 2026-06-18). A notification would force
-    // POST_NOTIFICATIONS app-wide, and that permission also un-hides the recording
-    // foreground-service notification: a witness filming covertly would light up
-    // their own status bar. The app declares no notification permission today, so
-    // nothing shows. The in-app banner is read AFTER unlock, so the detail never
-    // leaks on a locked screen either.
-    //
-    // Why the events exist at all: when the rescue path gives up (OrphanSweepWorker
-    // MAX_RETRIES) or the 48 h TTL sweep (ChunkUploadQueue.sweepStaleChunks)
-    // secure-deletes orphan blobs, we append a small event here, so that the next
-    // time the user opens the app the StreamActivity banner can surface "N
-    // fragments were deleted (never uploaded)" instead of the video vanishing in
-    // silence.
-    //
-    // Stored encrypted and bounded to the most recent MAX_DELETION_EVENTS; the JSON
-    // shape is in writeOrphanDeletions.
+    // See org.stream.crypto.upload.ReportAlerts for what each alert means and
+    // why it never becomes a notification. Stored encrypted, merged per reason.
+    // The key keeps its historical name so that the deletion events of older
+    // builds (reasons "expired" and "unrecoverable") are still shown.
 
-    private const val KEY_ORPHAN_DELETIONS = "orphan_deletions_v1"
-    private const val MAX_DELETION_EVENTS = 20
+    private const val KEY_REPORT_ALERTS = "orphan_deletions_v1"
 
-    /** Guards the read-modify-write of orphan_deletions. */
-    private val orphanDeletionsLock = Any()
+    /** Guards the read-modify-write of the alerts. */
+    private val reportAlertsLock = Any()
 
-    /** reason is "expired" (48 h TTL) or "unrecoverable" (rescue gave up). */
-    data class OrphanDeletionEvent(
-        val count: Int,
-        val oldestBlobMs: Long,
-        val reason: String,
-        val recordedAtMs: Long,
-    )
-
-    fun addOrphanDeletion(context: Context, count: Int, oldestBlobMs: Long, reason: String) {
+    fun addReportAlert(context: Context, count: Int, oldestMs: Long, reason: String) {
         if (count <= 0) return
-        synchronized(orphanDeletionsLock) {
-            val events = getOrphanDeletionsLocked(context).toMutableList()
-            events.add(
-                OrphanDeletionEvent(count, oldestBlobMs, reason, System.currentTimeMillis())
+        synchronized(reportAlertsLock) {
+            val merged = ReportAlerts.merge(
+                readReportAlertsLocked(context), count, oldestMs, reason, System.currentTimeMillis()
             )
-            writeOrphanDeletions(context, events.takeLast(MAX_DELETION_EVENTS))
+            writeReportAlerts(context, merged)
         }
     }
 
-    fun getOrphanDeletions(context: Context): List<OrphanDeletionEvent> {
-        synchronized(orphanDeletionsLock) { return getOrphanDeletionsLocked(context) }
+    fun getReportAlerts(context: Context): List<ReportAlerts.Alert> {
+        synchronized(reportAlertsLock) { return readReportAlertsLocked(context) }
     }
 
-    fun clearOrphanDeletions(context: Context) {
-        synchronized(orphanDeletionsLock) {
-            getPrefs(context).edit().remove(KEY_ORPHAN_DELETIONS).commit()
+    fun clearReportAlerts(context: Context) {
+        synchronized(reportAlertsLock) {
+            getPrefs(context).edit().remove(KEY_REPORT_ALERTS).commit()
         }
     }
 
-    private fun getOrphanDeletionsLocked(context: Context): List<OrphanDeletionEvent> {
-        val raw = getPrefs(context).getString(KEY_ORPHAN_DELETIONS, null) ?: return emptyList()
+    private fun readReportAlertsLocked(context: Context): List<ReportAlerts.Alert> {
+        val raw = getPrefs(context).getString(KEY_REPORT_ALERTS, null) ?: return emptyList()
         return try {
             val arr = org.json.JSONArray(raw)
-            val out = ArrayList<OrphanDeletionEvent>(arr.length())
+            val out = ArrayList<ReportAlerts.Alert>(arr.length())
             for (i in 0 until arr.length()) {
                 val o = arr.getJSONObject(i)
                 out.add(
-                    OrphanDeletionEvent(
+                    ReportAlerts.Alert(
                         count = o.getInt("c"),
-                        oldestBlobMs = o.optLong("o", 0L),
-                        reason = o.optString("r", "expired"),
+                        oldestMs = o.optLong("o", 0L),
+                        reason = o.optString("r", ReportAlerts.Reason.EXPIRED),
                         recordedAtMs = o.optLong("t", 0L),
                     )
                 )
@@ -763,17 +650,17 @@ object StreamPreferences {
         }
     }
 
-    private fun writeOrphanDeletions(context: Context, events: List<OrphanDeletionEvent>) {
+    private fun writeReportAlerts(context: Context, alerts: List<ReportAlerts.Alert>) {
         val arr = org.json.JSONArray()
-        for (e in events) {
+        for (a in alerts) {
             val o = org.json.JSONObject()
-            o.put("c", e.count)
-            o.put("o", e.oldestBlobMs)
-            o.put("r", e.reason)
-            o.put("t", e.recordedAtMs)
+            o.put("c", a.count)
+            o.put("o", a.oldestMs)
+            o.put("r", a.reason)
+            o.put("t", a.recordedAtMs)
             arr.put(o)
         }
-        getPrefs(context).edit().putString(KEY_ORPHAN_DELETIONS, arr.toString()).commit()
+        getPrefs(context).edit().putString(KEY_REPORT_ALERTS, arr.toString()).commit()
     }
 
     // -- Phase 7.3 — max recording quality cap --

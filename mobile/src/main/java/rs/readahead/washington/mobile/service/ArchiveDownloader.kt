@@ -1,557 +1,373 @@
 package rs.readahead.washington.mobile.service
 
-import android.content.ContentUris
-import android.content.ContentValues
+import android.content.ContentResolver
 import android.content.Context
-import android.os.Build
-import android.os.Environment
-import android.provider.MediaStore
-import kotlinx.coroutines.delay
+import android.net.Uri
+import android.provider.DocumentsContract
 import org.stream.crypto.ArchiveIdentity
+import org.stream.crypto.SecureWipe
 import org.stream.crypto.upload.ArchiveSession
+import rs.readahead.washington.mobile.archive.ArchiveLocalData
+import rs.readahead.washington.mobile.archive.ExportOutcome
+import rs.readahead.washington.mobile.archive.ExportPlan
+import rs.readahead.washington.mobile.archive.ExportRun
+import rs.readahead.washington.mobile.archive.ObjectPlacement
+import rs.readahead.washington.mobile.archive.RescueCallRunner
+import rs.readahead.washington.mobile.archive.ReportDir
+import rs.readahead.washington.mobile.archive.RescueNames
+import rs.readahead.washington.mobile.archive.RescueSession
+import rs.readahead.washington.mobile.archive.TimestampCheck
 import timber.log.Timber
+import uniffi.frappuccino.ObjectStatus
+import uniffi.frappuccino.OtsStatus
+import uniffi.frappuccino.ReportCheck
+import uniffi.frappuccino.ReportScheme
 import java.io.File
 import java.io.FileInputStream
 import java.io.IOException
+import uniffi.frappuccino.ProvenanceSigner as FfiProvenanceSigner
 
 /**
- * UI-free download core for archive rescue.
+ * The rescue's work on one report, without any UI: fetch and verify every
+ * stored object, check the timestamp proof, and export what verified (or, on
+ * an explicit request, what was kept apart as not verifiable).
  *
- * A plain [Context] must stay enough: every method here uses only generic
- * Context APIs (`contentResolver`, `Environment`, `File`, `cacheDir`) — no
- * Activity resources, no Views, no `getString` — and progress is surfaced
- * via a callback (the service turns it into a broadcast) rather than by
- * touching the UI. Reaching for an Activity resource here, because it is
- * shorter, makes the class unusable inside [ArchiveDownloadService], the
- * foreground service that keeps the rescue alive across screen-off and
- * backgrounding; the download then becomes killable by a screen-off again,
- * which is the bug that service was added to fix (Phase 4.4.8).
+ * A plain [Context] must stay enough: progress goes out through callbacks and
+ * [RescueSession], never through a View or an Activity resource, so the class
+ * keeps running inside [ArchiveDownloadService], the foreground service that
+ * survives screen-off and backgrounding.
  *
- * `moveToPublicDownloads`, `writePlaylistM3u` and `clearReportFolder` were
- * extracted from `ArchiveModeActivity` (Phase 4.4.2/4.4.5/4.4.6) and now
- * live here only — the activity goes through [ArchiveDownloadService]. They
- * have moved on since: see the provenance-artifact branch and the MediaStore
- * idempotence field-fix inside [moveToPublicDownloads]. The surrounding loop
- * ([downloadReport]) is the old `downloadOne` without its `progressView` /
- * `reportsAdapter` / `getString` calls.
+ * The order is fixed by the verification and is not a matter of taste: the
+ * closure is checked before any object of a chained report (Rust refuses the
+ * objects otherwise), and each object is classified by Rust as it lands, then
+ * placed by [ObjectPlacement]. Whatever is excluded is deleted by Rust and only
+ * counted.
+ *
+ * A legacy object the relay stored before it kept signatures (UNVERIFIABLE) is
+ * neither excluded nor verified: it is kept apart, in its own directory, as the
+ * desktop CLI does. Nothing proves it is the witness's, yet it may be the
+ * only copy left of a recording made before this version, so it stays readable
+ * in the internal player and exportable, both from a separate section under a
+ * "not verified" label. It never enters the verified testimony: not the
+ * verified count, not its playback, not the nominal export, not the timestamp
+ * check.
  */
 class ArchiveDownloader(context: Context) {
 
     private val appContext: Context = context.applicationContext
 
-    /** Outcome of a single report download. */
-    sealed class ReportOutcome {
-        data class Success(val publicDir: String, val blobCount: Int) : ReportOutcome()
-        object Empty : ReportOutcome()
-        data class Failure(val message: String) : ReportOutcome()
+    /**
+     * Fetch and verify every object of [entry] into a fresh local directory.
+     * On success the entry is VERIFIED with its verdict; on a failure the
+     * partial directory is purged and the error is rethrown.
+     *
+     * @param onObject `(done, total)` after each object.
+     */
+    suspend fun verifyReport(
+        entry: RescueSession.Entry,
+        session: ArchiveSession,
+        identity: ArchiveIdentity,
+        provenanceSigner: FfiProvenanceSigner?,
+        directory: ReportCheck?,
+        runner: RescueCallRunner,
+        isActive: () -> Boolean,
+        onObject: (done: Int, total: Int) -> Unit,
+    ) {
+        val check = entry.check
+        val dir = ArchiveLocalData.newReportDir(appContext)
+        entry.dir = dir
+        entry.verifiedFiles = emptyMap()
+        entry.unverifiableFiles = emptyMap()
+        entry.otsProof = null
+        entry.fetched = 0
+        try {
+            if (check.hasClosure()) {
+                val scratch = File(dir.incoming, "closure.bin")
+                runner.run { check.verifyClosure(scratch.path) }
+            }
+            val names = check.objectNames()
+            val placed = ObjectPlacement.placeAll(
+                names, dir,
+                fetch = { name, landing -> runner.run { check.fetchObject(name, landing.path) } },
+                isActive = isActive,
+            ) { done ->
+                entry.fetched = done
+                onObject(done, names.size)
+            }
+            entry.verifiedFiles = placed.verified
+            entry.unverifiableFiles = placed.unverifiable
+            val verdict = check.verdict()
+            entry.verdict = verdict
+            entry.ots = when (entry.scheme) {
+                ReportScheme.CHAIN -> chainTimestamp(entry, session, identity, provenanceSigner, directory, runner, dir)
+                ReportScheme.LEGACY -> legacyTimestamp(entry, session, identity, provenanceSigner, dir)
+                ReportScheme.DIRECTORY -> null
+            }
+            entry.state = RescueSession.EntryState.VERIFIED
+        } catch (e: Throwable) {
+            entry.verifiedFiles = emptyMap()
+            entry.unverifiableFiles = emptyMap()
+            entry.otsProof = null
+            entry.dir = null
+            ArchiveLocalData.purgeDir(dir)
+            throw e
+        }
     }
 
     /**
-     * Result of a single move operation. Carries enough
-     * metadata for the playlist generator to decide whether the moved
-     * file is a playable MP4 chunk (→ appears in `playlist.m3u`). It is
-     * not one, and is skipped from the playlist, both for the session
-     * manifest (`*.json`) and for the provenance artifacts
-     * (`.fpm` / `.manifest` / `.ots` / `.otssalt`).
+     * The timestamp proof of a chained report: fetched from the directory
+     * (where it is stored under the report's proof name), verified like any
+     * object, decrypted, then compared ([TimestampCheck]). A proof the
+     * directory does not hold is ABSENT; one that does not verify, or that
+     * verifies but does not decrypt, is a MISMATCH, as in the CLI. Null when
+     * the provenance signer could not be derived: the check was not made,
+     * and the screen shows nothing rather than a verdict.
      */
-    private data class MoveResult(
-        val path: String,
-        val displayName: String,
-        val isMp4: Boolean,
+    private suspend fun chainTimestamp(
+        entry: RescueSession.Entry,
+        session: ArchiveSession,
+        identity: ArchiveIdentity,
+        signer: FfiProvenanceSigner?,
+        directory: ReportCheck?,
+        runner: RescueCallRunner,
+        dir: ReportDir,
+    ): OtsStatus? {
+        val otsName = entry.check.otsName() ?: return OtsStatus.ABSENT
+        if (directory == null || otsName !in directory.objectNames()) return OtsStatus.ABSENT
+        if (signer == null) return null
+        val sealed = File(dir.incoming, "ots.bin")
+        val status = runner.run { directory.fetchObject(otsName, sealed.path) }
+        if (status != ObjectStatus.VERIFIED) {
+            sealed.delete()
+            return OtsStatus.MISMATCH
+        }
+        val outcome = timestampCheck(session, identity, signer).checkSealed(
+            sealed, File(dir.plain, "ots.proof"), verifiedMetadata(entry), entry.playableFiles(), dir.plain,
+        )
+        return keep(entry, outcome)
+    }
+
+    /**
+     * The timestamp proof of a legacy report: a `<sessionId>.ots` object of
+     * the report itself, stored as is (not encrypted). Only a VERIFIED one is
+     * considered (signed at the migration); a legacy proof stored without a
+     * signature is as unverifiable as the recordings of its time. Null when
+     * the report holds no verified proof.
+     */
+    private fun legacyTimestamp(
+        entry: RescueSession.Entry,
+        session: ArchiveSession,
+        identity: ArchiveIdentity,
+        signer: FfiProvenanceSigner?,
+        dir: ReportDir,
+    ): OtsStatus? {
+        val names = entry.verdict?.verifiedNames ?: return null
+        val name = names.firstOrNull { it.endsWith(".ots") } ?: return null
+        val proof = entry.verifiedFiles[name] ?: return null
+        if (signer == null) return null
+        val outcome = timestampCheck(session, identity, signer).checkStored(
+            proof, verifiedMetadata(entry), entry.playableFiles(), dir.plain,
+        )
+        return keep(entry, outcome)
+    }
+
+    /** The VERIFIED metadata object (seq 0) of [entry], still encrypted. */
+    private fun verifiedMetadata(entry: RescueSession.Entry): File? {
+        val names = entry.verdict?.verifiedNames ?: return null
+        val metadataName = RescueNames.metadataName(names) ?: return null
+        return entry.verifiedFiles[metadataName]
+    }
+
+    /** On MATCH, keep the proof and the recording id its salt is derived
+     *  from, for the export. */
+    private fun keep(entry: RescueSession.Entry, outcome: TimestampCheck.Outcome): OtsStatus {
+        if (outcome.status == OtsStatus.MATCH) {
+            entry.otsProof = outcome.proof
+            entry.recordingId = outcome.recordingId
+        }
+        return outcome.status
+    }
+
+    private fun timestampCheck(
+        session: ArchiveSession,
+        identity: ArchiveIdentity,
+        signer: FfiProvenanceSigner,
+    ) = TimestampCheck(
+        decrypt = { input, output -> session.decryptToFile(input, output, identity) },
+        hashPlaintext = { input, scratch -> session.plaintextHash(input, scratch, identity) },
+        commitment = { hashes, recordingId -> uniffi.frappuccino.provenanceOtsCommitment(hashes, recordingId, signer) },
+        proofStatus = { proof, commitment -> uniffi.frappuccino.otsProofStatus(proof.path, commitment) },
+        secureDelete = { ArchiveSession.secureDelete(it) },
+        wipe = { SecureWipe.wipe(it) },
     )
 
     /**
-     * [onBlob] is invoked on the caller's coroutine — the service's
-     * `Dispatchers.IO` — so do no UI work inside it. The service translates
-     * it into a broadcast, which is safe from any thread.
+     * Export the VERIFIED content of [entry] to a folder created in the tree
+     * the witness picked. Each object is decrypted to a private file, copied,
+     * and the private file secure-deleted before the next one; nothing is
+     * decrypted straight into the destination, which the app cannot erase
+     * if the copy is interrupted. An object that does not decrypt is excluded
+     * and counted, and the rest is exported ([ExportRun]). A failed or
+     * cancelled export removes the folder it created, as far as the
+     * destination's provider allows, and so does one in which no object
+     * decrypted.
      *
-     * Downloads and decrypts every blob of [reportId] into the PUBLIC
-     * `Downloads/Frappuccino/<rid>/` folder, writes a `playlist.m3u` there
-     * listing the recovered MP4 chunks (the session manifest and the
-     * provenance artifacts are kept out of it), and reports per-blob
-     * progress as `(filename, index, total)`.
+     * @param onItem `(done, total)` after each planned file.
      */
-    suspend fun downloadReport(
-        reportId: String,
-        identity: ArchiveIdentity,
+    fun exportReport(
+        entry: RescueSession.Entry,
+        treeUri: Uri,
         session: ArchiveSession,
-        // §10.11 Phase B — phrase-derived signer to re-derive the OTS salt for the
-        // disclosure bundle (null on a pure-archive rescue → salt export skipped).
-        provenanceSigner: uniffi.frappuccino.ProvenanceSigner?,
-        onBlob: (filename: String, index: Int, total: Int) -> Unit,
-    ): ReportOutcome {
-        val blobs = try {
-            session.listBlobs(reportId)
-        } catch (e: Exception) {
-            Timber.e(e, "ArchiveDownloader: listBlobs failed for %s", reportId)
-            return ReportOutcome.Failure(e.message ?: "listBlobs error")
-        }
-        // Phase C — null = 404 (the record vanished between enumeration and this
-        // download, e.g. a server-side reap); [] = a report with no blobs. Both
-        // = nothing to fetch.
-        if (blobs.isNullOrEmpty()) return ReportOutcome.Empty
-
-        // Transient buffer dir. Each blob writes here first via the FFI
-        // then immediately moves to public Downloads.
-        val cacheRoot = File(appContext.cacheDir, "archive_recovery/$reportId").apply { mkdirs() }
-        var lastPublicPath: String? = null
-        // Collect the MP4 displayNames that landed in public
-        // Downloads so we can write a playlist.m3u afterwards. Manifest
-        // JSONs are excluded (moveToPublicDownloads marks them isMp4=false).
-        val savedMp4Names = mutableListOf<String>()
-
-        try {
-            var i = 0
-            for (blob in blobs) {
-                i += 1
-                // M-1 (WP-C): the relay supplies blob.filename and we join it onto
-                // cacheRoot below; a coerced/seized relay must not path-traverse
-                // out of the cache dir. Validate with the SHARED guard (exact same
-                // rule as the CLI fetch-archive and the FFI download backstop).
-                // Skip a poisoned name and keep going so one bad entry can't deny
-                // the witness the rest of the recovery; the FFI download would
-                // reject it too (InvalidBlob), this is the clean pre-check.
-                if (!uniffi.frappuccino.archiveBlobFilenameIsSafe(blob.filename)) {
-                    Timber.e(
-                        "ArchiveDownloader: refusing unsafe relay filename %s — skipping",
-                        blob.filename,
-                    )
-                    continue
-                }
-                val cacheTarget = File(cacheRoot, blob.filename)
-                onBlob(blob.filename, i, blobs.size)
-
-                // §10.11 — non-STRM raw blobs: the `.ots` timestamp proof, plus any
-                // legacy `.fpm` (sealed manifest; no longer produced, but an old
-                // report may still hold one). Fetch them RAW — STRM-decrypting them
-                // would fail the header parse and abort the whole report.
-                val isRawBlob = blob.filename.endsWith(".ots", ignoreCase = true) ||
-                    blob.filename.endsWith(".fpm", ignoreCase = true)
-
-                // Download with a few retries : a transient WiFi/cellular
-                // blip (handoff, brief power-save) shouldn't kill the whole
-                // report. The service's WifiLock prevents the sustained
-                // screen-off stall ; this covers residual transients + slow
-                // / degraded networks (the rescue flow's whole point).
-                var attempt = 0
-                var lastError: Exception? = null
-                var ok = false
-                while (attempt < MAX_BLOB_ATTEMPTS) {
-                    attempt++
-                    try {
-                        if (isRawBlob) {
-                            session.downloadRaw(
-                                reportId, blob.filename, cacheTarget.absolutePath
-                            )
-                        } else {
-                            session.downloadAndDecrypt(
-                                reportId, blob.filename, cacheTarget.absolutePath, identity
-                            )
-                        }
-                        ok = true
-                        break
-                    } catch (e: Exception) {
-                        lastError = e
-                        Timber.w(
-                            e, "ArchiveDownloader: blob %s attempt %d/%d failed",
-                            blob.filename, attempt, MAX_BLOB_ATTEMPTS,
-                        )
-                        try {
-                            uniffi.frappuccino.secureDeleteFile(cacheTarget.absolutePath)
-                        } catch (_: Exception) {
-                            cacheTarget.delete()
-                        }
-                        if (attempt < MAX_BLOB_ATTEMPTS) delay(BLOB_RETRY_BACKOFF_MS * attempt)
-                    }
-                }
-                if (!ok) {
-                    Timber.e(
-                        lastError, "ArchiveDownloader: blob %s failed after %d attempts",
-                        blob.filename, MAX_BLOB_ATTEMPTS,
-                    )
-                    return ReportOutcome.Failure("${blob.filename}: ${lastError?.message}")
-                }
-
-                // §10.11 (lean "hash + Bitcoin") — for the `.ots` timestamp proof,
-                // re-derive the per-recording OTS salt from the phrase-derived
-                // signer and export it next to the proof, so the verifier can
-                // recompute the salted commitment (SHA-256(salt ‖ media root)).
-                // The salt is NEVER on the relay (re-derived here from the seed);
-                // exported only when the signer is available (present iff the
-                // rescue had the phrase). No manifest, no cert — attribution is
-                // on-demand at disclosure, never a stored artifact. Best-effort.
-                if (blob.filename.endsWith(".ots", ignoreCase = true) && provenanceSigner != null) {
-                    try {
-                        val sid = blob.filename.substringBeforeLast('.')
-                        val salt = provenanceSigner.otsSalt(recordingIdFor(sid))
-                        val saltHex = salt.joinToString("") { "%02x".format(it.toInt() and 0xFF) }
-                        val saltCache = File(cacheRoot, "$sid.otssalt")
-                        saltCache.writeText(saltHex)
-                        moveToPublicDownloads(saltCache, reportId, saltCache.name)
-                        Timber.i("Provenance OTS salt exported for %s", sid)
-                    } catch (e: Exception) {
-                        Timber.w(e, "OTS salt export during rescue failed (non-fatal) for %s", blob.filename)
-                    }
-                }
-
-                // Capture size BEFORE the move : moveToPublicDownloads
-                // secure-deletes the cache source, so length() after = 0.
-                val sizeBytes = cacheTarget.length()
-                val moved = moveToPublicDownloads(cacheTarget, reportId, blob.filename)
-                if (moved != null) {
-                    lastPublicPath = moved.path
-                    if (moved.isMp4) savedMp4Names.add(moved.displayName)
-                }
-                Timber.d(
-                    "Recovered %s -> %s (%d bytes)",
-                    blob.filename, moved?.path ?: "(move failed)", sizeBytes,
-                )
-            }
-
-            // Write playlist.m3u inside the same public
-            // folder. Non-fatal if it fails (the MP4s are still there).
-            if (savedMp4Names.isNotEmpty()) {
-                try {
-                    writePlaylistM3u(reportId, savedMp4Names.sorted())
-                } catch (e: Exception) {
-                    Timber.w(e, "playlist.m3u generation failed for %s (non-fatal)", reportId)
-                }
-            }
-
-            val parentDir = lastPublicPath?.substringBeforeLast('/')
-                ?: "Download/Frappuccino/$reportId"
-            return ReportOutcome.Success(parentDir, blobs.size)
-        } finally {
-            // Sweep the transient cacheDir buffer. Each source is
-            // secure-deleted right after a successful move; this clears
-            // any partial leftover on early exit (failure / cancellation).
-            try {
-                cacheRoot.listFiles()?.forEach { f ->
-                    try {
-                        uniffi.frappuccino.secureDeleteFile(f.absolutePath)
-                    } catch (_: Exception) {
-                        f.delete()
-                    }
-                }
-                cacheRoot.delete()
-            } catch (_: Exception) {
-            }
-        }
+        identity: ArchiveIdentity,
+        provenanceSigner: FfiProvenanceSigner?,
+        isActive: () -> Boolean,
+        onItem: (done: Int, total: Int) -> Unit,
+    ): ExportOutcome {
+        val verdict = entry.verdict ?: throw IOException("report not verified")
+        val dir = entry.dir ?: throw IOException("report not verified")
+        val plan = ExportPlan.plan(verdict.verifiedNames, entry.otsProof != null && entry.recordingId != null)
+        return exportItems(
+            entry, plan, entry.verifiedFiles, RescueNames.exportFolderName(entry.ordinal), dir, treeUri,
+            session, identity, provenanceSigner, isActive, onItem,
+        )
     }
 
     /**
-     * Purge any MediaStore entries (or legacy
-     * files) under `Downloads/Frappuccino/<rid>/` before a re-download.
-     * Without this, a second pass on an already-saved report would create
-     * suffixed duplicates (`chunk_000001 (1).mp4`, `(2).mp4`, …) via
-     * MediaStore's collision policy. Non-fatal on failure.
+     * Export the objects of [entry] kept apart as not verifiable, to a folder
+     * of their own whose name, like every file in it, carries
+     * [RescueNames.UNVERIFIED_LABEL]. Same handling as [exportReport]: private
+     * decryption, copy, secure deletion, exclusion of what does not decrypt,
+     * removal of a partial folder. Never writes into the verified export's
+     * folder, and never adds a verified object to this one.
      */
-    fun clearReportFolder(rid: String) {
-        val relativeDir = "${Environment.DIRECTORY_DOWNLOADS}/Frappuccino/$rid"
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            try {
-                val resolver = appContext.contentResolver
-                val sel = "${MediaStore.Downloads.RELATIVE_PATH} = ?"
-                val args = arrayOf("$relativeDir/")
-                var deleted = 0
-                resolver.query(
-                    MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-                    arrayOf(MediaStore.Downloads._ID),
-                    sel, args, null,
-                )?.use { c ->
-                    while (c.moveToNext()) {
-                        val id = c.getLong(0)
-                        val uri = ContentUris.withAppendedId(
-                            MediaStore.Downloads.EXTERNAL_CONTENT_URI, id,
-                        )
-                        if (resolver.delete(uri, null, null) > 0) deleted++
-                    }
-                }
-                Timber.i("clearReportFolder: purged %d entries for %s", deleted, rid)
-            } catch (e: Exception) {
-                Timber.w(e, "clearReportFolder failed for %s (non-fatal)", rid)
-            }
-        } else {
-            @Suppress("DEPRECATION")
-            val publicDir = Environment.getExternalStoragePublicDirectory(
-                Environment.DIRECTORY_DOWNLOADS
-            )
-            val targetDir = File(publicDir, "Frappuccino/$rid")
-            if (targetDir.isDirectory) {
-                // Purge each file's MediaStore entry (and the
-                // system thumbnail the provider derived from it) by path before
-                // the raw delete. A bare File.delete() orphans the thumbnail in
-                // the media-provider cache, leaving a recoverable preview of
-                // decrypted footage the user believes erased — the secure-delete
-                // promise must cover the thumbnail too. On pre-Q the provider
-                // owns the file so this also removes it; the raw delete stays as
-                // a fallback for any file never scanned into MediaStore.
-                val resolver = appContext.contentResolver
-                @Suppress("DEPRECATION")
-                val dataSel = "${MediaStore.MediaColumns.DATA} = ?"
-                targetDir.listFiles()?.forEach { f ->
-                    try {
-                        resolver.delete(
-                            MediaStore.Files.getContentUri("external"),
-                            dataSel,
-                            arrayOf(f.absolutePath),
-                        )
-                    } catch (e: Exception) {
-                        Timber.w(e, "clearReportFolder <Q: MediaStore purge failed for %s", f.name)
-                    }
-                    f.delete()
-                }
-            }
-        }
+    fun exportUnverifiable(
+        entry: RescueSession.Entry,
+        treeUri: Uri,
+        session: ArchiveSession,
+        identity: ArchiveIdentity,
+        isActive: () -> Boolean,
+        onItem: (done: Int, total: Int) -> Unit,
+    ): ExportOutcome {
+        val verdict = entry.verdict ?: throw IOException("report not verified")
+        val dir = entry.dir ?: throw IOException("report not verified")
+        val plan = ExportPlan.planUnverifiable(verdict.unverifiableNames)
+        if (plan.isEmpty()) throw IOException("nothing kept apart to export")
+        return exportItems(
+            entry, plan, entry.unverifiableFiles, RescueNames.exportUnverifiedFolderName(entry.ordinal), dir,
+            treeUri, session, identity, provenanceSigner = null, isActive = isActive, onItem = onItem,
+        )
     }
 
-    /**
-     * Recompute the manifest's 16-byte recording id from the session id (the
-     * `.fpm` filename stem). This has to stay exactly the derivation
-     * `StreamRecordingService` used at record time — `SHA-256(sessionId)[..16]`
-     * — because the OTS salt re-derived from it has to match what the manifest
-     * committed. A different derivation here breaks nothing visible: the
-     * disclosure bundle simply stops verifying (§10.11 Phase B).
-     */
-    private fun recordingIdFor(sessionId: String): ByteArray =
-        java.security.MessageDigest.getInstance("SHA-256")
-            .digest(sessionId.toByteArray(Charsets.UTF_8))
-            .copyOf(16)
-
-    /**
-     * Copy a decrypted plaintext from `cacheDir/...` to public
-     * `Downloads/Frappuccino/<rid>/`. On success, secure-deletes the cacheDir
-     * source. Sniffs the first byte to route the session manifest
-     * (`{` → `<base>.json`, `application/json`) away from MP4, so Android
-     * Photos doesn't choke on an unplayable JSON masked as `.mp4`
-     * (Phase 4.4.2/4.4.6).
-     */
-    private fun moveToPublicDownloads(
-        srcFile: File,
-        rid: String,
-        originalFilename: String,
-    ): MoveResult? {
-        // §10.11 — provenance artifacts (.fpm sealed manifest, .manifest unsealed,
-        // .ots timestamp proof, .otssalt blinding salt) keep their verbatim name +
-        // a binary mime; never sniffed, never an MP4 (excluded from playlist.m3u
-        // via isMp4=false below).
-        val isProvenanceArtifact = originalFilename.endsWith(".fpm", ignoreCase = true) ||
-            originalFilename.endsWith(".manifest", ignoreCase = true) ||
-            originalFilename.endsWith(".ots", ignoreCase = true) ||
-            originalFilename.endsWith(".otssalt", ignoreCase = true)
-
-        // Sniff first byte. `{` (0x7B) → JSON manifest. Skipped
-        // for every provenance artifact listed above: a `.fpm` is a
-        // `crypto_box_seal` envelope starting with a random ephemeral public
-        // key, so no first byte identifies it.
-        val isJsonManifest: Boolean = if (isProvenanceArtifact) false else try {
-            FileInputStream(srcFile).use { input ->
-                val b = input.read()
-                b >= 0 && b.toByte() == '{'.code.toByte()
-            }
-        } catch (e: Exception) {
-            Timber.w(e, "moveToPublicDownloads: first-byte sniff failed, defaulting to MP4")
-            false
-        }
-
-        val displayName: String
-        val mime: String
-        val countsAsMp4: Boolean
-        when {
-            isProvenanceArtifact -> {
-                // Keep the original <sessionId>.fpm name verbatim.
-                displayName = originalFilename
-                mime = "application/octet-stream"
-                countsAsMp4 = false
-            }
-            else -> {
-                val base = originalFilename
-                    .removeSuffix(".strm")
-                    .removeSuffix(".mp4")
-                    .removeSuffix(".json")
-                displayName = if (isJsonManifest) "$base.json" else "$base.mp4"
-                mime = if (isJsonManifest) "application/json" else "video/mp4"
-                countsAsMp4 = !isJsonManifest
-            }
-        }
-        val relativeDir = "${Environment.DIRECTORY_DOWNLOADS}/Frappuccino/$rid"
-
-        return try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                // Keep this purge: it is what makes the per-chunk publish
-                // idempotent, and dropping it can make a recovered testimony
-                // disappear from the gallery without any error. A re-rescue of an
-                // already-recovered report runs with clearFirst=false
-                // (cross-session re-tap, or a bulk resume), so clearReportFolder
-                // never ran and the same <sid>_NNNNNN.mp4 is still on disk. A bare
-                // insert then collides, and how it collides depends on the
-                // MediaStore provider: AOSP suffixes a `(1)`/`(2)` duplicate
-                // (OnePlus), while the MediaTek provider mis-types the stale row
-                // as application/octet-stream and refuses to index it into
-                // video/media (Seeker → invisible in gallery). Dropping any prior
-                // entry for this exact display name first makes the fresh insert
-                // REPLACE rather than duplicate, and clears a mis-typed stale row
-                // so the clean video/mp4 insert lands (field-fix 2026-06-29).
-                purgeExistingDownloadEntry(rid, displayName)
-                val values = ContentValues().apply {
-                    put(MediaStore.Downloads.DISPLAY_NAME, displayName)
-                    put(MediaStore.Downloads.MIME_TYPE, mime)
-                    put(MediaStore.Downloads.RELATIVE_PATH, relativeDir)
-                    put(MediaStore.Downloads.IS_PENDING, 1)
-                }
-                val resolver = appContext.contentResolver
-                val uri = resolver.insert(
-                    MediaStore.Downloads.EXTERNAL_CONTENT_URI, values
-                ) ?: throw IOException("MediaStore.insert returned null")
-                resolver.openOutputStream(uri)?.use { out ->
-                    FileInputStream(srcFile).use { it.copyTo(out) }
-                } ?: throw IOException("MediaStore openOutputStream returned null")
-                val publishValues = ContentValues().apply {
-                    put(MediaStore.Downloads.IS_PENDING, 0)
-                }
-                resolver.update(uri, publishValues, null, null)
-                try {
-                    uniffi.frappuccino.secureDeleteFile(srcFile.absolutePath)
-                } catch (e: Exception) {
-                    Timber.w(e, "moveToPublicDownloads: secureDelete cache failed")
-                    srcFile.delete()
-                }
-                MoveResult(
-                    path = "$relativeDir/$displayName",
-                    displayName = displayName,
-                    isMp4 = countsAsMp4,
-                )
-            } else {
-                @Suppress("DEPRECATION")
-                val publicDir = Environment.getExternalStoragePublicDirectory(
-                    Environment.DIRECTORY_DOWNLOADS
-                )
-                val targetDir = File(publicDir, "Frappuccino/$rid").apply { mkdirs() }
-                val target = File(targetDir, displayName)
-                srcFile.copyTo(target, overwrite = true)
-                try {
-                    uniffi.frappuccino.secureDeleteFile(srcFile.absolutePath)
-                } catch (e: Exception) {
-                    Timber.w(e, "moveToPublicDownloads: secureDelete cache failed (legacy)")
-                    srcFile.delete()
-                }
-                MoveResult(
-                    path = target.absolutePath,
-                    displayName = displayName,
-                    isMp4 = countsAsMp4,
-                )
-            }
-        } catch (e: Exception) {
-            Timber.e(e, "moveToPublicDownloads failed for %s", displayName)
-            null
-        }
-    }
-
-    /**
-     * Delete any existing MediaStore entry at
-     * `Downloads/Frappuccino/<rid>/<displayName>` so a re-publish replaces it
-     * instead of letting the provider auto-suffix a `(1)`/`(2)` duplicate.
-     * Shared by [moveToPublicDownloads] and [writePlaylistM3u].
-     *
-     * The Q+ guard below is not a coverage hole waiting to be filled: the
-     * pre-Q branch of [moveToPublicDownloads] writes through
-     * `copyTo(overwrite = true)`, so the file is overwritten in place and no
-     * duplicate can appear. Do not read that as "pre-Q files are not in
-     * MediaStore" : they can well be, which is why the pre-Q branch of
-     * [clearReportFolder] purges their entries — and the thumbnails the
-     * provider derived from them — before deleting. And do not turn the catch
-     * into a rethrow — a query/delete failure has to fall through to the
-     * insert, which at worst duplicates, the behaviour that predates this
-     * fix. Throwing here would instead be caught by [moveToPublicDownloads],
-     * which returns null, and that chunk would never reach public Downloads
-     * at all: a MediaStore provider hiccup would cost a piece of the rescued
-     * footage (field-fix 2026-06-29).
-     */
-    private fun purgeExistingDownloadEntry(rid: String, displayName: String) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
-        val relativeDir = "${Environment.DIRECTORY_DOWNLOADS}/Frappuccino/$rid"
+    /** Write [plan] into a new folder [folderName] of [treeUri], each object
+     *  read from [sources] (relay name → local encrypted file). The proof and
+     *  salt items come from [entry] and only [ExportPlan.plan] lists them. */
+    private fun exportItems(
+        entry: RescueSession.Entry,
+        plan: List<ExportPlan.Item>,
+        sources: Map<String, File>,
+        folderName: String,
+        dir: ReportDir,
+        treeUri: Uri,
+        session: ArchiveSession,
+        identity: ArchiveIdentity,
+        provenanceSigner: FfiProvenanceSigner?,
+        isActive: () -> Boolean,
+        onItem: (done: Int, total: Int) -> Unit,
+    ): ExportOutcome {
         val resolver = appContext.contentResolver
-        try {
-            val sel = "${MediaStore.Downloads.RELATIVE_PATH} = ? AND " +
-                "${MediaStore.Downloads.DISPLAY_NAME} = ?"
-            val args = arrayOf("$relativeDir/", displayName)
-            resolver.query(
-                MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-                arrayOf(MediaStore.Downloads._ID),
-                sel, args, null,
-            )?.use { c ->
-                while (c.moveToNext()) {
-                    val id = c.getLong(0)
-                    val uri = ContentUris.withAppendedId(
-                        MediaStore.Downloads.EXTERNAL_CONTENT_URI, id,
-                    )
-                    resolver.delete(uri, null, null)
+        val parent = DocumentsContract.buildDocumentUriUsingTree(
+            treeUri, DocumentsContract.getTreeDocumentId(treeUri),
+        )
+        val folder = DocumentsContract.createDocument(
+            resolver, parent, DocumentsContract.Document.MIME_TYPE_DIR, folderName,
+        ) ?: throw IOException("cannot create the export folder")
+        val destination = object : ExportRun.Destination<Uri> {
+            override fun create(item: ExportPlan.Item): Uri =
+                DocumentsContract.createDocument(resolver, folder, item.mimeType, item.targetName)
+                    ?: throw IOException("cannot create an export file")
+
+            override fun copy(plain: File, target: Uri): Long = copyFile(resolver, plain, target)
+
+            override fun writeTimestamp(item: ExportPlan.Item, target: Uri) {
+                when (item.kind) {
+                    ExportPlan.Kind.OTS_PROOF -> {
+                        val proof = entry.otsProof ?: throw IOException("timestamp proof missing")
+                        copyFile(resolver, proof, target)
+                    }
+                    ExportPlan.Kind.OTS_SALT -> {
+                        val signer = provenanceSigner ?: throw IOException("salt not derivable")
+                        val recordingId = entry.recordingId ?: throw IOException("salt not derivable")
+                        writeSaltHex(resolver, signer.otsSalt(recordingId), target)
+                    }
+                    ExportPlan.Kind.VIDEO, ExportPlan.Kind.METADATA ->
+                        throw IllegalArgumentException("not a timestamp item")
                 }
             }
-        } catch (e: Exception) {
-            Timber.w(e, "purgeExistingDownloadEntry: query/delete failed for %s (non-fatal)", displayName)
+        }
+        var keep = false
+        try {
+            val outcome = ExportRun(
+                decrypt = { sealed, plain -> session.decryptToFile(sealed, plain, identity) },
+                secureDelete = { ArchiveSession.secureDelete(it) },
+                destination = destination,
+            ).run(plan, sources, File(dir.plain, "export.tmp"), isActive, onItem)
+            // A folder in which nothing decrypted holds nothing for anyone.
+            keep = !outcome.nothingWritten
+            return outcome
+        } finally {
+            if (!keep) {
+                try {
+                    DocumentsContract.deleteDocument(resolver, folder)
+                } catch (e: Exception) {
+                    Timber.w(e, "ArchiveDownloader: partial export not removable")
+                }
+            }
         }
     }
 
-    /**
-     * Write a `playlist.m3u` next to the downloaded MP4
-     * chunks so VLC / MX Player / Plex can chain them as one virtual
-     * movie without re-encoding. Relative filenames (same directory), so
-     * it survives a copy/move of the whole folder. Any pre-existing
-     * playlist for this rid is deleted first.
-     */
-    private fun writePlaylistM3u(rid: String, mp4Filenames: List<String>) {
-        if (mp4Filenames.isEmpty()) return
-        val playlistName = "playlist.m3u"
-        val relativeDir = "${Environment.DIRECTORY_DOWNLOADS}/Frappuccino/$rid"
-        val content = buildString {
-            append("#EXTM3U\n")
-            append("# Frappuccino archive — report ")
-            append(rid)
-            append(" — ")
-            append(mp4Filenames.size)
-            append(" chunks\n")
-            for (name in mp4Filenames) {
-                append("#EXTINF:5,")
-                append(name)
-                append('\n')
-                append(name)
-                append('\n')
+    /** Copy [source] into [target]; returns the number of bytes written. */
+    private fun copyFile(resolver: ContentResolver, source: File, target: Uri): Long {
+        val buffer = ByteArray(COPY_BUFFER_BYTES)
+        try {
+            var total = 0L
+            val out = resolver.openOutputStream(target, "w") ?: throw IOException("export destination refused")
+            out.use { stream ->
+                FileInputStream(source).use { input ->
+                    while (true) {
+                        val n = input.read(buffer)
+                        if (n < 0) break
+                        stream.write(buffer, 0, n)
+                        total += n
+                    }
+                }
+                stream.flush()
             }
-        }.toByteArray(Charsets.UTF_8)
+            return total
+        } finally {
+            SecureWipe.wipe(buffer)
+        }
+    }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val resolver = appContext.contentResolver
-            // Idempotent: drop a stale playlist for this rid before re-inserting.
-            purgeExistingDownloadEntry(rid, playlistName)
-
-            val values = ContentValues().apply {
-                put(MediaStore.Downloads.DISPLAY_NAME, playlistName)
-                put(MediaStore.Downloads.MIME_TYPE, "audio/x-mpegurl")
-                put(MediaStore.Downloads.RELATIVE_PATH, relativeDir)
-                put(MediaStore.Downloads.IS_PENDING, 1)
+    /** Write the salt as lowercase hex (the format `verify-provenance`
+     *  reads), without going through a `String`. Wipes [salt]. */
+    private fun writeSaltHex(resolver: ContentResolver, salt: ByteArray, target: Uri) {
+        val hex = ByteArray(salt.size * 2)
+        try {
+            for ((i, b) in salt.withIndex()) {
+                val v = b.toInt() and 0xFF
+                hex[2 * i] = HEX_DIGITS[v ushr 4]
+                hex[2 * i + 1] = HEX_DIGITS[v and 0x0F]
             }
-            val uri = resolver.insert(
-                MediaStore.Downloads.EXTERNAL_CONTENT_URI, values,
-            ) ?: throw IOException("MediaStore.insert returned null for playlist")
-            resolver.openOutputStream(uri)?.use { it.write(content) }
-                ?: throw IOException("MediaStore openOutputStream returned null for playlist")
-            val publishValues = ContentValues().apply {
-                put(MediaStore.Downloads.IS_PENDING, 0)
-            }
-            resolver.update(uri, publishValues, null, null)
-        } else {
-            @Suppress("DEPRECATION")
-            val publicDir = Environment.getExternalStoragePublicDirectory(
-                Environment.DIRECTORY_DOWNLOADS
-            )
-            val targetDir = File(publicDir, "Frappuccino/$rid").apply { mkdirs() }
-            File(targetDir, playlistName).writeBytes(content)
+            val out = resolver.openOutputStream(target, "w") ?: throw IOException("export destination refused")
+            out.use { it.write(hex) }
+        } finally {
+            SecureWipe.wipe(salt)
+            SecureWipe.wipe(hex)
         }
     }
 
     companion object {
-        private const val MAX_BLOB_ATTEMPTS = 3
-        private const val BLOB_RETRY_BACKOFF_MS = 1000L
+        private const val COPY_BUFFER_BYTES = 64 * 1024
+        private val HEX_DIGITS = "0123456789abcdef".toByteArray(Charsets.US_ASCII)
     }
 }

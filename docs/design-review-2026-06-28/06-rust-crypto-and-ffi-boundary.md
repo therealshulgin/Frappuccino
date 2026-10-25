@@ -2,6 +2,8 @@
 
 > Model: claude-opus-4-8[1m]. Date: 2026-06-28. Scope: the choice to keep all sensitive crypto in one Rust crate behind a single UniFFI surface, how that surface is minimized (no key getters, combined seal/unseal), the cross-language parity defenses (diff-fuzz, KAT), the server-mirrored domain-separation table, and the `.so` freshness/pin-value gate.
 
+> **Later change (2026-10-25), read before this report.** The FFI entry points this review names for encryption (`strm_encrypt_file`) and for the rescue (`archive_download_and_decrypt`) have since been retired. Chunks are now encrypted, signed and written as queue envelopes by the report writer (`ReportWriter.seal_chunk_file`), and the rescue downloads the encrypted object first (`archive_fetch_object`), verifies it under the re-derived report key, and only then decrypts it (`strm_decrypt_to_file`). The plaintext still never crosses into the JVM. Current surface: `docs/ARCHITECTURE_TECHNIQUE_COMPLETE.md` §5.2.
+
 This document is an **adversarial steelman**, not a findings list. For each design choice it makes the strongest affirmative case, justifies the specific implementation against the alternatives that were on the table, states the sharpest honest objection a hostile reviewer would raise (rebutting or conceding it), and surfaces the assumptions and the questions a future adversarial audit should probe. Every claim is grounded in the real code with `file:line` citations.
 
 ---

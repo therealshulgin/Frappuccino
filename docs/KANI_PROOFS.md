@@ -1,6 +1,24 @@
 # Kani proofs — STRM parser (8.4 ③) + transport de-obfs (§10.10)
 
-**Date:** 2026-09-03 · **Result: 5/5 harnesses verified, 0 failures.**
+**Date:** 2026-10-25 · **Result: 8/8 harnesses verified, 0 failures** (`run-kani.sh`,
+cargo-kani 0.67.0 under WSL, CBMC backend; whole run 20 min 40 s, peak memory 13.7 GB).
+
+> **Run of 2026-10-25, the full set.** The report rework added three harnesses on the
+> queue envelope (the trailer decoder, in two harnesses, and the footer framing, below),
+> and this run verifies all eight: `check_envelope_framing_accounts_for_the_whole_file`
+> (0 of 283 checks failed, 14.6 s), `check_envelope_trailer_decode_never_panics` (0 of
+> 967, 69.1 s), `check_envelope_trailer_decode_refuses_short_input` (0 of 1109, 17.8 s),
+> `check_deobfuscate_in_place_never_panics` (0 of 1496, 1101.6 s),
+> `check_be_u16_big_endian_and_or_equals_xor` (0 of 6, 0.2 s),
+> `check_parse_header_postconditions_make_caller_slices_safe` (0 of 106, 2.4 s),
+> `check_parse_header_never_panics` (0 of 94, 1.3 s), `check_parse_header_rejects_any_grant`
+> (0 of 97, 1.4 s). Nearly all of the time, and almost certainly the memory peak, is the
+> Salamander harness, which this rework did not touch; the envelope harnesses, measured
+> on their own, peak at about 1.4 GB or less each. A CI runner with 16 GB has little
+> margin above the 13.7 GB peak.
+>
+> The previous dated result, kept as it was: **2026-09-03, 5/5** (the five older
+> harnesses).
 
 > **Re-vérifié 2026-06-29** (HEAD `fc1560c`, post WP-E4/F/G ; cargo-kani 0.67.0 via WSL) :
 > **4/4 harnesses SUCCESSFUL, 0 failure** — `check_parse_header_postconditions_make_caller_slices_safe`,
@@ -34,11 +52,15 @@ The target is the untrusted-input attack surface: `stream/src/header.rs`
 | `check_parse_header_postconditions_make_caller_slices_safe` | When `parse_header` returns `Ok(p)`, the offsets are internally consistent (`header_end == HEADER_SIZE_NO_GRANTS`, since a declared grant is refused outright, and `body_start == header_end+1`) **and** in-bounds, so the three slices `decrypt()` takes right after (`blob[OFF_SEALED..OFF_SEALED+SEALED_ENVELOPE_SIZE]`, `blob[..header_end]`, `blob[body_start..]`) can never panic. The harness performs those exact slices to tie the proof to the real use site. |
 | `check_parse_header_rejects_any_grant` | No accepted blob carries a grant: when `parse_header` returns `Ok(p)`, `p.grant_count == 0`. The multi-recipient section is a reserved wire field nothing has ever emitted, so the parser refuses rather than walking `grant_count` entries of attacker-chosen input (2026-09-03). The bound `N` still spans a full grant entry, so the proof explores the blobs the old code accepted and shows they are now refused, rather than proving a property over inputs that can no longer occur. |
 | `check_be_u16_big_endian_and_or_equals_xor` | `be_u16(hi,lo) == hi*256 + lo` **and** `== (hi<<8) ^ lo`. The second equality machine-confirms the §8.4.4 "equivalent mutant" verdict — `be_u16:77 \| -> ^` is unkillable because the operand bit-ranges are disjoint, so OR ≡ XOR — replacing the hand argument with a proof. |
+| `check_envelope_trailer_decode_refuses_short_input` (report rework) | `envelope::decode_plain` refuses every decrypted trailer shorter than the fixed fields, for a symbolic length, without a panic. The decoder checks its input length before anything else, so none of these inputs reaches a loop; `#[kani::unwind(2)]` holds for that reason only, and a decoder that started looping before its length check would fail the harness's unwinding check rather than pass. |
+| `check_envelope_trailer_decode_never_panics` (report rework) | `envelope::decode_plain`, the decoder of a queue envelope's decrypted trailer, never panics for any trailer from the fixed fields up to a filename of **4 bytes**, each length checked in turn over fully symbolic bytes, and on a trailer it accepts the declared filename length accounts for the whole input, the filename has that length, and the bytes at its place form a name the relay accepts (none for a closure). The decoder runs on bytes that passed the AEAD, so this is the property that matters if the queue key leaks. **Not proven by Kani:** that the filename is those bytes unchanged (an exhaustive unit test over all 256 byte values covers it), the refusal of the reserved name `manifest` (8 bytes, beyond the bound; unit-tested), and the wipe of a trailer on drop (the harness forgets its result rather than dropping it, see the comment in `kani_proofs.rs`). |
+| `check_envelope_framing_accounts_for_the_whole_file` (report rework) | The envelope footer framing (`u32_be(sealed_len) ‖ "FQE1"` at the end of a file) never panics, and when it accepts a tail the sealed trailer it returns sits right before the footer, within the allowed size range, and the payload length it derives accounts for the whole file, for a fully symbolic file length. |
 | `check_deobfuscate_in_place_never_panics` (§10.10) | The Salamander de-obfuscation parser (`stream/src/salamander.rs`), the obfs proxy's internet-facing **untrusted-UDP** edge, never panics on **any** datagram, for every symbolic `n` in the `recv` contract `SALT_LEN <= n <= buf.len()`. See the note below on why a small concrete buffer + `#[kani::unwind]` is a complete no-panic proof here despite the `BLAKE2b` call. |
 
 ### Counting the harnesses is part of the proof
 
-`run-kani.sh` asserts that **exactly `EXPECTED_HARNESSES` (5)** come back verified,
+`run-kani.sh` asserts that **exactly `EXPECTED_HARNESSES`** come back verified (5 when this
+section was written, 8 since the report rework),
 not merely that none failed. `cargo kani` already exits non-zero on a FAILING
 proof, so that half was covered; what an exit code cannot see is a proof that
 stopped EXISTING. Delete a harness, rename it, drop its `#[kani::proof]`, or cfg
@@ -124,7 +146,9 @@ Baseline: **5 harnesses verified, 0 failures** (Kani 0.67.0, CBMC backend) — t
 parser harnesses (2026-06-06), the Salamander de-obfs no-panic proof (2026-06-23,
 §10.10 T2), and the grant-rejection proof (2026-09-03). `run-kani.sh` asserts this
 count, so a harness cannot quietly stop existing; if the two numbers ever disagree,
-the runner is right and this line is stale.
+the runner is right and this line is stale. Since the report rework the runner expects
+8 (the three envelope harnesses above), and the run of 2026-10-25 at the top of this
+document verified all eight.
 
 ## Status
 

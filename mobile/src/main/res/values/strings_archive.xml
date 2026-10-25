@@ -1,0 +1,183 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Strings of the rescue screens (ArchiveModeActivity, ArchivePlayerActivity,
+  ArchiveDownloadService). The keys shared with older screens (archive_title,
+  archive_warning, archive_close, ...) stay in strings.xml.
+
+  The statuses below are what a witness reads about his own testimony after a
+  loss or a seizure. Keep them exact rather than reassuring: COMPLETE is only
+  for a closed recording whose every object verified; a report that never
+  closed is INTERRUPTED, never "complete"; an object that does not verify is
+  "excluded", never "skipped". A legacy object stored without a signature is
+  "not verified" wherever it shows: kept apart, never called verified, never
+  called excluded either.
+-->
+<resources>
+  <!-- Unlock -->
+  <string name="archive_phrase_wrong_count">Invalid phrase: 12 words expected (entered: %1$d).</string>
+  <string name="archive_deriving">Deriving the keys…</string>
+  <string name="archive_unknown_word">A word is not in the French BIP-39 list. Check the spelling.</string>
+  <string name="archive_invalid_phrase">Invalid BIP-39 phrase: check the words and their order.</string>
+  <string name="archive_unlock_failed">Key derivation failed.</string>
+  <string name="archive_no_server">No relay address configured in Settings.</string>
+  <string name="archive_unlocked">ARCHIVE UNLOCKED</string>
+  <string name="archive_identity_matches">This phrase matches this device\'s identity.\n\nTap RECOVER to look for your reports on the relay.</string>
+  <string name="archive_identity_differs">WARNING: this phrase is NOT this device\'s identity.\nYou are about to recover the reports of another identity.</string>
+  <string name="archive_identity_none">No identity on this device: archive only.\n\nTap RECOVER to look for your reports on the relay.</string>
+
+  <!-- Search (enumeration) -->
+  <string name="archive_retry_btn">SEARCH AGAIN</string>
+  <string name="archive_enum_running">Searching… %1$s, %2$s.</string>
+  <string name="archive_enum_rate_limited">The relay is limiting requests: waiting about %1$d s, then resuming where the search stopped.</string>
+  <string name="archive_enum_complete">Search complete: %1$s.</string>
+  <string name="archive_enum_none">Search complete: no report found for this phrase.</string>
+  <string name="archive_enum_incomplete">Search INCOMPLETE (%1$s): %2$s so far. Reports may be missing: search again before concluding anything.</string>
+  <string name="archive_enum_capped">Search INCOMPLETE: it reached its probe limit before a run of empty addresses. %1$s up to that limit. Reports past it were not looked for, and searching again stops at the same limit.</string>
+  <string name="archive_enum_cancelled">Search stopped.</string>
+  <plurals name="archive_enum_probed">
+    <item quantity="one">%d address probed</item>
+    <item quantity="other">%d addresses probed</item>
+  </plurals>
+  <plurals name="archive_reports_found">
+    <item quantity="one">%d report found</item>
+    <item quantity="other">%d reports found</item>
+  </plurals>
+  <string name="archive_reason_rate_limited">the relay kept limiting requests</string>
+  <string name="archive_reason_network">relay unreachable</string>
+  <string name="archive_reason_storage">storage error on this phone</string>
+  <string name="archive_reason_refused">request refused</string>
+  <string name="archive_reason_probe_cap">probe limit reached</string>
+  <string name="archive_reason_other">unexpected error</string>
+  <string name="archive_anomaly_directory_closed">Anomaly: the report directory was closed, by someone who held this device\'s state. Reports opened after that have no entry in it; the search probed further.</string>
+  <string name="archive_anomaly_directory_closure_invalid">Anomaly: a closure that is not valid is recorded on the report directory. The search probed further.</string>
+  <string name="archive_anomaly_directory_closure_unchecked">Anomaly: a closure is recorded on the report directory, and it could not be checked. The search probed further.</string>
+  <string name="archive_anomaly_directory_absent">No report directory on the relay: the search probed a longer range.</string>
+  <string name="archive_anomaly_directory_unreadable">Anomaly: the relay served a report directory that cannot be read. The search went on without it and probed a longer range.</string>
+  <plurals name="archive_anomaly_unmatched">
+    <item quantity="one">Anomaly: %d directory entry matches none of your reports.</item>
+    <item quantity="other">Anomaly: %d directory entries match none of your reports.</item>
+  </plurals>
+  <plurals name="archive_anomaly_unreadable_listings">
+    <item quantity="one">Anomaly: the relay served %d report listing that cannot be read. That report is not in the list; the search went on past it.</item>
+    <item quantity="other">Anomaly: the relay served %d report listings that cannot be read. Those reports are not in the list; the search went on past them.</item>
+  </plurals>
+
+  <!-- Report rows -->
+  <string name="archive_verify_all_btn">VERIFY ALL</string>
+  <string name="archive_busy">The rescue is already working, wait for it to finish.</string>
+  <string name="archive_report_title">Report %1$d</string>
+  <string name="archive_report_subtitle_chain">Signed while recording · index %1$d</string>
+  <string name="archive_report_subtitle_legacy">Recorded before the update · index %1$d</string>
+  <plurals name="archive_report_listed">
+    <item quantity="one">%d object on the relay, not verified yet.</item>
+    <item quantity="other">%d objects on the relay, not verified yet.</item>
+  </plurals>
+  <string name="archive_status_verifying">Verifying… %1$d / %2$d</string>
+  <string name="archive_status_failed">Verification stopped (%1$s). Tap VERIFY to try again.</string>
+  <string name="archive_status_complete">COMPLETE: the recording was closed and every one of its objects verified.</string>
+  <string name="archive_status_incomplete">INCOMPLETE: the recording was closed, but some of its objects are missing on the relay.</string>
+  <string name="archive_status_altered">ALTERED: objects that are not yours were found on the relay. They are excluded.</string>
+  <string name="archive_status_interrupted">INTERRUPTED: the recording was never closed. Its objects are verified one by one; its end is not certified.</string>
+  <string name="archive_status_legacy">Recorded before the update: an object is verified only if it carries a valid signature.</string>
+  <string name="archive_status_legacy_frozen">Recorded before the update, frozen on the relay: an object is verified only if it carries a valid signature.</string>
+  <plurals name="archive_count_verified">
+    <item quantity="one">%d verified</item>
+    <item quantity="other">%d verified</item>
+  </plurals>
+  <plurals name="archive_count_missing">
+    <item quantity="one">%d missing</item>
+    <item quantity="other">%d missing</item>
+  </plurals>
+  <plurals name="archive_count_foreign">
+    <item quantity="one">%d foreign (excluded)</item>
+    <item quantity="other">%d foreign (excluded)</item>
+  </plurals>
+  <plurals name="archive_count_unexpected">
+    <item quantity="one">%d unexpected (excluded)</item>
+    <item quantity="other">%d unexpected (excluded)</item>
+  </plurals>
+  <plurals name="archive_count_unexpected_signed">
+    <item quantity="one">%d signed outside the closure (excluded)</item>
+    <item quantity="other">%d signed outside the closure (excluded)</item>
+  </plurals>
+  <plurals name="archive_count_invalid">
+    <item quantity="one">%d with an invalid signature (excluded)</item>
+    <item quantity="other">%d with an invalid signature (excluded)</item>
+  </plurals>
+  <plurals name="archive_count_unverifiable">
+    <item quantity="one">%d not verifiable (see below)</item>
+    <item quantity="other">%d not verifiable (see below)</item>
+  </plurals>
+  <plurals name="archive_count_unchecked">
+    <item quantity="one">%d not checked</item>
+    <item quantity="other">%d not checked</item>
+  </plurals>
+  <string name="archive_dates_range">Stored between %1$s and %2$s (relay clock).</string>
+  <string name="archive_anomaly_closure_invalid">Anomaly: the closure recorded on the relay is not valid.</string>
+  <string name="archive_ots_match">Timestamp: the proof matches these recordings. The Bitcoin anchoring is checked with the desktop tool.</string>
+  <string name="archive_ots_mismatch">Timestamp: the proof does NOT match the verified recordings.</string>
+  <string name="archive_ots_absent">Timestamp: none.</string>
+  <string name="archive_verify_btn">VERIFY</string>
+  <string name="archive_play_btn">WATCH</string>
+  <string name="archive_export_btn">EXPORT</string>
+  <string name="archive_play_none">No verified video in this report.</string>
+  <string name="archive_play_none_unverifiable">No video among the objects kept apart.</string>
+
+  <!-- Not verifiable -->
+  <string name="archive_unverifiable_title">NOT VERIFIABLE</string>
+  <string name="archive_unverifiable_explain">These objects were stored before the relay kept signatures. Nothing proves they are yours or unchanged: an object sealed to your identity can come from anyone who knows its public key. They are kept apart from the verified testimony and never counted in it. You can watch them here and export them, to a separate folder marked \"not-verified\". Only recordings are exported from here: a timestamp proof among them is left to the desktop tool (frappuccino-cli fetch-archive), which keeps every such object apart.</string>
+  <string name="archive_unverifiable_play_btn">WATCH (NOT VERIFIED)</string>
+  <string name="archive_unverifiable_export_btn">EXPORT (NOT VERIFIED)</string>
+  <string name="archive_unverifiable_export_warning_title">Export objects that are NOT verified?</string>
+  <string name="archive_unverifiable_export_warning_message">Nothing proves these recordings are yours or unchanged: they were stored before the relay kept signatures. They go to a separate folder, marked \"not-verified\" like each file in it, never together with the verified testimony. Like any export, the copy leaves the app: it is decrypted, the emergency wipe cannot erase it, and any app with access to the chosen folder can read it.</string>
+  <string name="archive_unverifiable_export_done">Exported to a separate folder marked \"not-verified\".</string>
+  <plurals name="archive_unverifiable_line">
+    <item quantity="one">Report %1$d: %2$d object</item>
+    <item quantity="other">Report %1$d: %2$d objects</item>
+  </plurals>
+
+  <!-- Export -->
+  <string name="archive_export_warning_title">Export this report?</string>
+  <string name="archive_export_warning_message">The exported copy leaves the app: it is decrypted, the emergency wipe cannot erase it, and any app with access to the chosen folder can read it. Only verified recordings are exported, with the timestamp proof and its salt when the proof matches.</string>
+  <string name="archive_export_confirm">CHOOSE A FOLDER</string>
+  <string name="archive_cancel">CANCEL</string>
+  <string name="archive_export_no_picker">No file picker on this phone: export is not possible.</string>
+  <string name="archive_export_lost">The export did not start. Start it again from the report.</string>
+  <string name="archive_export_running">Export: file %1$d of %2$d</string>
+  <string name="archive_export_done">Exported.</string>
+  <!-- After the done line: objects that did not decrypt are excluded and the
+       rest of the report is exported. -->
+  <plurals name="archive_export_undecryptable">
+    <item quantity="one">%d object did not decrypt and was excluded from the export.</item>
+    <item quantity="other">%d objects did not decrypt and were excluded from the export.</item>
+  </plurals>
+  <plurals name="archive_export_nothing_decrypted">
+    <item quantity="one">Nothing exported: %d object did not decrypt and was excluded.</item>
+    <item quantity="other">Nothing exported: %d objects did not decrypt and were excluded.</item>
+  </plurals>
+  <string name="archive_export_timestamp_left_out">The timestamp proof and its salt were excluded too: they cover every verified recording, and at least one is missing from the export.</string>
+  <string name="archive_export_failed">Export failed. The partial copy was removed where the destination allows it.</string>
+
+  <!-- Close -->
+  <string name="archive_close_confirm_title">Close the rescue?</string>
+  <string name="archive_close_confirm_message">Closing cancels the work in progress and erases the copies recovered on this phone.</string>
+  <string name="archive_close_confirm_yes">CLOSE</string>
+
+  <!-- Player -->
+  <string name="archive_player_part">Part %1$d of %2$d</string>
+  <string name="archive_player_decrypting">Decrypting…</string>
+  <string name="archive_player_error">This part cannot be played.</string>
+  <string name="archive_player_end">End of the recording.</string>
+  <string name="archive_player_prev">◀ PREVIOUS</string>
+  <string name="archive_player_next">NEXT ▶</string>
+  <string name="archive_player_close">CLOSE</string>
+  <string name="archive_player_unverified_banner">NOT VERIFIED. Stored before the relay kept signatures: nothing proves this recording is yours or unchanged.</string>
+
+  <!-- Foreground service -->
+  <string name="archive_fgs_channel">Archive rescue</string>
+  <string name="archive_fgs_starting">Starting the rescue…</string>
+  <string name="archive_fgs_enumerating">Searching for your reports…</string>
+  <string name="archive_fgs_rate_limited">Relay busy: waiting before resuming…</string>
+  <string name="archive_fgs_verifying">Verifying report %1$d/%2$d</string>
+  <string name="archive_fgs_exporting">Exporting…</string>
+</resources>

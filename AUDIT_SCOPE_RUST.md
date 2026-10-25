@@ -22,11 +22,22 @@ fork of Tella FOSS, re-engineered around an Algorand-inspired V2 design:
   long-term Ed25519 key is one-shot (`EnrollmentKit`), wiped on drop once
   enrollment is signed (`core/src/identity.rs`); the X25519 key is re-derived
   from the phrase on demand (`ArchiveIdentity::from_mnemonic`). What persists on
-  the device is the **public** pair (`StreamIdentity`) plus the ephemeral ratchet
+  the device is the **public** pair (`StreamIdentity`), the ephemeral ratchet
   (batches of 50 Ed25519 slots, of which 49 are usable — the last is reserved so
-  a rotation is always possible, `core/src/ratchet.rs`).
+  a rotation is always possible, `core/src/ratchet.rs`), the PIN-sealed provenance
+  seed, and the PIN-sealed **report state** `(i, C_i, directory seed)`
+  (`core/src/report/chain.rs`), which can open report `i` and every later one but
+  not re-derive the key of any report opened before it. `report_master` is not
+  kept after enrollment or migration.
 * The device **cannot decrypt its own past streams** — only the paper
   phrase (archive mode) recovers the session keys.
+* Every report object is **signed when it is produced** (`ReportWriter`), and a
+  stopped recording is **closed**: domain `0x09` signs the exact manifest of its
+  objects, then the report key is wiped. The relay refuses any new name in a closed
+  report, and the rescue verifies every object under the report key it re-derives
+  from the phrase. "No forging of the past" holds for **closed** reports, not for
+  the report being recorded nor for reports opened after an extraction of the state
+  (§3, §4.9).
 * A **self-signed TLS relay** with SPKI-pinning ferries blobs between the
   phone and a future recipient. The server is a blind relay; it never sees
   plaintext.
@@ -46,9 +57,9 @@ Where a document and the code disagree, the code is authoritative.
 
 | Crate                       | Role                                               |
 |-----------------------------|----------------------------------------------------|
-| `crypto-rs/core/`           | BIP-39, HKDF, identities, ratchet, PIN store, seal, signature domains, provenance, report keys |
-| `crypto-rs/stream/`         | STRM blob format, relay client + TLS pin, QUIC transport, Salamander obfuscation, path safety, secure delete |
-| `crypto-rs/ffi/`            | `UniFFI` surface exposed to Kotlin                 |
+| `crypto-rs/core/`           | BIP-39, HKDF, identities, ratchet, PIN store, seal, signature domains, provenance, report keys (legacy and chained), report writer, closure manifest, rescue verification |
+| `crypto-rs/stream/`         | STRM blob format, queue envelope format, durable writes, relay client + TLS pin, QUIC transport, Salamander obfuscation, path safety, secure delete |
+| `crypto-rs/ffi/`            | `UniFFI` surface exposed to Kotlin, including the report state file, the report writer, the envelope queue and the rescue |
 | `crypto-rs/cli/`            | Offline tooling (identity, decrypt, parity, probe, archive fetch, provenance verify) |
 | `crypto-rs/obfs-proxy/`     | Server-side Salamander de-obfuscation of hostile UDP |
 | `crypto-rs/quic-spike/`     | Throwaway QUIC spike; a workspace member, **not** shipped in the `.so` |
@@ -99,12 +110,14 @@ signature happens outside Rust**, and there is no hidden JNI path (post S8c.5,
 | Server operator tampers with blobs                | Yes                  | XChaCha20-Poly1305 tag, AAD binds header + chunk_count v2  |
 | Device seizure (PIN known)                        | No                   | App unlocks; this is the explicit DI path                  |
 | Device seizure (PIN unknown)                      | Partial              | Argon2id 256 MiB × 4 gates the sealed ratchet; ≠ phrase    |
-| Device seizure (wipe button mashed)               | Yes                  | Ratchet file wiped; archive recovers via paper phrase only |
+| Device state extracted (PIN cracked, root)        | Partial              | No past content (no decryption key on the device); closed reports stay frozen. Not covered: the report being recorded and every report opened afterwards can be signed, and the directory written, with no time limit (§4.9, R1/R1b) |
+| Device seizure (wipe button mashed)               | Yes                  | Live report writer aborted; ratchet, report state, queue key, queues and rescue copies wiped; archive recovers via paper phrase only. Exports made through the system file picker are out of reach |
+| Server operator adds, swaps or drops report objects | Partial            | Closed report: the `0x09` manifest fixes the set and the rescue excludes and reports any deviation. Never-closed report: objects verified one by one by their stored `write_sig`, end not certified. Withholding a whole report is undetectable with one relay |
 | Attacker replays a captured verify signature      | Yes                  | Nonce atomic-pop + ±30 s timestamp skew (S9-pre-audit pt2) |
 | Attacker truncates a CHUNKED blob at rest         | Yes                  | AAD binds `chunk_count` (STRM CHUNKED, V2/V3)             |
-| Attacker forges a self-addressed STRM blob        | **Partial** — §6.1   | `crypto_box_seal` gates recipient-side; V3 carries no author at rest (field removed) |
+| Attacker forges a self-addressed STRM blob        | **Partial** — §6.1   | `crypto_box_seal` gates recipient-side; V3 carries no author at rest (field removed). Such a blob is excluded from the verified testimony unless a `write_sig` or closure under the re-derived report key covers it; legacy objects stored without a signature are kept apart as unverifiable |
 | Cold-boot RAM dump of locked device               | Best-effort          | `zeroize` on secrets, `mlock` on the `LockedSecret` types only; the ratchet's 50 private keys are a bare array, zeroized on drop but never `mlock`ed (scoped decision: Android swaps to zram, not to disk). FLAG_SECURE on screens |
-| JIT retention of wiped secrets                    | Best-effort          | `zeroize` at the call sites **and** a hand-written `impl Drop` on each secret-bearing type (`EphemeralRatchet`, `EnrollmentKit`, `SecretBytes`, `LockedSecret`); the discipline is real, but it is written by hand, with exactly one `#[derive(ZeroizeOnDrop)]` in the tree (`core/src/bip39.rs`). Audit the `Drop` impls, not the derive |
+| JIT retention of wiped secrets                    | Best-effort          | `zeroize` at the call sites **and** a hand-written `impl Drop` on each secret-bearing type (`EphemeralRatchet`, `EnrollmentKit`, `SecretBytes`, `LockedSecret`); the discipline is real, but it is mostly written by hand. `#[derive(ZeroizeOnDrop)]` appears on the BIP-39 mnemonic (`core/src/bip39.rs`) and on the report types (the chain link and directory seed in `core/src/report/chain.rs`; the writer's object records, prepared objects and prepared closures in `core/src/report/writer.rs`; envelope fields and trailers in `stream/src/envelope.rs`). The report writer's signing key is an `ed25519_dalek::SigningKey`, wiped by that crate on drop. Audit both the `Drop` impls and the derives |
 | Compiler/linker inserts wipe-avoiding optimisation| Best-effort          | `zeroize` with compiler fences; gates via cargo-fuzz       |
 
 The V2 design explicitly does **not** try to protect against an attacker
@@ -149,7 +162,17 @@ Exact UTF-8 bytes — **never change these strings**:
 * `"stream.report.id.v1"`                — domain prefix hashed **directly by
   SHA-256**, not an HKDF context: `report_id = SHA-256(ctx ‖ report_pk)[..16]`
 * `"stream.report.directory.v1"`         — directory report
-* `"stream.report.directory.entry.v1"`   — directory entry names
+* `"stream.report.directory.entry.v1"`   — directory entry names (legacy indices)
+* `"stream.report.chain.v2.root"`        — chain root `C_0` from `report_master`
+* `"stream.report.chain.v2.next"`        — `C_{i+1}` from `C_i`
+* `"stream.report.chain.v2.key"`         — report `i` signing seed from `C_i`
+* `"stream.report.chain.v2.directory-entry"` — report `i` directory entry name (16 bytes)
+* `"stream.report.chain.v2.ots-name"`    — report `i` timestamp proof name (16 bytes)
+* `"frappuccino-report-state-v2"`        — not HKDF: the AAD under which the report
+  state file is sealed with the PIN-session key
+
+All of these are pinned by `core/tests/hkdf_contexts_lockstep.rs`; the chained
+derivation is also pinned end to end by `core/tests/report_chain_kat.rs`.
 
 ### 4.3 Identity derivation
 
@@ -255,8 +278,9 @@ Fixtures: `crypto-rs/parity-vectors/identity/derive.json`.
   `0x01 ‖ nonce_bytes ‖ timestamp_BE_u64` (**41** bytes) via the ratchet. The
   leading byte is the domain-separation tag (audit R-C-1); every signing context
   in the system has one, and the relay mirrors them byte-identically. The
-  complete frozen set of eight tags, including the reserved-but-retired 0x04,
-  0x05 and 0x06, lives in `crypto-rs/core/src/signature_domain.rs`.
+  complete frozen set of nine tags, including the reserved-but-retired 0x04,
+  0x05 and 0x06 and the report tags 0x07 (create), 0x08 (write) and 0x09
+  (close), lives in `crypto-rs/core/src/signature_domain.rs`.
 * `/auth/v2/verify` enforces `|now - timestamp| ≤ 30 s` + atomic
   nonce pop (S9-pre-audit pt2, post-audit replay window = 30 s worst-case).
 
@@ -265,6 +289,54 @@ Fixtures: `crypto-rs/parity-vectors/identity/derive.json`.
 `crypto_box_seal` = pure-Rust `crypto_box` + `blake2`. Ephemeral key
 generated per-seal; nonce deterministic = `Blake2b(epk ‖ pk, 24)`. No
 RNG state shared between blobs.
+
+### 4.9 Reports: chain, closure, queue envelope
+
+Source of truth: `crypto-rs/core/src/report.rs` and `core/src/report/`
+(derivation, writer, manifest, verification, rescue), `crypto-rs/stream/src/envelope.rs`
+(queue envelope), `crypto-rs/ffi/src/{report_state,report_writer,envelopes,rescue}.rs`.
+
+* **One index space, two schemes.** Indices below the migration point `k` are
+  legacy (`report_sk_n = HKDF(report_master, "stream.report.key.v1" ‖ u32_be(n))`);
+  indices from `k` on are chained (`C_0 = HKDF(report_master, root)`,
+  `C_{i+1} = HKDF(C_i, next)`, report `i` key from `HKDF(C_i, key)`). `k = 0` on a
+  fresh enrollment. `report_id = SHA-256("stream.report.id.v1" ‖ report_pk)[..16]`
+  for both.
+* **Device state** = `0x02 ‖ u32_be(i) ‖ C_i(32) ‖ directory_seed(32)`, sealed with
+  the PIN-session key under AAD `"frappuccino-report-state-v2"`, owned by Rust
+  (`report_state.bin`). Every transition runs under one process-wide lock; opening
+  report `i` replaces `C_i` by `C_{i+1}` and hands out the writer **only after** the
+  advanced state is durably written. Migration walks `k` steps and refuses
+  `k > 1 000 000`.
+* **Object names**: `format!("{seq:06}.strm")`, `seq ∈ [0, 999 999]` = capture order
+  (seq 0 = metadata JSON, mandatory first; gaps allowed). `manifest` is reserved.
+* **Manifest** = `"FQM1" ‖ u32_be(count) ‖ count × (u32_be(seq) ‖ sha256(blob))`,
+  strictly increasing `seq`; `seq_limit = last seq + 1` (0 for count 0). A chained
+  closure never has count 0; a legacy closure always does.
+* **Closure signature** `0x09`: `report_id(16) ‖ u32_be(seq_limit) ‖ sha256(manifest)(32)`.
+  After a successful close the writer wipes its key and every later call fails.
+* **Queue envelope** (local file, never sent as such): `payload ‖
+  nonce(24) ‖ XChaCha20-Poly1305(trailer) ‖ u32_be(sealed_len) ‖ "FQE1"`, trailer AAD
+  `"FQE1" ‖ u64_be(payload_len)`,
+  queue key 32 random bytes (Android Keystore-wrapped, installed into a Rust global).
+  The trailer carries kind, `report_id`, `report_pk`, the main signature, the
+  `create_sig` (or zeros), `seq_limit`, the relay name, the payload length and hash.
+  Before any send Rust decrypts it, re-hashes the payload, checks
+  `report_id = H(pk)` and the signature; any failure is `envelope_corrupt`, never
+  re-signed, never sent. The decoder and the footer framing have Kani harnesses and
+  a proptest (`stream/tests/proptest_envelope.rs`).
+* **Rescue** verifies under the `report_pk` it **re-derives** (the `report_id` is
+  recomputed, never received): `verify_write`, `verify_close`, strict manifest parser.
+
+**Not covered** (stated as guarantees, detail in
+`docs/ACCEPTED_RESIDUALS_2026-06-28.md`): an extraction of the state at `t` can sign
+the report being recorded at `t` and every report opened after `t` (the chain is
+deterministic so the phrase alone finds every report), and write to or close the
+directory, whose key is persistent (R1, R1b); a report whose key is lost before its
+closure is written stays open, its end uncertified (R2); migrated devices keep the
+exposure of a `report_master` extracted before the update (R3). There is no
+Tamarin or TLA+ model of the report scheme; it is covered by unit tests, KATs and
+the relay's pytest suite.
 
 ## 5. External contracts
 
@@ -297,11 +369,16 @@ field was **removed** from the STRM header in V3 (`VERSION_CURRENT =
 rest. The field was dead (never used to decrypt, no consumer anywhere),
 so this is a pure removal, not a feature loss.
 
-**Residual (unchanged, by design)**: a blind relay can still fabricate
-self-addressed blobs (it knows the recipient's x25519 pk, published at
-enrollment) — but they now carry **no identity** at all. The practical
-impact is "spam in the archive," not data compromise; confidentiality is
-preserved (`crypto_box_seal`).
+**Residual (narrowed by signing at production)**: a blind relay can still
+fabricate self-addressed blobs (it knows the recipient's x25519 pk, published at
+enrollment) — but they carry **no identity** at all, and they no longer enter
+the verified testimony: the rescue accepts an object only if a `write_sig`
+(`0x08`) or the report's closure (`0x09`) covers it, under the report key
+re-derived from the phrase. What remains is the legacy objects stored before the
+relay kept signatures, which nothing authenticates but their decryption; the
+rescue keeps them apart, in a "not verifiable" section (R3b in
+`docs/ACCEPTED_RESIDUALS_2026-06-28.md`). Confidentiality is preserved
+(`crypto_box_seal`).
 
 **Status**: the deferred "sign the author" question is moot — there is no
 author field left to sign. Legacy V1/V2 blobs retain the field read-only.
@@ -348,7 +425,9 @@ Every merge to `main` must pass:
   changes to `crypto-rs/` (not on every merge — check the workflow's triggers
   before relying on that). They are the most verifiable thing in this repository,
   which is why they belong in the entry brief rather than an appendix:
-  * **Kani** (bounded model checking) — 5 harnesses over the real parser code,
+  * **Kani** (bounded model checking) — 8 harnesses over the real parser code (the
+    three newest on the queue envelope; the last dated run in `docs/KANI_PROOFS.md`
+    verifies all eight),
     `crypto-rs/run-kani.sh`, which asserts the harness *count* so a proof cannot
     quietly stop existing.
   * **Tamarin** (Dolev-Yao) — `crypto-rs/core/proofs/RatchetProtocol.spthy`.
@@ -395,6 +474,8 @@ Additional gates for the audit window:
 | `crypto_box_seal`    | `core/src/seal.rs` unit (roundtrip + tamper)             |
 | STRM blob            | `stream/tests/parity_strm.rs` + `decrypt_malformed` + `header_errors` |
 | Server protocol      | `stream/tests/parity_protocol.rs` byte-exact request bodies    |
+| Reports (chain, writer, closure, rescue) | `core/src/report/*` unit tests + `core/tests/report_chain_kat.rs` (frozen vectors, mirrored by `server/tests/test_report_close_kat.py`) + `ffi/src/{report_state,report_writer,rescue}.rs` unit tests |
+| Queue envelope       | `stream/src/envelope.rs` unit tests + `stream/tests/proptest_envelope.rs` + Kani harnesses in `stream/src/kani_proofs.rs` |
 | Relay live E2E       | `stream/tests/e2e_protocol.rs` `#[ignore]` against Vultr       |
 | UDL surface          | `ffi/src/lib.rs` unit tests — NOT one per exposed function, the coverage is partial and deliberately so; read the UDL for the surface and this file for what is exercised |
 | Fuzz (libfuzzer)     | `crypto-rs/fuzz/` — 4 targets, smoke-tested on Vultr           |

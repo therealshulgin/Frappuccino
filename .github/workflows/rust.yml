@@ -52,6 +52,16 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --locked
 
+      # The two workspace steps above build the stream crate WITH `legacy-strm`:
+      # the CLI enables it, and Cargo unifies features across the build graph.
+      # So the configuration the Android .so actually ships (V3 only) was never
+      # exercised there. This step builds and tests the stream crate on its own,
+      # in exactly that configuration.
+      - name: cargo clippy + test (stream crate alone, the shipped V3-only configuration)
+        run: |
+          cargo clippy -p frappuccino-crypto-stream --all-targets --locked -- -D warnings
+          cargo test -p frappuccino-crypto-stream --locked
+
       # The legacy STRM decoder (V1/V2) is behind `legacy-strm`, off by default so
       # the shipped .so carries no legacy parsing surface. The four STRM parity
       # fixtures are V1 blobs written by the old Kotlin encoder, and they are the

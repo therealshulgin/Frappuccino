@@ -13,8 +13,8 @@
 //! Scope: the deterministic, raw-bytes-in APIs — i.e. the untrusted-input ->
 //! marshalling -> Rust-parse surface flagged by audits 8.1: bip39 validate,
 //! identity from public keys, ratchet deserialize round-trip, pin-store open,
-//! archive identity from mnemonic. (Randomised APIs like `strm_encrypt` /
-//! `pin_store_seal` need a round-trip oracle — a follow-up corpus mode.)
+//! archive identity from mnemonic. (Randomised APIs, such as the report
+//! writer's seals, need a round-trip oracle — a follow-up corpus mode.)
 //!
 //! Usage: `frappuccino-difffuzz-dump [seed] [cases_per_api] > corpus.jsonl`
 
@@ -86,6 +86,12 @@ fn err_repr(e: &FfiError) -> (&'static str, String) {
         FfiError::Network { detail } => ("Network", detail.clone()),
         FfiError::Internal { detail } => ("Internal", detail.clone()),
         FfiError::Io { detail } => ("Io", detail.clone()),
+        FfiError::WriterClosed => ("WriterClosed", String::new()),
+        FfiError::WriterBusy => ("WriterBusy", String::new()),
+        FfiError::NoQueueKey => ("NoQueueKey", String::new()),
+        FfiError::EnvelopeCorrupt { detail } => ("EnvelopeCorrupt", detail.clone()),
+        FfiError::ReportRefused { detail } => ("ReportRefused", detail.clone()),
+        FfiError::RateLimited { retry_after_secs } => ("RateLimited", retry_after_secs.to_string()),
     }
 }
 

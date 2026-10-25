@@ -37,11 +37,12 @@ frappuccino-crypto-stream = { path = "../stream" }
 # Exact versions pinned per Rust_guidelines.md.
 uniffi    = { version = "=0.28.3", features = ["cli"] }
 thiserror = "=1.0.69"
-# Phase 6.1.4-C — Zeroizing<Vec<u8>> pour le plaintext lu depuis disk
-# dans strm_encrypt_file (wipe au drop, résiste aux optims LLVM).
+# Zeroizing buffers (wiped on drop) for the secrets the FFI reads or holds:
+# plaintext read from disk or decrypted, the upload bearer, serialized ratchet
+# state, a timestamp ticket's content in clear.
 zeroize   = { version = "=1.8.2" }
-# Phase C — streaming SHA-256 of the .strm chunk in upload_put_report_chunk
-# (byte-identical to the relay's hasher; ciphertext, so no Zeroizing needed).
+# SHA-256 of objects (plaintext and encrypted) for the write signatures, the
+# closure manifest and the rescue's checks; byte-identical to the relay's.
 sha2      = "=0.10.9"
 
 [build-dependencies]

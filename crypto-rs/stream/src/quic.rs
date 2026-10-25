@@ -38,11 +38,14 @@
 //! actually died ([`reset_quic_client_if_dead`]) — a transient per-stream error
 //! never evicts the connection the other concurrent workers are using.
 
+use crate::file_range::{FileRange, FileRangeReader, RangeFailure};
 use crate::pin::PinnedCertVerifier;
 use crate::salamander_socket::SalamanderSocket;
-use crate::upload::{elapsed_ms, PutResult};
+use crate::transport::{Method, OutgoingRequest};
+use crate::upload::{elapsed_ms, response_tag, PutResult, REFUSAL_BODY_CAP};
 use quinn::crypto::rustls::QuicClientConfig;
 use std::fmt;
+use std::io::Read as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
@@ -69,14 +72,14 @@ const OBF_QUIC_PORT: u16 = 8445;
 /// The pinned QUIC endpoint to reach: host (for SNI + pin host-check), UDP port,
 /// and the base64 SPKI SHA-256 pin of its cert. Production uses
 /// [`prod_target`]; the local integration test injects 127.0.0.1 + its self-
-/// signed cert's pin via [`put_chunk_quic_to`].
+/// signed cert's pin via [`send_quic_to`].
 #[derive(Clone)]
 pub struct QuicTarget {
     /// Host for the TLS SNI and the pin's host-check. A DOMAIN in prod since
     /// the 2026-06-27 migration (`prod_target` sets `pin::PINNED_HOST`), not an
     /// IP literal as this line used to say. The name goes out in the
-    /// ClientHello: under the Salamander XOR on this UDP path, in clear on the
-    /// DirectTls control plane.
+    /// `ClientHello`: under the Salamander XOR on this UDP path, in clear on the
+    /// `DirectTls` control plane.
     pub host: String,
     /// UDP port of the HTTP/3 endpoint.
     pub port: u16,
@@ -188,7 +191,7 @@ pub fn quic_is_degraded() -> bool {
 }
 
 /// Latch QUIC as unable to establish. Called only from connection-establishment
-/// failure paths in [`put_chunk_quic_to`].
+/// failure paths in [`send_quic_to`].
 fn mark_quic_degraded() {
     QUIC_DEGRADED.store(true, Ordering::Relaxed);
 }
@@ -263,56 +266,30 @@ fn reset_quic_client_if_dead() {
     }
 }
 
-// `put_chunk_quic` REMOVED (2026-09-03), for the same reason and in the same
-// gesture as `upload::put_chunk`: it was the bearer-only wrapper, its sole caller
-// was the FFI `upload_put_chunk`, and being `pub` it would have gone on being
-// compiled into the shipped .so without a single warning.
-
-/// PUT one already-encrypted `.strm` chunk over HTTP/3 to the production
-/// endpoint, with an arbitrary header list (the QUIC twin of
-/// [`crate::upload::put_chunk_with_headers`]). Phase C relay-blind report chunks
-/// pass the per-report capability headers; `Content-Type` is always added. The
-/// blob is streamed from disk (ciphertext, no plaintext). Never panics — every
-/// failure maps to a [`PutResult`] with `http_status == 0` and a machine tag.
-pub fn put_chunk_quic_with_headers(
-    url: &str,
-    blob_path: &str,
-    headers: &[(&str, &str)],
-) -> PutResult {
-    put_chunk_quic_to_with_headers(&prod_target(), url, blob_path, headers)
+/// Send one relay write over HTTP/3 to the production endpoint, the QUIC leg
+/// of [`crate::transport::send`].
+pub fn send_quic(request: &OutgoingRequest<'_>) -> PutResult {
+    send_quic_to(&prod_target(), request)
 }
 
-/// [`put_chunk_quic_with_headers`] against an explicit target — production passes
-/// [`prod_target`]; the local h3 integration test passes 127.0.0.1 + its test
-/// cert's pin.
-pub fn put_chunk_quic_to(
-    target: &QuicTarget,
-    url: &str,
-    bearer: &str,
-    blob_path: &str,
-) -> PutResult {
-    put_chunk_quic_to_with_headers(target, url, blob_path, &[("authorization", bearer)])
-}
-
-/// [`put_chunk_quic_to`] generalized to an arbitrary header list. The request
-/// path is taken from `url`; the scheme/authority are the target's (so the relay
-/// base URL the worker already builds is reused verbatim, while the QUIC
-/// endpoint's own address/pin live here).
-pub fn put_chunk_quic_to_with_headers(
-    target: &QuicTarget,
-    url: &str,
-    blob_path: &str,
-    headers: &[(&str, &str)],
-) -> PutResult {
+/// [`send_quic`] against an explicit target. The request path is taken from
+/// the URL; the scheme and authority are the target's. The body is streamed
+/// from its file range in [`CHUNK`]-sized slices (never loaded whole) and,
+/// when the range carries an expected hash, re-hashed as it goes: on a
+/// mismatch the request stream is reset before its last bytes, so the relay
+/// never receives the body whole.
+///
+/// Local problems (`bad_url`, the [`RangeFailure`] tags) are reported before
+/// any network activity, or by their own tag if they occur mid-body, and never
+/// latch QUIC as degraded. Every failure is a [`PutResult`], none is raised.
+pub fn send_quic_to(target: &QuicTarget, request: &OutgoingRequest<'_>) -> PutResult {
     let started = Instant::now();
-
-    // Missing / empty blob = a concurrent worker already uploaded + secure-
-    // deleted it (mirrors the DirectTls `file_missing` path → caller treats it
-    // as success). The body is ciphertext, so a plain read is fine.
-    let body = match std::fs::read(blob_path) {
-        Ok(b) if !b.is_empty() => bytes::Bytes::from(b),
-        _ => return PutResult::failed("file_missing", started),
+    let method = match request.method {
+        Method::Put => http::Method::PUT,
+        Method::Post => http::Method::POST,
     };
+    let url = request.url;
+    let headers = request.headers;
 
     // Reuse the path from the relay URL; the authority is the QUIC endpoint's.
     let path = match url.parse::<http::Uri>() {
@@ -324,6 +301,10 @@ pub fn put_chunk_quic_to_with_headers(
     let endpoint_uri: http::Uri = match format!("https://{}{}", target.authority(), path).parse() {
         Ok(u) => u,
         Err(_) => return PutResult::failed("bad_url", started),
+    };
+    let mut body = match request.body.map(FileRange::open).transpose() {
+        Ok(body) => body,
+        Err(failure) => return PutResult::failed(failure.tag(), started),
     };
 
     let Some(rt) = rt() else {
@@ -339,9 +320,10 @@ pub fn put_chunk_quic_to_with_headers(
             Err(tag) => {
                 // Connection establishment failed (handshake / connect / verify)
                 // — the UDP-blocked-network or endpoint-down case. Latch so the
-                // next chunks skip QUIC; the FFI dispatch falls THIS one back to
-                // DirectTls (a per-stream `do_put` error below does NOT latch —
-                // the connection is fine for the other concurrent workers).
+                // next chunks skip QUIC; the dispatch (`transport::send`) falls
+                // THIS one back to DirectTls (a per-stream `do_request` error
+                // below does NOT latch — the connection is fine for the other
+                // concurrent workers).
                 mark_quic_degraded();
                 return PutResult::failed(tag, started);
             }
@@ -356,15 +338,15 @@ pub fn put_chunk_quic_to_with_headers(
         let transfer_started = Instant::now();
         match tokio::time::timeout(
             CALL_TIMEOUT,
-            do_put(send_request, endpoint_uri, headers, body),
+            do_request(send_request, method, endpoint_uri, headers, body.as_mut()),
         )
         .await
         {
-            Ok(Ok(status)) => PutResult {
+            Ok(Ok((status, body_head))) => PutResult {
                 http_status: status,
                 upload_ms: elapsed_ms(started),
                 transfer_ms: elapsed_ms(transfer_started),
-                error_detail: None,
+                error_detail: response_tag(status, &body_head),
             },
             Ok(Err(tag)) => {
                 // Mid-call failure: rebuild ONLY if the connection actually died
@@ -446,7 +428,7 @@ async fn build_connection(target: &QuicTarget) -> Result<QuicConn, &'static str>
         Some(psk) => {
             // Phase 3b — Salamander obfs: wrap quinn's default socket so every
             // datagram is XOR-scrambled under QUIC. We're inside the tokio
-            // runtime (rt.block_on in put_chunk_quic_to), so wrap_udp_socket is
+            // runtime (rt.block_on in send_quic_to), so wrap_udp_socket is
             // valid here.
             let std_sock = std::net::UdpSocket::bind(bind).map_err(|_| "endpoint")?;
             let runtime: std::sync::Arc<dyn quinn::Runtime> =
@@ -488,18 +470,22 @@ async fn build_connection(target: &QuicTarget) -> Result<QuicConn, &'static str>
     })
 }
 
-/// Send the request head + body, await the response head, drain the response
-/// body. Returns the HTTP status. Every step maps failure to a short tag.
-async fn do_put(
+/// Send the request head and the body (if any), await the response head,
+/// drain the response body. Returns the HTTP status and, for a 409, the first
+/// [`REFUSAL_BODY_CAP`] bytes of the body (empty otherwise). Every step maps
+/// failure to a short tag; a local failure of the body reader resets the
+/// request stream and returns the reader's own tag.
+async fn do_request(
     mut send_request: H3SendRequest,
+    method: http::Method,
     uri: http::Uri,
     headers: &[(&str, &str)],
-    body: bytes::Bytes,
-) -> Result<u16, &'static str> {
-    let mut builder = http::Request::builder()
-        .method(http::Method::PUT)
-        .uri(uri)
-        .header(http::header::CONTENT_TYPE, "application/octet-stream");
+    body: Option<&mut FileRangeReader>,
+) -> Result<(u16, Vec<u8>), &'static str> {
+    let mut builder = http::Request::builder().method(method).uri(uri);
+    if body.is_some() {
+        builder = builder.header(http::header::CONTENT_TYPE, "application/octet-stream");
+    }
     for (name, value) in headers {
         builder = builder.header(*name, *value);
     }
@@ -518,14 +504,33 @@ async fn do_put(
     // JWT, 507 -> disk-full breaker). Only if the response read ALSO fails is it
     // a true transport error.
     let mut send_failed = false;
-    let mut off = 0;
-    while off < body.len() {
-        let end = (off + CHUNK).min(body.len());
-        if stream.send_data(body.slice(off..end)).await.is_err() {
-            send_failed = true;
-            break;
+    if let Some(reader) = body {
+        let mut slice = vec![0u8; CHUNK];
+        loop {
+            let read = match reader.read(&mut slice) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    // The file changed or failed under us: abort the request
+                    // so the relay never sees the body whole.
+                    stream.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+                    return Err(reader.failure().map_or("body_read", RangeFailure::tag));
+                }
+            };
+            let Some(filled) = slice.get(..read) else {
+                stream.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+                return Err("body_read");
+            };
+            if stream
+                .send_data(bytes::Bytes::copy_from_slice(filled))
+                .await
+                .is_err()
+            {
+                send_failed = true;
+                break;
+            }
         }
-        off = end;
     }
     if !send_failed && stream.finish().await.is_err() {
         send_failed = true;
@@ -541,10 +546,22 @@ async fn do_put(
     let status = resp.status().as_u16();
 
     // Drain the response body so the stream completes cleanly (best-effort: the
-    // status is already decided).
-    while let Ok(Some(_)) = stream.recv_data().await {}
+    // status is already decided). A 409 keeps the start of its body, which
+    // tells the closure refusal apart from the other conflicts.
+    let keep = if status == 409 { REFUSAL_BODY_CAP } else { 0 };
+    let mut body_head = Vec::new();
+    while let Ok(Some(mut data)) = stream.recv_data().await {
+        use bytes::Buf as _;
+        while data.has_remaining() {
+            let part = data.chunk();
+            let room = keep.saturating_sub(body_head.len());
+            body_head.extend_from_slice(part.get(..room.min(part.len())).unwrap_or_default());
+            let read = part.len();
+            data.advance(read);
+        }
+    }
 
-    Ok(status)
+    Ok((status, body_head))
 }
 
 /// rustls + quinn client config: TLS 1.3 (QUIC requires it), the per-transport
@@ -614,9 +631,20 @@ fn resolve(host: &str, port: u16) -> Result<SocketAddr, &'static str> {
 
 #[cfg(all(test, feature = "quic"))]
 mod tests {
-    use super::{put_chunk_quic_to, quic_is_degraded, reset_quic_client, QuicTarget};
+    use super::{quic_is_degraded, reset_quic_client, send_quic_to, QuicTarget};
+    use crate::file_range::FileRange;
+    use crate::transport::{Method, OutgoingRequest};
+    use crate::upload::{PutResult, REPORT_CLOSED_TAG};
     use std::sync::mpsc;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+    /// The QUIC connection and the degraded latch are process-global, so the
+    /// tests that drive them run one at a time.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    fn serial() -> MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 
     /// Self-sign a throwaway cert for 127.0.0.1; return (cert DER, key DER, the
     /// base64 SPKI pin the client must use). The pin is computed via the crate's
@@ -654,7 +682,7 @@ mod tests {
 
     /// Spawn the h3 server on its own current-thread runtime + OS thread and
     /// return the bound port + the cert pin. Responds 500 to any path containing
-    /// "fail500", else 200 (proves the status flows through `do_put`).
+    /// "fail500", else 200 (proves the status flows through `do_request`).
     fn spawn_server(obfs_psk: Option<Vec<u8>>) -> (u16, String) {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -742,6 +770,28 @@ mod tests {
         }
     }
 
+    /// PUT the whole file at `blob_path` with a bearer, through the
+    /// production send path. A missing file goes through as a one-byte range,
+    /// so the send path itself reports it.
+    fn put_chunk_quic_to(
+        target: &QuicTarget,
+        url: &str,
+        bearer: &str,
+        blob_path: &str,
+    ) -> PutResult {
+        let body = FileRange::whole_non_empty_file(blob_path)
+            .unwrap_or_else(|| FileRange::new(blob_path, 0, 1, None));
+        send_quic_to(
+            target,
+            &OutgoingRequest {
+                method: Method::Put,
+                url,
+                headers: &[("authorization", bearer)],
+                body: Some(&body),
+            },
+        )
+    }
+
     fn write_blob(name: &str, len: usize) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(name);
         std::fs::write(&path, vec![0x5Au8; len]).expect("write blob");
@@ -750,6 +800,7 @@ mod tests {
 
     #[test]
     fn quic_put_roundtrip_status_reset_and_concurrency() {
+        let _serial = serial();
         let (port, pin) = spawn_server(None);
         let target = QuicTarget {
             host: "127.0.0.1".to_string(),
@@ -905,6 +956,231 @@ mod tests {
         );
         reset_quic_client();
 
+        let _ = std::fs::remove_file(&blob);
+    }
+
+    /// What the recording server saw of one request: method, path, body, and
+    /// whether the body ended cleanly.
+    type Seen = Arc<Mutex<Vec<(String, String, Vec<u8>, bool)>>>;
+
+    /// An h3 server that records every request and answers 200 to each one
+    /// whose body arrived whole.
+    fn spawn_recording_server() -> (u16, String, Seen) {
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("server rt");
+            rt.block_on(async move {
+                let (cert_der, key_der, pin) = gen_cert();
+                let endpoint = quinn::Endpoint::server(
+                    server_config(cert_der, key_der),
+                    "127.0.0.1:0".parse().unwrap(),
+                )
+                .expect("server endpoint");
+                tx.send((endpoint.local_addr().expect("addr").port(), pin))
+                    .expect("send port");
+                while let Some(incoming) = endpoint.accept().await {
+                    let recorder = Arc::clone(&recorder);
+                    tokio::spawn(async move {
+                        if let Ok(conn) = incoming.await {
+                            serve_recording(conn, recorder).await;
+                        }
+                    });
+                }
+            });
+        });
+        let (port, pin) = rx.recv().expect("server port");
+        (port, pin, seen)
+    }
+
+    async fn serve_recording(conn: quinn::Connection, seen: Seen) {
+        use bytes::Buf as _;
+        let Ok(mut h3c) =
+            h3::server::Connection::<_, bytes::Bytes>::new(h3_quinn::Connection::new(conn)).await
+        else {
+            return;
+        };
+        while let Ok(Some(resolver)) = h3c.accept().await {
+            let seen = Arc::clone(&seen);
+            tokio::spawn(async move {
+                let Ok((req, mut stream)) = resolver.resolve_request().await else {
+                    return;
+                };
+                let mut body = Vec::new();
+                let complete = loop {
+                    match stream.recv_data().await {
+                        Ok(Some(mut data)) => {
+                            while data.has_remaining() {
+                                let part = data.chunk();
+                                body.extend_from_slice(part);
+                                let read = part.len();
+                                data.advance(read);
+                            }
+                        }
+                        Ok(None) => break true,
+                        Err(_) => break false,
+                    }
+                };
+                seen.lock().unwrap().push((
+                    req.method().to_string(),
+                    req.uri().path().to_string(),
+                    body,
+                    complete,
+                ));
+                if complete {
+                    let path = req.uri().path();
+                    let (code, body): (u16, &'static [u8]) = match path {
+                        "/file/r/closed" => (409, br#"{"detail":"Report closed"}"#),
+                        "/file/r/conflict" => (
+                            409,
+                            br#"{"detail":"Chunk already stored with different content"}"#,
+                        ),
+                        _ => (200, b""),
+                    };
+                    let resp = http::Response::builder()
+                        .status(code)
+                        .body(())
+                        .expect("resp");
+                    let _ = stream.send_response(resp).await;
+                    if !body.is_empty() {
+                        let _ = stream.send_data(bytes::Bytes::from_static(body)).await;
+                    }
+                    let _ = stream.finish().await;
+                }
+            });
+        }
+    }
+
+    fn sha256(bytes: &[u8]) -> [u8; 32] {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(bytes).into()
+    }
+
+    #[test]
+    fn quic_tags_only_the_closure_refusal() {
+        let _serial = serial();
+        reset_quic_client();
+        let (port, pin, _seen) = spawn_recording_server();
+        let target = QuicTarget {
+            host: "127.0.0.1".to_string(),
+            port,
+            pins: vec![pin],
+            obfs_psk: None,
+        };
+        let blob = write_blob("frap_quic_refusal.fqe", 1000);
+        let body = FileRange::new(&blob, 0, 1000, None);
+        for (name, status, tag) in [
+            ("closed", 409, Some(REPORT_CLOSED_TAG)),
+            ("conflict", 409, None),
+            ("fine", 200, None),
+        ] {
+            let url = format!("https://relay/file/r/{name}");
+            let r = send(&target, Method::Put, &url, &[], &body);
+            assert_eq!(r.http_status, status, "{name}: {:?}", r.error_detail);
+            assert_eq!(r.error_detail.as_deref(), tag, "{name}");
+        }
+        reset_quic_client();
+        let _ = std::fs::remove_file(&blob);
+    }
+
+    fn send<'a>(
+        target: &QuicTarget,
+        method: Method,
+        url: &'a str,
+        headers: &'a [(&'a str, &'a str)],
+        body: &'a FileRange,
+    ) -> crate::upload::PutResult {
+        send_quic_to(
+            target,
+            &OutgoingRequest {
+                method,
+                url,
+                headers,
+                body: Some(body),
+            },
+        )
+    }
+
+    #[test]
+    fn quic_streams_a_body_range_and_never_completes_a_changed_one() {
+        let _serial = serial();
+        reset_quic_client();
+        let (port, pin, seen) = spawn_recording_server();
+        let target = QuicTarget {
+            host: "127.0.0.1".to_string(),
+            port,
+            pins: vec![pin],
+            obfs_psk: None,
+        };
+        let data: Vec<u8> = (0u8..=255).cycle().take(300_000).collect();
+        let blob = write_blob("frap_quic_range.fqe", 0);
+        std::fs::write(&blob, &data).unwrap();
+
+        // A POST of a range in the middle of the file, hash-checked.
+        let range = FileRange::new(&blob, 1000, 200_000, Some(sha256(&data[1000..201_000])));
+        let headers = [("X-Report-Close-Seq-Limit", "4")];
+        let r = send(
+            &target,
+            Method::Post,
+            "https://relay/close/abc",
+            &headers,
+            &range,
+        );
+        assert_eq!(r.http_status, 200, "{:?}", r.error_detail);
+        {
+            let seen = seen.lock().unwrap();
+            let (method, path, body, complete) = seen.last().unwrap();
+            assert_eq!((method.as_str(), path.as_str()), ("POST", "/close/abc"));
+            assert!(complete);
+            assert_eq!(body.as_slice(), &data[1000..201_000]);
+        }
+
+        // The same range against a hash it no longer has: reset before the
+        // last bytes, reported locally, and the relay never gets it whole.
+        let changed = FileRange::new(&blob, 1000, 200_000, Some([0u8; 32]));
+        let r = send(
+            &target,
+            Method::Put,
+            "https://relay/file/r/changed",
+            &[],
+            &changed,
+        );
+        assert_eq!(r.http_status, 0);
+        assert_eq!(r.error_detail.as_deref(), Some("body_mismatch"));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let arrived_whole = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, path, _, complete)| path == "/file/r/changed" && *complete);
+        assert!(!arrived_whole, "a changed body must never arrive whole");
+
+        // Local problems are reported before any request.
+        let before = seen.lock().unwrap().len();
+        let missing = FileRange::new("/no/such/frap/blob", 0, 1, None);
+        let r = send(
+            &target,
+            Method::Put,
+            "https://relay/file/r/missing",
+            &[],
+            &missing,
+        );
+        assert_eq!(r.error_detail.as_deref(), Some("file_missing"));
+        let short = FileRange::new(&blob, 299_999, 2, None);
+        let r = send(
+            &target,
+            Method::Put,
+            "https://relay/file/r/short",
+            &[],
+            &short,
+        );
+        assert_eq!(r.error_detail.as_deref(), Some("body_short"));
+        assert_eq!(seen.lock().unwrap().len(), before);
+        reset_quic_client();
         let _ = std::fs::remove_file(&blob);
     }
 }

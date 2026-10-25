@@ -29,9 +29,14 @@ exposer de secret en cas de saisie.
   exposé à Kotlin via **UniFFI**.
 - **Identité** dérivée d'une phrase **BIP-39 (12 mots FR)** → Ed25519 (signature) +
   X25519 (ECDH), style libsodium. Paper backup = la phrase.
-- **Forward secrecy** : batch ratchet (50 clés éphémères / batch), rotation auto.
-- **Conteneur STRM v2** : magic + version + author + sealed + mode + body, AAD
-  anti-troncature, binding `chunk_count`, nonce anti-réordonnancement.
+- **Forward security de l'authentification** : batch ratchet (50 clés éphémères / batch), rotation auto.
+- **Conteneur STRM v3** : magic + version + sealed + mode + body (plus d'auteur au
+  repos depuis V3), AAD anti-troncature, binding `chunk_count`, nonce
+  anti-réordonnancement.
+- **Rapports signés à la production et figés à la clôture** : chaque objet signé
+  quand il est produit par une clé propre au rapport, clôture `0x09` sur le
+  manifeste exact, clé effacée ensuite ; le relais refuse tout ajout à un rapport
+  clos.
 - **PIN** : Argon2id (256 MiB × 4) + XChaCha20-Poly1305, fast-reseal (~1,2 s Seeker),
   deny-list anti-bruteforce.
 - **Zéro secret sur le heap JVM** : `SecureWipe` / `Zeroizing`, jamais de String Java
@@ -68,8 +73,13 @@ exposer de secret en cas de saisie.
 
 ### 1.5 Archive mode / récupération
 - Phrase BIP-39 → fingerprint match → **download des streams chiffrés** depuis le
-  relais, manifest JSON + playlist `.m3u`, « tout télécharger » + busy guard +
-  anti-doublon MediaStore.
+  relais, **vérifiés** sous la clé re-dérivée de la phrase avant d'être rangés
+  (statuts par objet et par rapport), « tout vérifier » + busy guard.
+- **Lecture interne** : copies chiffrées dans le stockage privé de l'app, déchiffrées
+  quelques chunks à la fois pendant la lecture, purgées à la fermeture ; **export
+  explicite** et averti par le sélecteur de fichiers du système (la version
+  antérieure écrivait le clair dans `Download/Frappuccino/` avec une playlist
+  `.m3u`, ce n'est plus le cas).
 
 ### 1.6 UX / branding OSINT
 - Wordmark FRAPPUCCINO (typo Coffee Amore), dark rouge `#CC1A1A` / noir, écran REC

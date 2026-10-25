@@ -45,11 +45,14 @@ end-to-end encrypted on-device and uploaded immediately to a **blind relay** tha
 stores only opaque blobs. It holds no key that can decrypt them and cannot read a
 byte of content. The only secret that ever decrypts testimony is derived from a
 twelve-word BIP-39 phrase, shown once and never stored on any machine. After
-enrollment the device can encrypt and sign but can never decrypt its own past:
-authentication uses a ratchet of single-use Ed25519 keys, each wiped right after
-signing, so an adversary who seizes the unlocked phone gets at most a *bounded,
-server-detectable window of future signatures* (every slot use is tracked;
-revocation cuts it off), never past content.
+enrollment the device can encrypt and sign but can never decrypt its own past.
+Authentication uses a ratchet of single-use Ed25519 keys, each wiped right after
+signing. Each recording is signed while it is made, with a key of its own that the
+phone erases when it signs the recording's closure; the relay then refuses anything
+new in it. An adversary who seizes the unlocked phone therefore gets no past
+content and cannot extend a closed recording, but can sign the recording in
+progress and every later one, with no time limit and no alert to the witness;
+there is no revocation route, only re-enrollment under a new phrase.
 
 The threat model and the honest list of what it does **not** protect live
 [on the positioning page](@/positioning.md); this piece is about how the crypto
@@ -147,7 +150,8 @@ guard, the model passes. Pure Java, no WSL.
 ### 3. The real implementation, Kani (bounded model checking)
 
 Tamarin and TLC prove models. Kani proves the *actual Rust that ships*. Five proof
-harnesses in `kani_proofs.rs`:
+harnesses in `kani_proofs.rs` at the time of the run described here (three more, on the
+queue envelope added by the report rework, have joined them since):
 
 - `check_parse_header_rejects_any_grant`: no accepted header carries a grant. The
   multi-recipient section is reserved, not implemented, and this proves the parser

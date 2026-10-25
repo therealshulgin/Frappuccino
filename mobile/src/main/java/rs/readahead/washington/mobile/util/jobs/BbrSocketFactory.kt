@@ -22,8 +22,8 @@ import javax.net.SocketFactory
  * release uploads use the platform default factory and are completely
  * unaffected.
  *
- * Scope: chunk PUTs no longer go through OkHttp — they go through the Rust
- * transport (`uniffi.frappuccino.uploadPutReportChunk`, DIRECT_TLS / OBF_QUIC),
+ * Scope: report uploads no longer go through OkHttp — they go through the Rust
+ * transport (`uniffi.frappuccino.uploadSendEnvelope`, DIRECT_TLS / OBF_QUIC),
  * so this factory no longer sees the testimony-upload sockets at all. What is
  * left on the shared [UploadHttpClient] is the relay `/health` probe and the
  * opt-in provenance timestamp call; the `bbrApply` lines you still see come

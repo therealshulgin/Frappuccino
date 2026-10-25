@@ -1,0 +1,199 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Chaînes des écrans de secours (ArchiveModeActivity, ArchivePlayerActivity,
+  ArchiveDownloadService). Les clés partagées avec des écrans plus anciens
+  (archive_title, archive_warning, archive_close, ...) restent dans strings.xml.
+
+  Les statuts ci-dessous sont ce qu'un témoin lit de son propre témoignage
+  après une perte ou une saisie. Les garder exacts plutôt que rassurants :
+  COMPLET seulement pour un enregistrement clos dont chaque objet a été vérifié ;
+  un rapport jamais clos est INTERROMPU, jamais « complet » ; un objet qui ne se
+  vérifie pas est « exclu », jamais « ignoré ». Un objet legacy stocké sans
+  signature est « non vérifié » partout où il apparaît : gardé à part, jamais
+  dit vérifié, jamais dit exclu non plus.
+-->
+<resources>
+  <!-- Déverrouillage -->
+  <string name="archive_phrase_wrong_count">Phrase invalide : 12 mots attendus (saisis : %1$d).</string>
+  <string name="archive_deriving">Dérivation des clés…</string>
+  <string name="archive_unknown_word">Un mot n\'est pas dans la liste BIP-39 française. Vérifiez l\'orthographe.</string>
+  <string name="archive_invalid_phrase">Phrase BIP-39 invalide : vérifiez les mots et leur ordre.</string>
+  <string name="archive_unlock_failed">La dérivation des clés a échoué.</string>
+  <string name="archive_no_server">Aucune adresse de relais configurée dans les réglages.</string>
+  <string name="archive_unlocked">ARCHIVE DÉVERROUILLÉE</string>
+  <string name="archive_identity_matches">Cette phrase correspond à l\'identité de cet appareil.\n\nTouchez RÉCUPÉRER pour chercher vos rapports sur le relais.</string>
+  <string name="archive_identity_differs">ATTENTION : cette phrase n\'est PAS l\'identité de cet appareil.\nVous allez récupérer les rapports d\'une autre identité.</string>
+  <string name="archive_identity_none">Aucune identité sur cet appareil : archive seule.\n\nTouchez RÉCUPÉRER pour chercher vos rapports sur le relais.</string>
+
+  <!-- Recherche (énumération) -->
+  <string name="archive_retry_btn">RECHERCHER À NOUVEAU</string>
+  <string name="archive_enum_running">Recherche… %1$s, %2$s.</string>
+  <string name="archive_enum_rate_limited">Le relais limite les requêtes : attente d\'environ %1$d s, puis reprise là où la recherche s\'est arrêtée.</string>
+  <string name="archive_enum_complete">Recherche terminée : %1$s.</string>
+  <string name="archive_enum_none">Recherche terminée : aucun rapport trouvé pour cette phrase.</string>
+  <string name="archive_enum_incomplete">Recherche INCOMPLÈTE (%1$s) : %2$s jusqu\'ici. Des rapports peuvent manquer : relancez la recherche avant de conclure quoi que ce soit.</string>
+  <string name="archive_enum_capped">Recherche INCOMPLÈTE : elle a atteint sa limite de sondage avant une suite d\'adresses vides. %1$s jusqu\'à cette limite. Les rapports au-delà n\'ont pas été cherchés, et une nouvelle recherche s\'arrête à la même limite.</string>
+  <string name="archive_enum_cancelled">Recherche arrêtée.</string>
+  <plurals name="archive_enum_probed">
+    <item quantity="one">%d adresse sondée</item>
+    <item quantity="other">%d adresses sondées</item>
+    <item quantity="many">%d adresses sondées</item>
+  </plurals>
+  <plurals name="archive_reports_found">
+    <item quantity="one">%d rapport trouvé</item>
+    <item quantity="other">%d rapports trouvés</item>
+    <item quantity="many">%d rapports trouvés</item>
+  </plurals>
+  <string name="archive_reason_rate_limited">le relais a continué de limiter les requêtes</string>
+  <string name="archive_reason_network">relais injoignable</string>
+  <string name="archive_reason_storage">erreur de stockage sur ce téléphone</string>
+  <string name="archive_reason_refused">requête refusée</string>
+  <string name="archive_reason_probe_cap">limite de sondage atteinte</string>
+  <string name="archive_reason_other">erreur inattendue</string>
+  <string name="archive_anomaly_directory_closed">Anomalie : l\'annuaire des rapports a été clos, par quelqu\'un qui détenait l\'état de cet appareil. Les rapports ouverts ensuite n\'y ont pas d\'entrée ; la recherche a sondé plus loin.</string>
+  <string name="archive_anomaly_directory_closure_invalid">Anomalie : une clôture non valide est enregistrée sur l\'annuaire des rapports. La recherche a sondé plus loin.</string>
+  <string name="archive_anomaly_directory_closure_unchecked">Anomalie : une clôture est enregistrée sur l\'annuaire des rapports, et elle n\'a pas pu être contrôlée. La recherche a sondé plus loin.</string>
+  <string name="archive_anomaly_directory_absent">Pas d\'annuaire des rapports sur le relais : la recherche a sondé une plage plus longue.</string>
+  <string name="archive_anomaly_directory_unreadable">Anomalie : le relais a servi un annuaire des rapports illisible. La recherche a continué sans lui et a sondé une plage plus longue.</string>
+  <plurals name="archive_anomaly_unmatched">
+    <item quantity="one">Anomalie : %d entrée de l\'annuaire ne correspond à aucun de vos rapports.</item>
+    <item quantity="other">Anomalie : %d entrées de l\'annuaire ne correspondent à aucun de vos rapports.</item>
+    <item quantity="many">Anomalie : %d entrées de l\'annuaire ne correspondent à aucun de vos rapports.</item>
+  </plurals>
+  <plurals name="archive_anomaly_unreadable_listings">
+    <item quantity="one">Anomalie : le relais a servi %d liste de rapport illisible. Ce rapport n\'est pas dans la liste ; la recherche a continué au-delà.</item>
+    <item quantity="other">Anomalie : le relais a servi %d listes de rapports illisibles. Ces rapports ne sont pas dans la liste ; la recherche a continué au-delà.</item>
+    <item quantity="many">Anomalie : le relais a servi %d listes de rapports illisibles. Ces rapports ne sont pas dans la liste ; la recherche a continué au-delà.</item>
+  </plurals>
+
+  <!-- Lignes de rapport -->
+  <string name="archive_verify_all_btn">TOUT VÉRIFIER</string>
+  <string name="archive_busy">Le secours travaille déjà, attendez qu\'il ait fini.</string>
+  <string name="archive_report_title">Rapport %1$d</string>
+  <string name="archive_report_subtitle_chain">Signé pendant l\'enregistrement · index %1$d</string>
+  <string name="archive_report_subtitle_legacy">Enregistré avant la mise à jour · index %1$d</string>
+  <plurals name="archive_report_listed">
+    <item quantity="one">%d objet sur le relais, pas encore vérifié.</item>
+    <item quantity="other">%d objets sur le relais, pas encore vérifiés.</item>
+    <item quantity="many">%d objets sur le relais, pas encore vérifiés.</item>
+  </plurals>
+  <string name="archive_status_verifying">Vérification… %1$d / %2$d</string>
+  <string name="archive_status_failed">Vérification interrompue (%1$s). Touchez VÉRIFIER pour réessayer.</string>
+  <string name="archive_status_complete">COMPLET : l\'enregistrement a été clos et chacun de ses objets est vérifié.</string>
+  <string name="archive_status_incomplete">INCOMPLET : l\'enregistrement a été clos, mais certains de ses objets manquent sur le relais.</string>
+  <string name="archive_status_altered">ALTÉRÉ : des objets qui ne sont pas les vôtres ont été trouvés sur le relais. Ils sont exclus.</string>
+  <string name="archive_status_interrupted">INTERROMPU : l\'enregistrement n\'a jamais été clos. Ses objets sont vérifiés un par un ; sa fin n\'est pas certifiée.</string>
+  <string name="archive_status_legacy">Enregistré avant la mise à jour : un objet n\'est vérifié que s\'il porte une signature valide.</string>
+  <string name="archive_status_legacy_frozen">Enregistré avant la mise à jour, figé côté relais : un objet n\'est vérifié que s\'il porte une signature valide.</string>
+  <plurals name="archive_count_verified">
+    <item quantity="one">%d vérifié</item>
+    <item quantity="other">%d vérifiés</item>
+    <item quantity="many">%d vérifiés</item>
+  </plurals>
+  <plurals name="archive_count_missing">
+    <item quantity="one">%d manquant</item>
+    <item quantity="other">%d manquants</item>
+    <item quantity="many">%d manquants</item>
+  </plurals>
+  <plurals name="archive_count_foreign">
+    <item quantity="one">%d étranger (exclu)</item>
+    <item quantity="other">%d étrangers (exclus)</item>
+    <item quantity="many">%d étrangers (exclus)</item>
+  </plurals>
+  <plurals name="archive_count_unexpected">
+    <item quantity="one">%d inattendu (exclu)</item>
+    <item quantity="other">%d inattendus (exclus)</item>
+    <item quantity="many">%d inattendus (exclus)</item>
+  </plurals>
+  <plurals name="archive_count_unexpected_signed">
+    <item quantity="one">%d signé hors de la clôture (exclu)</item>
+    <item quantity="other">%d signés hors de la clôture (exclus)</item>
+    <item quantity="many">%d signés hors de la clôture (exclus)</item>
+  </plurals>
+  <plurals name="archive_count_invalid">
+    <item quantity="one">%d à la signature invalide (exclu)</item>
+    <item quantity="other">%d à la signature invalide (exclus)</item>
+    <item quantity="many">%d à la signature invalide (exclus)</item>
+  </plurals>
+  <plurals name="archive_count_unverifiable">
+    <item quantity="one">%d non vérifiable (voir plus bas)</item>
+    <item quantity="other">%d non vérifiables (voir plus bas)</item>
+    <item quantity="many">%d non vérifiables (voir plus bas)</item>
+  </plurals>
+  <plurals name="archive_count_unchecked">
+    <item quantity="one">%d non contrôlé</item>
+    <item quantity="other">%d non contrôlés</item>
+    <item quantity="many">%d non contrôlés</item>
+  </plurals>
+  <string name="archive_dates_range">Stocké entre %1$s et %2$s (horloge du relais).</string>
+  <string name="archive_anomaly_closure_invalid">Anomalie : la clôture enregistrée sur le relais n\'est pas valide.</string>
+  <string name="archive_ots_match">Horodatage : la preuve correspond à ces enregistrements. L\'ancrage Bitcoin se vérifie avec l\'outil de bureau.</string>
+  <string name="archive_ots_mismatch">Horodatage : la preuve ne correspond PAS aux enregistrements vérifiés.</string>
+  <string name="archive_ots_absent">Horodatage : aucun.</string>
+  <string name="archive_verify_btn">VÉRIFIER</string>
+  <string name="archive_play_btn">REGARDER</string>
+  <string name="archive_export_btn">EXPORTER</string>
+  <string name="archive_play_none">Aucune vidéo vérifiée dans ce rapport.</string>
+  <string name="archive_play_none_unverifiable">Aucune vidéo parmi les objets gardés à part.</string>
+
+  <!-- Non vérifiable -->
+  <string name="archive_unverifiable_title">NON VÉRIFIABLE</string>
+  <string name="archive_unverifiable_explain">Ces objets ont été stockés avant que le relais ne conserve les signatures. Rien ne prouve qu\'ils sont les vôtres ni qu\'ils sont intacts : un objet scellé pour votre identité peut venir de quiconque connaît sa clé publique. Ils sont gardés à part du témoignage vérifié et n\'y sont jamais comptés. Vous pouvez les regarder ici et les exporter, dans un dossier distinct marqué « not-verified ». Seuls les enregistrements s\'exportent d\'ici : une preuve d\'horodatage parmi eux est laissée à l\'outil de bureau (frappuccino-cli fetch-archive), qui met à part tous ces objets.</string>
+  <string name="archive_unverifiable_play_btn">REGARDER (NON VÉRIFIÉ)</string>
+  <string name="archive_unverifiable_export_btn">EXPORTER (NON VÉRIFIÉ)</string>
+  <string name="archive_unverifiable_export_warning_title">Exporter des objets NON vérifiés ?</string>
+  <string name="archive_unverifiable_export_warning_message">Rien ne prouve que ces enregistrements sont les vôtres ni qu\'ils sont intacts : ils ont été stockés avant que le relais ne conserve les signatures. Ils partent dans un dossier distinct, marqué « not-verified » comme chacun de ses fichiers, jamais avec le témoignage vérifié. Comme tout export, la copie sort de l\'app : elle est déchiffrée, l\'effacement d\'urgence ne peut pas l\'effacer, et toute app ayant accès au dossier choisi peut la lire.</string>
+  <string name="archive_unverifiable_export_done">Exporté dans un dossier distinct marqué « not-verified ».</string>
+  <plurals name="archive_unverifiable_line">
+    <item quantity="one">Rapport %1$d : %2$d objet</item>
+    <item quantity="other">Rapport %1$d : %2$d objets</item>
+    <item quantity="many">Rapport %1$d : %2$d objets</item>
+  </plurals>
+
+  <!-- Export -->
+  <string name="archive_export_warning_title">Exporter ce rapport ?</string>
+  <string name="archive_export_warning_message">La copie exportée sort de l\'app : elle est déchiffrée, l\'effacement d\'urgence ne peut pas l\'effacer, et toute app ayant accès au dossier choisi peut la lire. Seuls les enregistrements vérifiés sont exportés, avec la preuve d\'horodatage et son sel quand la preuve correspond.</string>
+  <string name="archive_export_confirm">CHOISIR UN DOSSIER</string>
+  <string name="archive_cancel">ANNULER</string>
+  <string name="archive_export_no_picker">Aucun sélecteur de fichiers sur ce téléphone : l\'export est impossible.</string>
+  <string name="archive_export_lost">L\'export n\'a pas démarré. Relancez-le depuis le rapport.</string>
+  <string name="archive_export_running">Export : fichier %1$d sur %2$d</string>
+  <string name="archive_export_done">Exporté.</string>
+  <!-- Après la ligne de fin : les objets qui ne se déchiffrent pas sont exclus
+       et le reste du rapport est exporté. -->
+  <plurals name="archive_export_undecryptable">
+    <item quantity="one">%d objet ne se déchiffre pas et a été exclu de l\'export.</item>
+    <item quantity="other">%d objets ne se déchiffrent pas et ont été exclus de l\'export.</item>
+    <item quantity="many">%d objets ne se déchiffrent pas et ont été exclus de l\'export.</item>
+  </plurals>
+  <plurals name="archive_export_nothing_decrypted">
+    <item quantity="one">Rien n\'a été exporté : %d objet ne se déchiffre pas et a été exclu.</item>
+    <item quantity="other">Rien n\'a été exporté : %d objets ne se déchiffrent pas et ont été exclus.</item>
+    <item quantity="many">Rien n\'a été exporté : %d objets ne se déchiffrent pas et ont été exclus.</item>
+  </plurals>
+  <string name="archive_export_timestamp_left_out">La preuve d\'horodatage et son sel ont été exclus aussi : ils portent sur tous les enregistrements vérifiés, et il en manque au moins un dans l\'export.</string>
+  <string name="archive_export_failed">L\'export a échoué. La copie partielle a été retirée là où la destination le permet.</string>
+
+  <!-- Fermeture -->
+  <string name="archive_close_confirm_title">Fermer le secours ?</string>
+  <string name="archive_close_confirm_message">Fermer annule le travail en cours et efface les copies récupérées sur ce téléphone.</string>
+  <string name="archive_close_confirm_yes">FERMER</string>
+
+  <!-- Lecteur -->
+  <string name="archive_player_part">Partie %1$d sur %2$d</string>
+  <string name="archive_player_decrypting">Déchiffrement…</string>
+  <string name="archive_player_error">Cette partie ne peut pas être lue.</string>
+  <string name="archive_player_end">Fin de l\'enregistrement.</string>
+  <string name="archive_player_prev">◀ PRÉCÉDENT</string>
+  <string name="archive_player_next">SUIVANT ▶</string>
+  <string name="archive_player_close">FERMER</string>
+  <string name="archive_player_unverified_banner">NON VÉRIFIÉ. Stocké avant que le relais ne conserve les signatures : rien ne prouve que cet enregistrement est le vôtre ni qu\'il est intact.</string>
+
+  <!-- Service de premier plan -->
+  <string name="archive_fgs_channel">Secours de l\'archive</string>
+  <string name="archive_fgs_starting">Démarrage du secours…</string>
+  <string name="archive_fgs_enumerating">Recherche de vos rapports…</string>
+  <string name="archive_fgs_rate_limited">Relais occupé : attente avant reprise…</string>
+  <string name="archive_fgs_verifying">Vérification du rapport %1$d/%2$d</string>
+  <string name="archive_fgs_exporting">Export…</string>
+</resources>

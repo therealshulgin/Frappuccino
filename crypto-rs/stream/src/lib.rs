@@ -59,6 +59,17 @@
 //! crate that still parses V1/V2; [`LEGACY_STRM_MARKER`] exists in the linked
 //! binary only under the feature, and both `build-android.sh` and the Gradle
 //! `checkRustSoFresh` gate refuse a `.so` that carries it.
+//!
+//! ## Beyond the STRM container
+//!
+//! * [`envelope`] — the `FQE1` queue envelope: a report object waiting on the
+//!   device, with its production-time signatures in an encrypted trailer.
+//! * [`file_range`] and [`durable`] — reading a byte range of a file with a
+//!   hash check, and replacing a file durably.
+//! * `transport` (feature `protocol`) — the one send primitive for every relay
+//!   write, over `DirectTls` or `ObfQuic`.
+//! * `protocol` (feature `protocol`) — the relay client, including the
+//!   archive reads of the rescue.
 
 pub use frappuccino_crypto_core as core;
 
@@ -89,7 +100,10 @@ pub const LEGACY_STRM_COMPILED_IN: bool = cfg!(feature = "legacy-strm");
 pub static LEGACY_STRM_MARKER: &[u8] = b"FRAPPUCCINO_LEGACY_STRM_COMPILED_IN";
 
 pub mod decrypt;
+pub mod durable;
 pub mod encrypt;
+pub mod envelope;
+pub mod file_range;
 pub mod header;
 pub mod pathsafe;
 pub mod secure_delete;
@@ -108,8 +122,15 @@ mod kani_proofs;
 pub mod pin;
 #[cfg(feature = "protocol")]
 pub mod protocol;
+// One send primitive (method, URL, headers, body range) over DirectTls or
+// ObfQuic, with the QUIC latch and the fallback to TLS.
+#[cfg(feature = "protocol")]
+pub mod transport;
 #[cfg(feature = "protocol")]
 pub mod upload;
+// Loopback TLS relay used by the transport and archive tests.
+#[cfg(all(test, feature = "protocol"))]
+mod test_relay;
 
 // Phase 3a HTTP/3 upload transport (quinn + h3 + BBR). Behind the `quic`
 // feature (which implies `protocol`): only the shipped Android `.so` and the
@@ -130,16 +151,26 @@ pub mod salamander_socket;
 
 pub use decrypt::{decrypt, BlobMetadata, DecryptError};
 pub use encrypt::{encrypt_chunked, encrypt_single, EncryptError};
-pub use pathsafe::is_safe_blob_filename;
+#[cfg(feature = "protocol")]
+pub use envelope::EnvelopeRequest;
+pub use envelope::{
+    convert_to_envelope, inspect_envelope, open_envelope, write_envelope, Conversion,
+    EnvelopeError, EnvelopeFields, EnvelopeKind, EnvelopeTrailer, PayloadDigest, QueueKey,
+    VerifiedEnvelope,
+};
+pub use file_range::{FileRange, FileRangeReader, RangeFailure};
+pub use pathsafe::{is_relay_object_name, is_safe_blob_filename};
 #[cfg(feature = "protocol")]
 pub use protocol::{
-    ArchiveBlobInfo, ChallengeValue, EnrollResult, ProtocolError, StreamServerClient,
+    ArchiveBlobInfo, ArchiveClosure, ArchiveListing, ArchiveObject, ChallengeValue, EnrollResult,
+    ProtocolError, StoredObject, StreamServerClient, WriteSigHeader,
 };
 #[cfg(feature = "quic")]
 pub use quic::{
-    clear_quic_degraded, put_chunk_quic_to, put_chunk_quic_with_headers, quic_is_degraded,
-    reset_quic_client, QuicTarget,
+    clear_quic_degraded, quic_is_degraded, reset_quic_client, send_quic, send_quic_to, QuicTarget,
 };
 pub use secure_delete::{secure_delete_file, SecureDeleteError};
 #[cfg(feature = "protocol")]
-pub use upload::{put_chunk_with_headers, reset_upload_client, PutResult};
+pub use transport::{send, Method, OutgoingRequest, SendOutcome, Transport, TransportUsed};
+#[cfg(feature = "protocol")]
+pub use upload::{reset_upload_client, send_direct_tls, PutResult, REPORT_CLOSED_TAG};

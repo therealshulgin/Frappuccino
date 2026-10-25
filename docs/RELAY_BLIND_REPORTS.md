@@ -1,8 +1,8 @@
-# Relay-blind reports — design **v3** (Phase C, « une saisie n'expose rien »)
+# Relay-blind reports — design **v3** (Phase C, « une saisie n'expose rien »), complété par les rapports figés
 
-**Statut : IMPLÉMENTÉ ET DÉPLOYÉ EN PROD (cutover 2026-06-26), field-validé sur 2 devices.** Ce document a été rédigé comme spec de conception (v3, post-2-passes d'audit adverse Opus 4.8) ; **les 5 tranches du §11 sont toutes livrées**. Le corps ci-dessous reste un compte-rendu exact de la conception telle qu'**implémentée** — ne PAS le lire comme « à faire ».
+**Statut : v3 IMPLÉMENTÉ ET DÉPLOYÉ (cutover 2026-06-26), field-validé sur 2 devices ; puis complété par la refonte « rapports figés » (§0), livrée en code et testée, pas encore validée sur appareil.** Ce document a été rédigé comme spec de conception (v3, post-2-passes d'audit adverse Opus 4.8) ; **les 5 tranches du §11 sont toutes livrées**. Les §1 à §13 restent le compte-rendu de la conception v3 telle qu'implémentée, **sauf là où le §0 les remplace** : où se tient la clé de rapport (§3.3), le moment de la signature (§3.3), l'énumération et la vérification au secours (§3.4), la détection de troncature (§7). Une divergence entre ce document et le code : **le code fait foi**.
 
-> **Implémentation (un auditeur ne doit pas conclure « feature absente ») :** dérivation Rust `crypto-rs/core/src/report.rs` (report_master/key/id + tags `0x07`/`0x08`, miroir `server/app/signature_domain.py`) ; serveur `server/app/routes/{upload,reports,archive}.py` (`reports.json = {report_id, report_pk}` SEUL, archive id-free sans JWT, write-once + budget création + rollback) ; client `mobile/.../util/jobs/{ChunkUploadWorker,DirectoryEntryWorker}.kt` ; tests `server/tests/test_relay_blind_reports.py` + `test_report_sig_kat.py`. Commits porteurs : `ec4f9dc`, `45f1046`, `b4c214b` (+ durcissement post-cutover). Cutover + field-test = 2026-06-26.
+> **Implémentation (un auditeur ne doit pas conclure « feature absente ») :** dérivation Rust `crypto-rs/core/src/report.rs` et `crypto-rs/core/src/report/` (schéma legacy, chaîne, écrivain, manifeste, vérification, secours ; tags `0x07`/`0x08`/`0x09`, miroir `server/app/signature_domain.py`) ; FFI `crypto-rs/ffi/src/{report_state,report_writer,envelopes,rescue}.rs` ; serveur `server/app/routes/{upload,reports,archive}.py` (`reports.json = {report_id, report_pk}` plus la clôture d'un rapport clos, archive id-free sans JWT, write-once + budget création + rollback, `POST /close`) ; client `stream-crypto/.../upload/{EnvelopeQueue,ReportProducer,LegacyReportMigration}.kt` et `mobile/.../util/jobs/ChunkUploadWorker.kt` (un job par enveloppe) ; tests `server/tests/test_relay_blind_reports.py`, `test_report_sig_kat.py`, `test_report_close.py`, `test_report_close_kat.py`, `test_report_tombstone.py`. Commits porteurs de la v3 : `ec4f9dc`, `45f1046`, `b4c214b` (+ durcissement post-cutover). Cutover + field-test v3 = 2026-06-26.
 
 v3 intègre les 2 passes adverses (2026-06-26) — faits porteurs re-vérifiés à la main. Voir §12 pour la traçabilité audit→disposition.
 
@@ -13,6 +13,20 @@ Décisions verrouillées (therealshulgin) :
 2. **Lectures = identité-free total** — le `report_id` (128 bits, dérivé de la phrase) EST la capability.
 3. **Création = gatée par le ratchet** (anti-sybil) ; l'identité vérifiée est **jetée**, jamais persistée.
 4. **Le ratchet ne doit PAS être cassé** (contrainte dure).
+
+---
+
+## 0. Rapports figés : ce qui a changé depuis la v3
+
+La v3 laissait l'appareil garder `report_master` (scellé par le PIN) et signer chaque objet **à l'envoi** : n'importe quel rapport, passé ou futur, restait signable depuis l'état de l'appareil, et rien ne marquait la fin d'un rapport. La refonte ferme ces deux points pour les rapports **clos**, sans toucher au ratchet. Description complète : `ARCHITECTURE_TECHNIQUE_COMPLETE.md` §6.3, §7.4, §8.3, §8.7 ; résidus : `ACCEPTED_RESIDUALS_2026-06-28.md`.
+
+- **Chaîne à sens unique.** Les index `≥ k` (`k = 0` pour une inscription neuve) suivent une chaîne HKDF : `C_0 = HKDF(report_master, "stream.report.chain.v2.root")`, `C_{i+1} = HKDF(C_i, "stream.report.chain.v2.next")`, clé du rapport `i` depuis `HKDF(C_i, "stream.report.chain.v2.key")`, nom d'entrée d'annuaire et nom de preuve OTS depuis `C_i`. L'appareil ne garde que `(i, C_i, graine d'annuaire)` dans `report_state.bin`, fichier possédé par Rust, scellé par la clé de session PIN ; `report_master` n'y est plus. Ouvrir un rapport avance l'état et le réécrit durablement **avant** de rendre l'écrivain : l'état ne redérive plus la clé d'un rapport ouvert avant lui. Les index `< k` (appareils inscrits avant la refonte) restent au schéma §3.1.
+- **Signature à la production.** L'écrivain Rust scelle le JSON de métadonnées (seq 0), puis chaque chunk sous son numéro de capture (`NNNNNN.strm`), le signe `0x08` et l'écrit dans une **enveloppe de file** (`FQE1` : charge utile + en-tête chiffré sous une clé de file Keystore). L'envoi ne signe jamais : Rust revérifie l'enveloppe et en tire l'URL et les en-têtes. Le holder `report_sk` du §3.3 et `upload_put_report_chunk` n'existent plus ; l'entrée d'annuaire est elle aussi scellée à l'ouverture du rapport, en enveloppe, et `DirectoryEntryWorker` a disparu.
+- **Clôture `0x09`.** À l'arrêt, l'écrivain signe `report_id ‖ u32_be(seq_limit) ‖ sha256(manifest)` sur le manifeste `"FQM1" ‖ u32_be(count) ‖ count × (u32_be(seq) ‖ sha256(blob))`, puis efface la clé. `POST /close/{rid}` vérifie et enregistre la clôture (manifeste stocké en objet write-once `manifest`, puis `{seq_limit, manifest_sha256, sig}` dans la fiche, sauvegarde durable). Après clôture, le relais n'accepte qu'un objet déjà présent (write-once) ou un nom `NNNNNN.strm` sous `seq_limit` ; tout autre nom reçoit 409 `Report closed`. Une fiche close n'est jamais supprimée : à expiration de tous ses objets elle devient une **pierre tombale** qui refuse toute écriture. `reports.json` est sauvegardé avec fsync du répertoire et chargé **fail-closed**.
+- **Signature d'écriture conservée.** Le relais stocke la `write_sig` vérifiée de chaque objet en métadonnée `x-amz-meta-report-write-sig` et la renvoie à l'archive (`X-Report-Write-Sig`). C'est une donnée d'intégrité à préserver en cas de migration de stockage.
+- **Secours vérifié.** Énumération par l'annuaire (deux familles de noms, legacy et chaîne) puis sondage au-delà ; vérification de chaque objet sous la `report_pk` re-dérivée avant tout déchiffrement ; statuts `VERIFIED` / `FOREIGN` / `MISSING` / `UNEXPECTED` par objet, `COMPLETE` / `INCOMPLETE` / `ALTERED` / `INTERRUPTED` par rapport chaîne ; section « non vérifiable » pour les objets legacy stockés sans signature. Ce secours remplace la détection de troncature par OTS seule du §7 : pour un rapport clos, le manifeste signé fixe l'ensemble des objets. Retenir un rapport **entier** (C1) reste indétectable avec un relais unique.
+- **Migration.** Au premier déverrouillage après la mise à jour : `k` fixé au-delà des index legacy, état chaîne écrit, fichiers legacy en attente convertis en enveloppes signées à ce moment, une clôture legacy (manifeste vide) par index `< k`, puis seulement suppression du maître.
+- **Ce que la refonte ne couvre pas** (résidus R1-R7) : une extraction de l'état à `t` signe le rapport en cours et tous ceux ouverts après `t`, et écrit dans l'annuaire, sans limite de durée ; un rapport interrompu avant sa clôture n'a pas de fin certifiée ; une extraction antérieure à la migration a pu emporter `report_master`. La garantie « pas de forge du passé » vaut pour les rapports **clos**.
 
 ---
 
@@ -95,6 +109,8 @@ Logique serveur :
 
 ### 3.3 Autz upload — où vit `report_sk` (corrigé post-audit : **miroir du `provenanceSigner`**, PAS du JWT)
 
+> **Remplacé par le §0.** Ce qui suit décrit la v3 : un `report_sk` re-dérivable du maître et une signature à l'envoi. La clé vit désormais dans l'écrivain Rust du rapport en cours, n'existe que de l'ouverture à la clôture, et chaque objet est signé à sa production.
+
 `report_sk` est **secret + seed-dérivé** (non re-dérivable sans PIN) ⇒ jamais dans le heap JVM (heap-0) **et** cycle de vie aligné sur un secret seed-dérivé qui survit au background recording :
 - **Objet UniFFI tenu côté Kotlin** (`StreamUploadManager.reportKeyring`), rechargé au unlock par `pinSessionOpenReportKeyring`, qui ouvre le master scellé **en-crate** : ni le master ni la clé de session ne traversent la FFI. Cette puce décrivait un `static REPORT_SK_HOLDER` chargé par `pinStoreOpenWithKey` ; ni l'un ni l'autre n'existe, l'export ayant été retiré à la migration no-export R-CR-1.
 - **Cycle de vie = celui du `provenanceSigner`** (`StreamUploadManager.kt:71` chargé `:269`, wipé **seulement à `lock()` `:294`**), **PAS** celui de `UPLOAD_JWT` (wipé au timer JWT défaut-0 = au background). Raison vérifiée : le JWT background-wipé est **re-dérivable** (`ensureFallbackReAuth`) ; `report_sk` **ne l'est PAS** ⇒ un wipe au background **casserait** la signature des chunks en capture écran-éteint (data-loss non-récupérable, régression Phase 1.14). Le `provenanceSigner` (même contrainte seed) est **field-prouvé** survivre au background recording.
@@ -103,6 +119,8 @@ Logique serveur :
 - **1er PUT** : + `X-Report-PK` + `X-Report-Create-Sig` (calculés une fois/report) + bearer (holder `UPLOAD_JWT`).
 
 ### 3.4 Rescue (énumération + lecture, identité-free, anti-data-loss)
+
+> **Complété par le §0.** L'énumération décrite ici vaut pour la famille legacy ; le secours courant apparie aussi les noms de la famille chaîne, sonde au-delà du plus haut index apparié, et **vérifie** chaque objet avant de le ranger (`crypto-rs/ffi/src/rescue.rs`, même code pour l'APK et le CLI).
 
 - **Lecture** : `GET …/reports/{report_id}/blobs` et `…/{filename}` — **identité-free**. `POST /api/v2/archive/auth` + `require_archive_auth` + scope archive supprimés.
 - **Serveur 404 sur record inconnu** (pas sur prefix MinIO vide — sinon `list_blobs` renvoie `200+[]`). Record ⇒ ≥1 blob (invariant §3.2).
@@ -158,6 +176,8 @@ Logique serveur :
 ## 7. Complétude & anti-troncature (3 propriétés)
 
 **Prévention** — impossible avec relais unique non-fiable. Postulat du motto. **Hors périmètre, inhérent.** La write-sig par chunk = intégrité d'un chunk présent, **pas** la complétude (couche autorisation ≠ couche complétude).
+
+> **Complété par le §0.** Pour un rapport chaîne **clos**, la détection ne dépend plus de l'OTS : le manifeste signé `0x09` liste les objets, et le secours classe tout écart. Ce qui suit reste la description de la v3, et vaut encore pour un rapport non clos.
 
 **Détection — partielle, via la provenance lean conservée.** `SHA-256(sel ‖ chunk_merkle_root(tous les hashes)) → OTS → Bitcoin` engage l'ensemble des chunks d'**un recording**. Au rescue : un chunk droppé **dans un report tracké** ⇒ racine recalculée ≠ ancre BTC ⇒ `verify-provenance` échoue ⇒ **troncature intra-report détectée**. **Limites** : exige l'OTS actif/ancré (dormant ⇒ déploiement = GO) ; async ; détecte ≠ récupère.
 ⚠️ **NE COUVRE PAS un report ENTIER retenu** : l'OTS est **par-recording**, il n'existe **aucun manifeste global** des reports d'un témoin, et le device de rescue n'a **aucun `n_max` indépendant** (`list_user_reports` supprimé) ⇒ un relais qui 404 un bloc terminal de report_ids **tronque la queue silencieusement** (caché dans le bruit légitime des `n` jamais-uploadés). **= résiduel C1, assumé (décision therealshulgin).**

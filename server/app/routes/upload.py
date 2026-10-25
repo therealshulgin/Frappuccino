@@ -1,14 +1,30 @@
 import asyncio
 import hashlib
+import logging
+import re
 import tempfile
 from fastapi import APIRouter, Header, Request, Response, HTTPException
 from app import auth, config, paths, ratchet_registry, signature_domain, storage
 from app.ratelimit import limiter  # shared app-wide Limiter (see app/ratelimit.py)
 from app.routes import reports
 
+logger = logging.getLogger("stream.upload")
+
 router = APIRouter()
 
 MAX_UPLOAD_SIZE = 500 * 1024 * 1024  # 500 MB per PUT request
+
+# Closure manifest: "FQM1" || u32_be(count) || count x (u32_be(seq) || sha256(32)).
+# seq < 1_000_000, so a manifest is at most 8 + 36 x 1_000_000 bytes (~36 MB);
+# the cap leaves headroom and refuses anything larger before it is spooled.
+MAX_MANIFEST_SIZE = 40 * 1024 * 1024
+_MANIFEST_MAGIC = b"FQM1"
+_MANIFEST_HEADER_LEN = 8
+_MANIFEST_ENTRY_LEN = 36
+
+# X-Report-Close-Seq-Limit: canonical decimal, no sign, no leading zero, no
+# whitespace, at most seven digits (the range check comes after).
+_SEQ_LIMIT_RE = re.compile(r"(?:0|[1-9][0-9]{0,6})")
 
 # Mirror of crypto-rs/core/src/report.rs::report_id_from_pk — the report's
 # identity-free address is SHA-256("stream.report.id.v1" || report_pk)[..16].
@@ -27,10 +43,16 @@ def _validate_path(report_id: str, filename: str):
     # bounded-length filename with no `/`, `\`, a lone `.`, or `..` anywhere. The
     # stored MinIO key is thus byte-identical to the write-signed name — never
     # rewritten (an old `.replace("..","")` silently desynced key vs signed name
-    # and could collide two names). Real names are chunk ids (`<sid>_NNNNNN.strm`)
-    # or an opaque 32-hex directory entry (M-1), never `.`/`..`.
+    # and could collide two names). Real names are chunk ids (`<sid>_NNNNNN.strm`,
+    # `NNNNNN.strm`) or an opaque 32-hex directory entry (M-1), never `.`/`..`.
     paths.validate_report_id(report_id)
     paths.validate_filename(filename)
+    # `manifest` is written only by POST /close, from the body whose hash the
+    # closure signature covers. A PUT to it is refused whatever the report's
+    # state: write-once would otherwise let the first writer choose the bytes a
+    # later closure has to match.
+    if filename == paths.MANIFEST_NAME:
+        raise HTTPException(400, "Reserved object name")
 
 
 def _parse_hex(value: str | None, nbytes: int, name: str) -> bytes:
@@ -118,7 +140,9 @@ async def upload_file(
                              creation budget, else 425 ("retry, not yet created")
       3. stream body -> SHA-256 (one pass)
       4. verify write-sig over (0x08 || report_id || filename || sha256(body))
-      5. store the blob (write-once) — durable before any record is written
+      5. re-read the record and store the blob (write-once, with its write-sig
+         as metadata) under the closure rule — durable before any record is
+         written
       6. if creating: create-or-verify the record (now that >=1 blob is durable)
 
     Every PUT carries `X-Report-PK` + `X-Report-Write-Sig` (the per-report key
@@ -228,11 +252,37 @@ async def upload_file(
                 raise HTTPException(403, "Invalid write signature")
 
             # ---- (5) Store the blob (write-once), durable BEFORE the record -
+            # The record read at step (2) predates the body stream, and a
+            # closure can be recorded while the body is still arriving, so the
+            # record is read again here, after the signature check. From that
+            # read to the end of the store this section holds the registry lock
+            # and never awaits: POST /close records closures under the same
+            # lock (from a worker thread), so "closure recorded" and "new
+            # object stored" cannot interleave. The store is synchronous on the
+            # event loop, as it always was; the lock can add a wait of one
+            # closure write (manifest store + registry save) to it.
             tmp.seek(0)
             try:
-                storage.upload_blob_stream_write_once(
-                    report_id, filename, tmp, total, hasher.hexdigest()
-                )
+                with reports.registry_lock():
+                    current = reports.get_report(report_id)
+                    if current is not None and current.get("report_pk") != report_pk_hex:
+                        raise HTTPException(409, "report_pk does not match the stored report")
+                    storage.upload_blob_stream_write_once(
+                        report_id,
+                        filename,
+                        tmp,
+                        total,
+                        hasher.hexdigest(),
+                        write_sig_hex=write_sig.hex(),
+                        closed_seq_limit=reports.closed_seq_limit(current),
+                    )
+            except storage.ReportClosedError:
+                # The report's signed closure does not cover this new name.
+                # Keep the body exact: the client tells this 409 apart from
+                # the write-once 409 below by it (crypto-rs reads the body of a
+                # 409 and reports `report_closed` only for exactly
+                # `{"detail":"Report closed"}`).
+                raise HTTPException(status_code=409, detail="Report closed")
             except storage.StorageFullError:
                 # MinIO disk-full. 507 rather than 500 tells the client this is
                 # a persistent capacity condition, so it opens its circuit
@@ -252,8 +302,12 @@ async def upload_file(
                 )
 
         # ---- (6) Creation: blob is durable, now write the record -----------
+        # to_thread: the save fsyncs, and the single worker's event loop must
+        # not wait on the disk.
         if is_creation:
-            if not reports.create_or_verify_report(report_id, report_pk_hex):
+            if not await asyncio.to_thread(
+                reports.create_or_verify_report, report_id, report_pk_hex
+            ):
                 # A concurrent worker created the same id with a different pk.
                 raise HTTPException(409, "report_pk does not match the stored report")
 
@@ -271,3 +325,146 @@ async def upload_file(
             await asyncio.to_thread(
                 ratchet_registry.release_report_creation, creation_identity
             )
+
+
+def _parse_seq_limit(value: str | None) -> int:
+    if value is None:
+        raise HTTPException(400, "Missing X-Report-Close-Seq-Limit header")
+    if _SEQ_LIMIT_RE.fullmatch(value) is None:
+        raise HTTPException(400, "Invalid X-Report-Close-Seq-Limit header")
+    seq_limit = int(value)
+    if seq_limit > paths.MAX_SEQ_LIMIT:
+        raise HTTPException(400, "Invalid X-Report-Close-Seq-Limit header")
+    return seq_limit
+
+
+def _check_manifest_frame(head: bytes, total: int) -> None:
+    """400 unless the body has the manifest's magic and the exact length its
+    count announces. Deliberately the only parsing the relay does: the entries
+    (seq order, hashes) are checked by the rescue against the stored objects,
+    and the relay never needs them."""
+    if total < _MANIFEST_HEADER_LEN or head[:4] != _MANIFEST_MAGIC:
+        raise HTTPException(400, "Malformed manifest")
+    count = int.from_bytes(head[4:_MANIFEST_HEADER_LEN], "big")
+    if total != _MANIFEST_HEADER_LEN + count * _MANIFEST_ENTRY_LEN:
+        raise HTTPException(400, "Malformed manifest")
+
+
+@router.post("/close/{report_id}")
+# Same bucket shape and ceiling as the PUT above, for the same reason: a backlog
+# drain after a reconnect sends closures along with chunks, and a 429 only
+# delays them (the client retries, the envelope stays on the device).
+@limiter.limit("600/minute")
+async def close_report_route(
+    report_id: str,
+    request: Request,
+    x_report_pk: str | None = Header(default=None),
+    x_report_close_sig: str | None = Header(default=None),
+    x_report_close_seq_limit: str | None = Header(default=None),
+):
+    """Freeze a report: after this, the relay accepts no new object name in it
+    outside what the signed closure covers.
+
+    The body is the closure manifest; the 0x09 signature under the record's
+    report_pk covers `report_id || u32_be(seq_limit) || sha256(body)`. Once
+    recorded, a PUT that would create a new object is accepted only for a name
+    `NNNNNN.strm` with `NNNNNN < seq_limit` (a chunk the manifest can list,
+    arriving late); existing objects keep their write-once semantics. A legacy
+    closure (empty manifest, seq_limit 0) therefore admits no new object.
+
+    No JWT and no creation budget, on purpose. A closure creates nothing: it
+    needs an existing record, and the signature under that record's key is the
+    only authorization that means anything here. A bearer token would hand the
+    relay an identity at the moment a report ends, exactly the join it must not
+    hold.
+
+    Codes, in the order they are checked:
+      400  bad report_id, missing/malformed header, seq_limit not canonical or
+           above 1_000_000, report_id != H(report_pk)
+      425  no record yet: the closure overtook the report's creating chunk
+           (the client's queue does not order uploads), retry later
+      409  report_pk differs from the record's
+      413  body above MAX_MANIFEST_SIZE (checked while it streams)
+      400  body is not a manifest frame (magic, length)
+      403  invalid 0x09 signature
+      then, under the registry lock: the 425/409 record checks again; 409 if a
+      different closure is already recorded or a different `manifest` object
+      is already stored; 507 storage full; 503 the registry save failed
+      (nothing recorded); 204 closure recorded, or the same closure was already
+      recorded.
+    """
+    paths.validate_report_id(report_id)
+    report_pk = _parse_hex(x_report_pk, 32, "X-Report-PK")
+    close_sig = _parse_hex(x_report_close_sig, 64, "X-Report-Close-Sig")
+    seq_limit = _parse_seq_limit(x_report_close_seq_limit)
+    report_id_bytes = bytes.fromhex(report_id)
+    report_pk_hex = report_pk.hex()
+    if _report_id_from_pk(report_pk) != report_id_bytes:
+        raise HTTPException(400, "report_id does not match X-Report-PK")
+
+    # Cheap record checks before reading up to 40 MB of body. They are repeated
+    # under the lock in reports.close_report, which is the one that counts.
+    record = reports.get_report(report_id)
+    if record is None:
+        raise HTTPException(425, "Report not yet created — retry")
+    if record.get("report_pk") != report_pk_hex:
+        raise HTTPException(409, "report_pk does not match the stored report")
+
+    total = 0
+    hasher = hashlib.sha256()
+    head = bytearray()
+    with tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024) as tmp:
+        async for chunk in request.stream():
+            total += len(chunk)
+            if total > MAX_MANIFEST_SIZE:
+                raise HTTPException(status_code=413, detail="Manifest too large")
+            if len(head) < _MANIFEST_HEADER_LEN:
+                head.extend(chunk[: _MANIFEST_HEADER_LEN - len(head)])
+            hasher.update(chunk)
+            tmp.write(chunk)
+        _check_manifest_frame(bytes(head), total)
+
+        manifest_sha256 = hasher.digest()
+        close_msg = (
+            signature_domain.SIG_DOMAIN_REPORT_CLOSE
+            + report_id_bytes
+            + seq_limit.to_bytes(4, "big")
+            + manifest_sha256
+        )
+        if not auth.verify_detached_ed25519(report_pk, close_sig, close_msg):
+            raise HTTPException(403, "Invalid close signature")
+
+        tmp.seek(0)
+        try:
+            # One worker thread for the whole lookup + manifest store + save,
+            # under the registry lock (reports.close_report).
+            await asyncio.to_thread(
+                reports.close_report,
+                report_id,
+                report_pk_hex,
+                seq_limit,
+                manifest_sha256.hex(),
+                close_sig.hex(),
+                tmp,
+                total,
+            )
+        except reports.ReportUnknownError:
+            raise HTTPException(425, "Report not yet created — retry")
+        except reports.ReportKeyMismatchError:
+            raise HTTPException(409, "report_pk does not match the stored report")
+        except reports.ClosureConflictError:
+            raise HTTPException(409, "A different closure is already recorded")
+        except storage.WriteOnceConflictError:
+            raise HTTPException(409, "Manifest already stored with different content")
+        except storage.StorageFullError:
+            raise HTTPException(
+                status_code=507,
+                detail="Server storage full — contact the administrator",
+            )
+        except OSError as e:
+            # An I/O error, most likely the registry save. close_report rolls
+            # its in-memory change back, so nothing is recorded and the client
+            # retries; a manifest already stored is found identical then.
+            logger.error("Closure not recorded, I/O error: %s", type(e).__name__)
+            raise HTTPException(503, "Report registry unavailable — retry")
+    return Response(status_code=204)

@@ -10,10 +10,12 @@
 //! each.
 
 use frappuccino_crypto_stream::header::{
-    parse_header, HeaderError, ED25519_PK_BYTES, HEADER_SIZE_NO_GRANTS,
-    LEGACY_HEADER_SIZE_NO_GRANTS, LEGACY_OFF_AUTHOR_PK, OFF_GRANT_COUNT, OFF_VERSION, VERSION_V1,
-    VERSION_V2, VERSION_V3,
+    parse_header, HeaderError, HEADER_SIZE_NO_GRANTS, LEGACY_HEADER_SIZE_NO_GRANTS,
+    OFF_GRANT_COUNT, OFF_VERSION, VERSION_V1, VERSION_V2, VERSION_V3,
 };
+// Only the legacy author round-trip reads these, and it runs in the CLI build.
+#[cfg(feature = "legacy-strm")]
+use frappuccino_crypto_stream::header::{ED25519_PK_BYTES, LEGACY_OFF_AUTHOR_PK};
 
 /// Structurally-parseable CURRENT (V3) header: magic + V3 + 80 B sealed
 /// envelope + 2 B `grant_count` (0) + mode byte. No author key.
@@ -66,10 +68,20 @@ fn parse_header_rejects_bad_version() {
 }
 
 #[test]
-fn parse_header_accepts_v1_v2_v3() {
-    assert!(parse_header(&scaffold_legacy(VERSION_V1)).is_ok());
-    assert!(parse_header(&scaffold_legacy(VERSION_V2)).is_ok());
+fn parse_header_accepts_v3_and_legacy_only_where_built_in() {
     assert!(parse_header(&scaffold_v3()).is_ok());
+    // V1/V2 are read by the CLI build only. The shipped build refuses them at
+    // parse, and both behaviours are asserted, each in its own configuration.
+    #[cfg(feature = "legacy-strm")]
+    {
+        assert!(parse_header(&scaffold_legacy(VERSION_V1)).is_ok());
+        assert!(parse_header(&scaffold_legacy(VERSION_V2)).is_ok());
+    }
+    #[cfg(not(feature = "legacy-strm"))]
+    {
+        assert!(parse_header(&scaffold_legacy(VERSION_V1)).is_err());
+        assert!(parse_header(&scaffold_legacy(VERSION_V2)).is_err());
+    }
 }
 
 #[test]
@@ -99,6 +111,7 @@ fn parse_header_v3_has_no_author() {
 }
 
 #[test]
+#[cfg(feature = "legacy-strm")]
 fn parse_header_legacy_roundtrips_author_pk() {
     // Legacy V1/V2 blobs DO embed the author — the decoder still surfaces it
     // (for migration/inspection), so the read path stays intact.

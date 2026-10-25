@@ -49,8 +49,8 @@ the cdylib. Exit code is non-zero if any case mismatched.
 Deterministic, raw-bytes-in APIs (the untrusted-input → marshalling → Rust-parse
 surface): `bip39_validate_fr`, `StreamIdentity.fromPublicKeys`→`readableFingerprint`,
 `EphemeralRatchet.deserialize`→`serialize`, `pin_store_open`,
-`ArchiveIdentity.fromMnemonic`. Randomised APIs (`strm_encrypt`) need a
-round-trip oracle — a follow-up corpus mode. `pin_store_seal` used to be listed
+`ArchiveIdentity.fromMnemonic`. Randomised APIs (the report writer's seals)
+need a round-trip oracle — a follow-up corpus mode. `pin_store_seal` used to be listed
 here too; it left the FFI surface on 2026-09-03 (no caller ever crossed the
 boundary for it, this harness included), so it can no longer be reached from
 Kotlin at all. The Rust function stays and the corpus dumper still uses it to

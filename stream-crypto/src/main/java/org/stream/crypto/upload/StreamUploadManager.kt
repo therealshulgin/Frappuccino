@@ -8,7 +8,6 @@ import uniffi.frappuccino.RotationProof
 import uniffi.frappuccino.pinSessionPopulate
 import uniffi.frappuccino.pinSessionOpenRatchet
 import uniffi.frappuccino.pinSessionOpenProvenanceSigner
-import uniffi.frappuccino.pinSessionOpenReportKeyring
 import uniffi.frappuccino.pinSessionClear
 import timber.log.Timber
 import uniffi.frappuccino.EnrollResult as FfiEnrollResult
@@ -17,8 +16,9 @@ import uniffi.frappuccino.EnrollmentKit as FfiEnrollmentKit
 import uniffi.frappuccino.FfiException
 import uniffi.frappuccino.StreamServerClient as FfiServerClient
 import uniffi.frappuccino.ProvenanceSigner as FfiProvenanceSigner
-import uniffi.frappuccino.ReportKeyring as FfiReportKeyring
+import uniffi.frappuccino.ReportWriter as FfiReportWriter
 import java.io.File
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * StreamUploadManager — Coordinateur V2 du chiffrement + signature des uploads.
@@ -58,6 +58,70 @@ class StreamUploadManager private constructor(private val context: Context) {
 
         /** Returns the current singleton, or null if [getInstance] has never been called. */
         fun getInstance(): StreamUploadManager? = instance
+
+        /**
+         * Bumped at the start of every emergency wipe. A recording session
+         * reads it when it starts and compares before writing anything that
+         * would outlive the wipe (an alert, a timestamp ticket): if it moved,
+         * the session's leftovers belong to an identity that no longer exists
+         * and are dropped silently.
+         */
+        private val wipeGenerationCounter = AtomicInteger(0)
+
+        // Makes "check the generation, then write" one step with respect to
+        // the bump that starts a wipe. See [unlessWipedSince].
+        private val wipeLock = Any()
+
+        fun wipeGeneration(): Int = wipeGenerationCounter.get()
+
+        /**
+         * Mark the start of an emergency wipe: bump the generation. The wipe
+         * calls this first, before it aborts the writer or cancels any job, so
+         * that a write guarded by [unlessWipedSince] that has not happened yet
+         * by then never happens. Returns the new generation.
+         */
+        fun beginWipe(): Int = synchronized(wipeLock) { wipeGenerationCounter.incrementAndGet() }
+
+        /**
+         * Run [block] only if no emergency wipe began since generation [gen],
+         * and as one step with respect to [beginWipe]: either the block runs
+         * entirely before the wipe's bump (and the wipe, which comes after it,
+         * erases or cancels what the block wrote or scheduled), or it does not
+         * run at all. A plain "compare, then write" leaves a gap between the
+         * two in which the wipe can start and finish. Returns the block's
+         * result, or null when a wipe began.
+         *
+         * For writes that would outlive the wipe: a WorkManager row, an alert,
+         * a file under the app's directories. Keep the block short (the wipe
+         * waits for it), and never take the manager's monitor in it: the wipe
+         * holds that monitor when it calls [beginWipe].
+         */
+        fun <T> unlessWipedSince(gen: Int, block: () -> T): T? =
+            synchronized(wipeLock) {
+                if (wipeGenerationCounter.get() != gen) null else block()
+            }
+
+        // Every authentication of the process runs under this lock, and so do
+        // the rotation calls: one need never spends two ratchet slots, and the
+        // queue of rotation proofs is only read and rewritten by one caller at
+        // a time. See [authenticateIfAbsent].
+        private val authLock = Any()
+        private val authGate = SingleFlightAuth(authLock)
+
+        /** File name of the report state, under `filesDir`. Owned by Rust. */
+        const val REPORT_STATE_FILE = "report_state.bin"
+
+        /**
+         * Directory names [panicWipe] detaches under `filesDir` and `cacheDir`,
+         * so that the next process start can finish a background wipe a
+         * process death interrupted (SecureDirWiper.finishLeftovers).
+         */
+        fun wipeableDirNames(): List<String> =
+            EnvelopeQueue.ALL_DIRS + listOf(
+                LegacyReportMigration.PROVENANCE_DIR, ChunkUploadQueue.DIR_NAME, "stream_migration",
+                "stream_encrypted", "directory_entries", "stream_chunks",
+                "debug_raw", "debug_raw_hevc", "debug_rolling",
+            )
     }
 
     // -- État persistant (disque, cache RAM) --
@@ -77,23 +141,14 @@ class StreamUploadManager private constructor(private val context: Context) {
     @Volatile var provenanceSigner: FfiProvenanceSigner? = null
         private set
 
-    /**
-     * The report capability keyring (UniFFI), for relay-blind reports. Each
-     * report's address + signing key `R_n` derives from the phrase through a
-     * dedicated HKDF context, never from the identity, so the relay only ever
-     * stores `report_id → report_pk` and never learns who.
-     *
-     * Its lifecycle must be the [provenanceSigner]'s and NOT the upload
-     * bearer's: a seed-derived secret reconstructed at unlock from the
-     * PIN-sealed `report_master`, wiped at [lock]. The bearer is wiped in the
-     * background by a timer and is re-derivable; `report_master` is seed-derived
-     * and not re-derivable without the PIN, so wiping it in the background would
-     * break signing chunks during screen-off recording — unrecoverable data
-     * loss. The provenance signer is field-proven to survive background
-     * recording under exactly this lifecycle.
-     */
-    @Volatile var reportKeyring: FfiReportKeyring? = null
-        private set
+    // Reports. The report keys are not held here: the state they derive from
+    // lives in `filesDir/report_state.bin`, written and sealed by Rust under
+    // the PIN-session key, and never crosses into the JVM. Opening a report at
+    // the start of a recording ([openReportWriter]) needs the PIN session; the
+    // writer it returns then holds that one report's key by itself, in Rust,
+    // until the report is closed. So a lock during a recording does not stop
+    // the recording from being sealed and closed, and nothing in the upload
+    // queue needs the PIN to leave: every envelope was signed when produced.
 
     // S8c.5 : toute la chaîne est désormais 100% UniFFI — plus aucun
     // `LazySodiumAndroid`, plus de `SecureMemory`, plus de `PinProtectedStore`.
@@ -142,26 +197,37 @@ class StreamUploadManager private constructor(private val context: Context) {
 
     /**
      * Premier setup : dérive tout depuis la phrase BIP-39, initialise le ratchet,
-     * stocke l'identité + le blob ratchet PIN-wrappé. Wipe toutes les clés privées.
+     * crée l'état des rapports et la clé de file, stocke l'identité + le blob
+     * ratchet PIN-wrappé. Wipe toutes les clés privées.
      *
      * À appeler UNE FOIS au bout de l'onboarding.
+     *
+     * L'état des rapports et la clé de file sont créés AVANT que l'identité et
+     * le ratchet ne soient persistés, et leur échec fait échouer l'enrôlement :
+     * un appareil inscrit doit pouvoir enregistrer. Dans l'ordre inverse, un
+     * échec laisserait un appareil « enrôlé » (isEnrolled vrai) incapable
+     * d'ouvrir un rapport, sans que rien ne le signale avant le premier REC.
      */
     @Synchronized
     fun enrollFromMnemonic(mnemonic: ByteArray, pin: ByteArray): EnrollmentProof {
         require(pin.isNotEmpty()) { "PIN must not be empty" }
 
-        // `pin` ET `mnemonic` sont maintenant des
-        // ByteArray, jamais convertis en String. Aucune fuite dans le pool
-        // JVM. Les callers (OnBoardSetPinFragment) wipent leur copie dans
-        // leur finally. Côté Rust, FfiEnrollmentKit.fromMnemonic prend
-        // bytes et wrap immédiatement le mnemonic en Zeroizing<Vec<u8>>.
+        // `pin` ET `mnemonic` sont des ByteArray, jamais convertis en String.
+        // Aucune fuite dans le pool JVM. Les callers (OnBoardSetPinFragment)
+        // wipent leur copie dans leur finally. Côté Rust, FfiEnrollmentKit
+        // .fromMnemonic prend bytes et wrap immédiatement le mnemonic en
+        // Zeroizing<Vec<u8>>.
         val kit = FfiEnrollmentKit.fromMnemonic(mnemonic, byteArrayOf())
+        var ratchet: FfiRatchet? = null
+        var persisted = false
+        val queueKeyExisted = QueueKeyStore.exists(context)
         try {
             // 1. Initialiser le ratchet depuis chain_0 (consume-once côté Rust).
-            val ratchet = FfiRatchet.fromKit(kit)
+            val r = FfiRatchet.fromKit(kit)
+            ratchet = r
 
             // 2. Signer batch_0 avec ed25519_sk (via EnrollmentKit).
-            val batch0Pks = ratchet.batchPublicKeys()
+            val batch0Pks = r.batchPublicKeys()
             val batch0Concat = concatPublicKeys(batch0Pks)
             val enrollSig = kit.signEnrollment(batch0Concat)
 
@@ -173,22 +239,29 @@ class StreamUploadManager private constructor(private val context: Context) {
             )
             uniffiIdentity.destroy()
 
-            // 4. Persister : identity (publiques) + ratchet blob PIN-wrappé.
-            StreamPreferences.saveIdentity(context, kotlinIdentity)
-            // Lot 4b : sérialise + scelle (Argon2id) ENTIÈREMENT côté Rust — le
-            // blob 50-sk ne traverse jamais la JVM (remplace serialize +
-            // pinStoreSeal + wipe).
-            val sealed = ratchet.sealWithPin(pin)
-            StreamPreferences.saveRatchetBlob(context, sealed)
-
-            // 5. Cache RAM pour utilisation immédiate (fast-reseal).
-            //    Lot 4b : Argon2id une fois, le derived_key + salt sont stashés
-            //    dans le holder Rust (jamais de retour ByteArray vers la JVM). Le
-            //    ratchet est déjà en mémoire (issu du kit) ; le holder sert au
-            //    fast-reseal + au scellement des seeds secondaires ci-dessous.
+            // 4. Scelle le ratchet (Argon2id, entièrement côté Rust : le blob
+            //    50-sk ne traverse jamais la JVM) et ouvre la session PIN : le
+            //    holder Rust garde la clé dérivée pour le fast-reseal et pour
+            //    sceller l'état des rapports juste après.
+            val sealed = r.sealWithPin(pin)
             pinSessionPopulate(pin, sealed)
+
+            // 5. État des rapports (index 0, dérivé de la phrase ; le master
+            //    intermédiaire est effacé côté Rust) et clé de file. Fatal :
+            //    l'exception remonte et rien n'est persisté côté identité.
+            uniffi.frappuccino.pinSessionCreateReportState(
+                mnemonic, byteArrayOf(), reportStatePath()
+            )
+            QueueKeyStore.createOrInstall(context, replaceUnreadable = true)
+
+            // 6. Persister : identity (publiques) + ratchet blob PIN-wrappé.
+            StreamPreferences.saveIdentity(context, kotlinIdentity)
+            StreamPreferences.saveRatchetBlob(context, sealed)
+            persisted = true
+
+            // 7. Cache RAM pour utilisation immédiate.
             this.identity = kotlinIdentity
-            this.ratchet = ratchet
+            this.ratchet = r
 
             // §10.11 — dérive la clé de provenance dédiée depuis la même phrase
             // et scelle son seed 32 o avec la clé PIN du ratchet (nonce frais,
@@ -206,34 +279,13 @@ class StreamUploadManager private constructor(private val context: Context) {
                 // on-demand at disclosure, never baked into a stored, seizable
                 // artifact (motto: a seizure exposes nothing). The provenance seed
                 // is kept only to derive the per-recording OTS blinding salt.
-                // Lot 4b (OPTION B) : le seed est scellé ENTIÈREMENT côté Rust
-                // (lu dans le signer, scellé avec la clé du holder) — il ne
-                // traverse jamais la JVM.
+                // Le seed est scellé ENTIÈREMENT côté Rust (lu dans le signer,
+                // scellé avec la clé du holder) — il ne traverse jamais la JVM.
                 StreamPreferences.saveProvenanceSeedBlob(
                     context, provSigner.sealWithSession()
                 )
             } catch (e: Exception) {
                 Timber.w(e, "provenance seed setup failed at enrollment (non-fatal)")
-            }
-
-            // Phase C (relay-blind reports) — derive the report capability
-            // master seed from the same phrase and PIN-seal it with the ratchet
-            // key (fresh nonce, no second Argon2id), exactly like the provenance
-            // seed above. Held live for the current session so the first
-            // post-onboarding recording addresses + signs its report without a
-            // lock/unlock. Best-effort: a failure here must never break
-            // onboarding (uploads degrade gracefully if the keyring is absent).
-            try {
-                val keyring = FfiReportKeyring.fromMnemonic(mnemonic, byteArrayOf())
-                this.reportKeyring = keyring
-                // Lot 4b (OPTION B) : le report_master est scellé ENTIÈREMENT côté
-                // Rust (lu dans le keyring, scellé avec la clé du holder) — il ne
-                // traverse jamais la JVM.
-                StreamPreferences.saveReportMasterBlob(
-                    context, keyring.sealWithSession()
-                )
-            } catch (e: Exception) {
-                Timber.w(e, "report keyring setup failed at enrollment (non-fatal)")
             }
 
             Timber.d("V2 enrollment complete. Fingerprint: %s",
@@ -257,6 +309,20 @@ class StreamUploadManager private constructor(private val context: Context) {
                 batch0PublicKeys = batch0Pks,
                 enrollmentSignature = enrollSig
             )
+        } catch (e: Exception) {
+            if (!persisted) {
+                // Rien de l'identité n'est sur disque : on défait le reste pour
+                // qu'un nouvel essai reparte de zéro.
+                ratchet?.let { it.wipe(); it.destroy() }
+                pinSessionClear()
+                try {
+                    uniffi.frappuccino.reportStateWipe(reportStatePath())
+                } catch (wipeError: Exception) {
+                    Timber.w(wipeError, "report state cleanup after a failed enrollment")
+                }
+                if (!queueKeyExisted) QueueKeyStore.wipe(context)
+            }
+            throw e
         } finally {
             kit.wipe()
             kit.destroy()
@@ -313,27 +379,20 @@ class StreamUploadManager private constructor(private val context: Context) {
             }
         }
 
-        // Phase C (relay-blind reports) — reload the report keyring via the same
-        // fast per-key open (reuses the holder's Argon2id key, no 2nd Argon2id).
-        // Reconstructed unconditionally if a sealed master exists. Best-effort: a
-        // device enrolled before the feature has no sealed master → keyring stays
-        // null (uploads degrade gracefully).
-        this.reportKeyring = null
-        val reportBlob = StreamPreferences.getReportMasterBlob(context)
-        if (reportBlob != null) {
-            try {
-                // Lot 4b (OPTION B) : descellé + reconstruit côté Rust ; le master
-                // ne traverse jamais la JVM.
-                this.reportKeyring = pinSessionOpenReportKeyring(reportBlob)
-                Timber.d("Report keyring loaded.")
-            } catch (e: Exception) {
-                Timber.w(e, "report keyring load failed at unlock (non-fatal)")
-            }
-        }
+        // La clé de file est normalement installée au démarrage du processus ;
+        // la réinstaller ici ne coûte rien si c'est déjà fait et couvre un
+        // démarrage où le Keystore n'était pas prêt. Elle n'est pas créée ici :
+        // seuls l'enrôlement et la migration en créent une.
+        QueueKeyStore.ensureInstalled(context)
     }
 
     /**
      * Verrouille le ratchet : wipe la RAM, laisse le blob sur disque.
+     *
+     * N'avorte PAS l'écrivain d'un enregistrement en cours : il tient lui-même
+     * la clé de son rapport, côté Rust, et doit pouvoir sceller ses derniers
+     * morceaux et sa clôture après un verrouillage. Seul l'effacement d'urgence
+     * l'avorte.
      */
     @Synchronized
     fun lock() {
@@ -343,136 +402,127 @@ class StreamUploadManager private constructor(private val context: Context) {
         // §10.11 — wipe the session provenance signer alongside the ratchet.
         provenanceSigner?.destroy()
         provenanceSigner = null
-        // Phase C — wipe the session report keyring alongside the ratchet.
-        // (Drain asymmetry §3.3: a later refinement defers this until the
-        // post-stop upload drain completes — report_master is NOT re-derivable,
-        // so a wipe mid-drain loses the pending chunks; for now it mirrors the
-        // provenance signer's lifecycle, which auto-lock already defers while a
-        // recording is running.)
-        reportKeyring?.destroy()
-        reportKeyring = null
         // Lot 4b : la clé Argon2id vit désormais dans le holder Rust (PIN_SESSION,
         // Zeroizing) ; on la zéroïse là. NON câblé sur un 401 (contrairement au
-        // bearer upload) — la clé n'est pas re-dérivable sans le PIN, la vider en
-        // plein drain orphelinerait les chunks.
+        // bearer upload) : la clé n'est pas re-dérivable sans le PIN.
         pinSessionClear()
         Timber.d("Ratchet locked")
     }
 
     /**
-     * Panic wipe : efface tout ce que l'appareil garde en local — l'état crypto
-     * en RAM (ratchet, signer de provenance, report keyring, holder PIN), les
-     * préférences (identité + ratchet blob + mappings de session), le scratch
-     * de capture (copies debug_raw et tout chunk MP4 orphelin de
-     * `cacheDir/stream_chunks`, quelle que soit sa taille), la file d'upload
-     * `.strm` en attente, les preuves de provenance
-     * `filesDir/stream_provenance` (fichiers `.ots`), les marqueurs
-     * `cacheDir/directory_entries` et le bearer d'upload rangé côté Rust.
+     * Panic wipe, partie stream-crypto (l'orchestration complète, services et
+     * WorkManager compris, est côté app : StreamSettingsActivity). Dans l'ordre :
+     *
+     *  1. avorte l'écrivain vivant (sa clé de rapport est effacée sans clôture)
+     *     et détruit le trousseau legacy d'une migration en cours
+     *     ([LegacyReportMigration.destroyLiveKeyring]) ;
+     *  2. verrouille (ratchet, signer de provenance, holder PIN), efface le
+     *     bearer d'upload rangé côté Rust, les préférences (identité, ratchet
+     *     scellé, graine de provenance, reliquats du schéma de rapports
+     *     précédent, alertes), la clé de file et le fichier d'état des
+     *     rapports ;
+     *  3. renomme d'un coup les répertoires qui portent quelque chose de ces
+     *     enregistrements (scratch de capture en clair, miroirs debug, file
+     *     d'enveloppes, répertoire d'échecs, marqueurs, tickets et preuves
+     *     d'horodatage, files du schéma précédent), puis ceux que l'appelant
+     *     détache par [extra], et efface le tout en arrière-plan, en une seule
+     *     passe ordonnée : tout le clair d'abord, le chiffré ensuite.
+     *
+     * La génération d'effacement est avancée en tout premier ([beginWipe]).
+     * L'orchestrateur côté app l'avance lui aussi avant même d'avorter
+     * l'écrivain et d'annuler les jobs ; l'avancer deux fois est sans effet
+     * de bord.
      *
      * C'est un disk-clean complet et pas un simple key-destroy, et ça doit le
-     * rester (forensic Surface 6). L'argument inverse est tentant :
-     * historiquement panicWipe laissait `filesDir/stream_chunk_queue/` (les
-     * `.strm`) sur disque, au motif que ces blobs sont chiffrés E2E, donc
-     * déchiffrables seulement par l'identité qu'on vient d'effacer. Il est
-     * faux : sur un device saisi, leur simple présence est une preuve
-     * forensique — nombre de chunks, tailles, et surtout `sessionId` +
-     * `nonce_prefix` dans les noms de fichiers permettent la corrélation de
-     * session (le risque que `enqueue()` documente déjà). panicWipe est le
-     * chemin "le device est en train d'être saisi". Les call-sites présument
-     * déjà ce comportement, cf. StreamSettingsActivity confirmLock.
+     * rester (forensic Surface 6). L'argument inverse est tentant : les
+     * enveloppes sont chiffrées E2E, donc déchiffrables seulement par l'identité
+     * qu'on vient d'effacer. Il est faux : sur un device saisi, leur simple
+     * présence est une preuve forensique (nombre d'objets, tailles, noms locaux
+     * portant l'identifiant de session), et la clé de file, si elle survivait,
+     * rendrait lisibles les adresses de rapports de leurs trailers.
      */
     @Synchronized
-    fun panicWipe() {
+    fun panicWipe(extra: () -> org.stream.crypto.DetachedDirs = { org.stream.crypto.DetachedDirs() }) {
+        beginWipe()
+        // 1. The live writer first, synchronously: its key must not outlive
+        //    the wipe, and from here on it seals nothing more.
+        try {
+            uniffi.frappuccino.reportWriterAbortLive()
+        } catch (e: Exception) {
+            Timber.w(e, "reportWriterAbortLive failed in panicWipe")
+        }
+        //    So does the legacy keyring of a migration in progress: it is
+        //    destroyed here, not by the migration's cleanup, and the migration
+        //    signs nothing more with it.
+        LegacyReportMigration.destroyLiveKeyring()
+        // 2. Keys and preferences.
         lock()
         identity = null
-        StreamPreferences.wipeAll(context)
-        // Also purge the capture scratch paths: debug_raw plaintext MP4 copies
-        // (Red Team R-H1) and every orphan MP4 chunk in cacheDir/stream_chunks,
-        // whatever its size — including one being encrypted right now. This is
-        // the "device is being seized" path, so nothing in cleartext may
-        // linger: a chunk finalized mid-encryption when the panic fires used to
-        // survive it, the old purge only catching 0-byte files (F-01). FBE
-        // stays the load-bearing at-rest control; this overwrite is
-        // defense-in-depth. (Phase H2-B.11, 2026-05-18 ; F-01, cross-audit
-        // 2026-06-30.)
-        try {
-            org.stream.crypto.capture.CaptureScratchCleaner.purgeAll(context)
-        } catch (e: Exception) {
-            Timber.w(e, "CaptureScratchCleaner.purgeAll failed in panicWipe")
-        }
-        // Secure-delete the pending STRM upload queue
-        // (les fichiers `.strm` de `filesDir/stream_chunk_queue`). clear() iterates
-        // queueDir.listFiles() and Rust-secure_delete's every entry; it is
-        // idempotent and race-safe (secureDeleteFile no-ops on a file a
-        // concurrent upload remove() already deleted, so it can't throw).
-        // ChunkUploadQueue is a stateless wrapper over the fixed queue
-        // path, hence constructed ad-hoc here — StreamUploadManager holds
-        // no queue instance (same pattern as CaptureScratchCleaner above).
-        try {
-            ChunkUploadQueue(context).clear()
-        } catch (e: Exception) {
-            Timber.w(e, "ChunkUploadQueue.clear failed in panicWipe")
-        }
-        // §10.11 — secure-delete the local provenance artifacts
-        // (les `.ots` de `filesDir/stream_provenance`, the opt-in timestamp proofs).
-        // ProvenanceUploadWorker already deletes each one after a confirmed
-        // upload, but the build→upload window and any never-uploaded orphan can
-        // linger ; the seized-device path should leave nothing behind.
-        try {
-            val provDir = File(context.filesDir, "stream_provenance")
-            provDir.listFiles()?.forEach { f ->
-                try {
-                    uniffi.frappuccino.secureDeleteFile(f.absolutePath)
-                } catch (e: Exception) {
-                    Timber.w(e, "panicWipe: secureDelete provenance %s failed, fallback delete()", f.name)
-                    f.delete()
-                }
-            }
-        } catch (e: Exception) {
-            Timber.w(e, "stream_provenance purge failed in panicWipe")
-        }
-        // Phase C — secure-delete the report-directory entry blobs
-        // (the contents of `cacheDir/directory_entries`, the tiny per-session markers that
-        // back the rescue's authoritative n_max). DirectoryEntryWorker deletes
-        // each after a confirmed upload, but the build→upload window or a
-        // never-uploaded orphan can linger; the blob NAME is the report index (a
-        // recording count), so the seized-device path purges them too.
-        try {
-            val dirEntries = File(context.cacheDir, "directory_entries")
-            dirEntries.listFiles()?.forEach { f ->
-                try {
-                    uniffi.frappuccino.secureDeleteFile(f.absolutePath)
-                } catch (e: Exception) {
-                    Timber.w(e, "panicWipe: secureDelete directory entry %s failed, fallback delete()", f.name)
-                    f.delete()
-                }
-            }
-        } catch (e: Exception) {
-            Timber.w(e, "directory_entries purge failed in panicWipe")
-        }
-        // §10.6 (2026-06-13) — zeroize the upload bearer held in Rust. The
-        // seized-device path must not leave the 24 h JWT reachable; clearing
-        // it here makes panicWipe self-contained (the StreamSettingsActivity
-        // panic path also calls UploadAuthHolder.clear(), but we don't rely on
-        // the caller). Drops/zeroizes the Zeroizing<String> in the FFI holder.
+        // §10.6 — zeroize the upload bearer held in Rust. The seized-device
+        // path must not leave the 24 h JWT reachable; clearing it here makes
+        // panicWipe self-contained (the app-side caller also clears it, for the
+        // OkHttp connection pool).
         try {
             uniffi.frappuccino.uploadAuthClear()
         } catch (e: Exception) {
             Timber.w(e, "uploadAuthClear failed in panicWipe")
         }
-        // Re-clear orphan deletion alerts as late as possible.
-        // wipeAll() above already drops them, but a giveup sweep that slipped
-        // past its isUnlocked() gate before lock() could addOrphanDeletion()
-        // concurrently and re-create the key after wipeAll. The events are only
-        // non-secret metadata (count + date, no sessionId), yet the seized-
-        // device path should leave nothing behind; this final clear wins the
-        // realistic race.
+        StreamPreferences.wipeAll(context)
+        QueueKeyStore.wipe(context)
         try {
-            StreamPreferences.clearOrphanDeletions(context)
+            uniffi.frappuccino.reportStateWipe(reportStatePath())
         } catch (e: Exception) {
-            Timber.w(e, "clearOrphanDeletions failed in panicWipe")
+            Timber.w(e, "reportStateWipe failed in panicWipe")
         }
-        Timber.w("PANIC WIPE — all local crypto state + pending queue erased")
+        // 3. Directories: renamed now, overwritten in the background. The
+        //    plaintext ones (capture scratch, debug mirrors) are detached and
+        //    wiped first: they are readable without any key.
+        val plaintext = org.stream.crypto.capture.CaptureScratchCleaner.plaintextDirs(context)
+        val ciphertext = EnvelopeQueue.ALL_DIRS.map { File(context.filesDir, it) } + listOf(
+            File(context.filesDir, LegacyReportMigration.PROVENANCE_DIR),
+            File(context.filesDir, ChunkUploadQueue.DIR_NAME),
+            File(context.filesDir, "stream_migration"),
+            File(context.cacheDir, "stream_encrypted"),
+            File(context.cacheDir, "directory_entries"),
+        )
+        val detach = { dirs: List<File> ->
+            dirs.mapNotNull { dir ->
+                try {
+                    org.stream.crypto.SecureDirWiper.detach(dir)
+                } catch (e: Exception) {
+                    Timber.w(e, "panicWipe: detach failed")
+                    dir
+                }
+            }
+        }
+        val streamPlain = detach(plaintext)
+        val streamCipher = detach(ciphertext)
+        // The caller's directories (the archive viewer's) are renamed in the
+        // same synchronous step, before any overwrite starts.
+        val others = try {
+            extra()
+        } catch (e: Exception) {
+            Timber.w(e, "panicWipe: extra detach failed")
+            org.stream.crypto.DetachedDirs()
+        }
+        org.stream.crypto.SecureDirWiper.wipeInBackground(
+            org.stream.crypto.SecureDirWiper.panicOrder(
+                streamPlain, others.plaintext, streamCipher, others.ciphertext,
+            ),
+            "panic-wipe",
+            others.afterErase,
+        )
+        // A sweep that read the alerts before the wipe could write them back
+        // after it; clearing once more, last, wins that race.
+        try {
+            StreamPreferences.clearReportAlerts(context)
+        } catch (e: Exception) {
+            Timber.w(e, "clearReportAlerts failed in panicWipe")
+        }
+        // Not EnvelopeQueue.get(): it would recreate the queue directories
+        // that were just renamed away.
+        EnvelopeQueue.forgetForWipe(context)
+        Timber.w("PANIC WIPE — local crypto state, report state and queues erased")
     }
 
     // =========================================================================
@@ -544,21 +594,8 @@ class StreamUploadManager private constructor(private val context: Context) {
         return id.ed25519PublicKeyHex()
     }
 
-    /**
-     * Helper pour [rs.readahead.washington.mobile.views.activity.ArchiveModeActivity] :
-     * crée un [org.stream.crypto.ArchiveIdentity] depuis une phrase BIP-39.
-     *
-     * S8c.4 : `ArchiveIdentity` délègue maintenant à `uniffi.frappuccino.
-     * ArchiveIdentity` — zéro lazysodium sur ce path.
-     */
-    fun createArchiveIdentity(
-        mnemonic: ByteArray,
-        passphrase: ByteArray = ByteArray(0)
-    ): org.stream.crypto.ArchiveIdentity {
-        // ByteArray au lieu de CharArray. Le mnemonic ne
-        // touche jamais le pool intern Java côté Kotlin.
-        return org.stream.crypto.ArchiveIdentity.fromMnemonic(mnemonic, passphrase)
-    }
+    // L'identité de déchiffrement du secours ne passe pas par ici :
+    // ArchiveModeActivity appelle `ArchiveIdentity.fromMnemonic` directement.
 
     // =========================================================================
     // V2 SERVER INTERACTION
@@ -673,10 +710,38 @@ class StreamUploadManager private constructor(private val context: Context) {
      * mal-déclenchait à chaque échec). Voir BT-05, et la chaîne de défaillance
      * détaillée au site de décision, plus bas dans le corps.
      *
+     * Tourne sous le verrou d'authentification du processus : deux appels
+     * concurrents (service, balayage, workers) s'exécutent l'un après l'autre,
+     * et la file des preuves de rotation n'est lue et réécrite que par un seul
+     * à la fois. Sans ce verrou, un verify accepté pouvait vider une preuve
+     * qu'une rotation concurrente venait d'ajouter et n'avait pas encore
+     * livrée.
+     *
      * @return true si l'auth a réussi (le bearer est rangé côté Rust par
      *   verify(), jamais retourné ici), false sinon. §10.6.
      */
-    fun authenticateV2(alreadyTriedReEnroll: Boolean = false): Boolean {
+    fun authenticateV2(alreadyTriedReEnroll: Boolean = false): Boolean =
+        synchronized(authLock) { authenticateV2Locked(alreadyTriedReEnroll) }
+
+    /**
+     * Authenticate only if [bearerPresent] says no bearer is held, single-flight
+     * with every other authentication of the process: a caller that finds an
+     * attempt under way waits for it and reuses its bearer instead of spending
+     * a second slot. [mayAuthenticate] is evaluated under the same lock, right
+     * before the attempt (recording running, device locked, no network: no
+     * attempt). Returns whether a bearer is held at the end. Never throws.
+     */
+    fun authenticateIfAbsent(bearerPresent: () -> Boolean, mayAuthenticate: () -> Boolean): Boolean =
+        authGate.ensure(bearerPresent) {
+            mayAuthenticate() && try {
+                authenticateV2()
+            } catch (e: Exception) {
+                Timber.w(e, "authentication threw")
+                false
+            }
+        }
+
+    private fun authenticateV2Locked(alreadyTriedReEnroll: Boolean): Boolean {
         val client = serverClient
             ?: throw IllegalStateException("Server URL not set — call setServerUrl() first")
         val id = identity ?: throw IllegalStateException("Not enrolled")
@@ -809,7 +874,7 @@ class StreamUploadManager private constructor(private val context: Context) {
             }
             if (reEnrolled) {
                 Timber.i("re-enrollment OK, retrying authenticateV2 once")
-                return authenticateV2(alreadyTriedReEnroll = true)
+                return authenticateV2Locked(alreadyTriedReEnroll = true)
             }
             Timber.e("re-enrollment failed — auth will need a manual Settings retry")
         }
@@ -959,8 +1024,12 @@ class StreamUploadManager private constructor(private val context: Context) {
 
     /**
      * Rotation manuelle (ex : depuis Settings). Consomme 1 clé pour signer le nouveau batch.
+     * Sous le verrou d'authentification, comme [authenticateV2] : les deux
+     * lisent et réécrivent la file des preuves de rotation.
      */
-    fun rotateBatchOnServer(): Boolean {
+    fun rotateBatchOnServer(): Boolean = synchronized(authLock) { rotateBatchOnServerLocked() }
+
+    private fun rotateBatchOnServerLocked(): Boolean {
         val client = serverClient
             ?: throw IllegalStateException("Server URL not set")
         val id = identity ?: throw IllegalStateException("Not enrolled")
@@ -1015,16 +1084,44 @@ class StreamUploadManager private constructor(private val context: Context) {
         }
     }
 
+    // =========================================================================
+    // RAPPORTS
+    // =========================================================================
+
+    /** Chemin du fichier d'état des rapports (écrit et scellé par Rust). */
+    fun reportStatePath(): String = File(context.filesDir, REPORT_STATE_FILE).absolutePath
+
+    fun hasReportState(): Boolean = File(reportStatePath()).exists()
+
+    /** Vrai tant que la migration depuis le schéma de rapports précédent n'a pas fini. */
+    fun needsLegacyMigration(): Boolean = LegacyReportMigration.isNeeded(context)
+
     /**
-     * Crée un [org.stream.crypto.capture.StreamChunkEncryptor] lié à l'identité courante.
-     *
-     * **S8c.2** : le chunk encryptor utilise maintenant directement
-     * `uniffi.frappuccino.strmEncrypt` — plus aucune dépendance lazysodium
-     * sur le chemin chunk encryption.
+     * Ouvre le rapport suivant pour un enregistrement et rend son écrivain.
+     * Rust avance l'état et l'écrit durablement AVANT de rendre l'écrivain ;
+     * en cas d'erreur il n'y a pas d'écrivain et l'état est inchangé. Exige la
+     * session PIN (appareil déverrouillé). Un seul écrivain vivant par
+     * processus : un second appel pendant un enregistrement lève WriterBusy.
      */
-    fun createChunkEncryptor(outputDir: File): org.stream.crypto.capture.StreamChunkEncryptor {
-        val id = checkNotNull(identity) { "Not initialized" }
-        return org.stream.crypto.capture.StreamChunkEncryptor(id, outputDir)
+    fun openReportWriter(): FfiReportWriter {
+        val id = checkNotNull(identity) { "Not unlocked" }
+        val author = uniffi.frappuccino.StreamIdentity.fromPublicKeys(
+            id.ed25519PublicKey, id.x25519PublicKey
+        )
+        try {
+            return uniffi.frappuccino.pinSessionOpenReport(reportStatePath(), author)
+        } finally {
+            author.destroy()
+        }
+    }
+
+    /**
+     * L'identité publique vers laquelle tout objet est chiffré, en objet FFI.
+     * L'appelant le libère (`destroy`). Null si l'identité n'est pas chargée.
+     */
+    fun authorIdentity(): uniffi.frappuccino.StreamIdentity? {
+        val id = identity ?: StreamPreferences.getIdentity(context) ?: return null
+        return uniffi.frappuccino.StreamIdentity.fromPublicKeys(id.ed25519PublicKey, id.x25519PublicKey)
     }
 
     // =========================================================================

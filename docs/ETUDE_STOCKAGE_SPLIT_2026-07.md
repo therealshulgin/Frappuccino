@@ -41,6 +41,13 @@ chemin d'écriture. Donations en complément à 8.2.5. Fédération (les orgs h�
 leur relais) = la vraie réponse à l'échelle, post-audit. En attendant, le block
 storage Vultr déjà planifié reste le geste minimal si le disque presse avant.
 
+**Condition ajoutée depuis l'étude** : toute migration de stockage doit **préserver
+les métadonnées utilisateur** des objets, en particulier `x-amz-meta-report-write-sig`,
+la signature d'écriture que le relais garde pour chaque objet (adaptation #6, §2) ;
+`reports.json` et ses clôtures doivent migrer avec les objets (le relais refuse de
+démarrer sur un registre illisible, et un registre plus ancien que les objets perd les
+clôtures récentes).
+
 ## 1. Pourquoi pas le cloud personnel de l'utilisateur
 
 Écarté pour trois ruptures d'architecture, pas pour l'image :
@@ -60,9 +67,13 @@ la fédération (§9, option 3).
 ## 2. Faits code : le split est déjà presque pluggable (vérifié dans le repo)
 
 - **Client S3 générique** : `Minio(config.MINIO_ENDPOINT, access_key, secret_key,
-  secure)` (`storage.py:73-78`), 4 variables d'env (`config.py:7-11`). **7 verbes
-  S3 seulement** dans tout le serveur : `put_object`, `stat_object`, `get_object`,
-  `list_objects`, `remove_object`, `bucket_exists`, `make_bucket`. Aucune API
+  secure)` (`storage.py:73-78`), 4 variables d'env (`config.py:7-11`). À la date de
+  l'étude, **7 verbes S3 seulement** dans tout le serveur : `put_object`,
+  `stat_object`, `get_object`, `list_objects`, `remove_object`, `bucket_exists`,
+  `make_bucket`. Depuis la refonte des rapports, un 8ᵉ : `copy_object` (copie en place
+  avec remplacement des métadonnées, pour poser la signature d'écriture sur un objet
+  stocké avant qu'elle soit gardée), et `put_object` porte une **métadonnée
+  utilisateur** (`x-amz-meta-report-write-sig`). Aucune API
   admin MinIO, aucun header SSE, pas de multipart (PUT à longueur exacte, choix
   documenté pour l'idempotence), pas de presigned URL, pas de requête
   conditionnelle.
@@ -87,6 +98,7 @@ la fédération (§9, option 3).
 | 3 | `MINIO_ENDPOINT` externe + `MINIO_SECURE=true` | Format host:port sans schéma (convention minio-py) |
 | 4 | Test d'intégration minio-py contre l'endpoint réel (HEAD/PUT/GET/LIST/DELETE, write-once, latence) | Obligatoire avant toute bascule ; les quirks S3 se voient à l'usage |
 | 5 | Vérifier la maintenance du client `minio-py` (7.2.12 épinglé) | MinIO Inc a abandonné le serveur ; le client Python peut suivre. Fallback : boto3 |
+| 6 | **Préserver les métadonnées utilisateur**, à l'écriture comme à la migration : le fournisseur doit stocker et rendre `x-amz-meta-report-write-sig`, accepter `copy_object` avec la directive `REPLACE`, et la copie des objets existants (outil de miroir, S3 vers S3) doit emporter les métadonnées utilisateur avec les octets. Contrôle : `deploy/audit-reports-vs-blobs.sh` avant et après, `without_write_sig` ne doit pas augmenter ; le test d'intégration (#4) doit couvrir l'aller-retour de la métadonnée | C'est une **donnée d'intégrité** : pour un rapport jamais clos, la signature d'écriture stockée est la seule chose qui permette au secours de vérifier qu'un objet vient du témoin. Une migration qui la perd rend ces objets invérifiables, sans perte de contenu mais avec perte de preuve |
 
 Latence hot path : chaque chunk = 1 HEAD + 1 PUT sur WAN (~10-30 ms intra-EU),
 négligeable devant la cadence de rotation 5 s.
@@ -223,7 +235,10 @@ nous. Stockage local (block storage) = zéro egress d'ingest, par construction.
 
 Blobs STRM V3 sans identité au repos, scellés vers une clé dont la moitié privée
 n'existe que sur papier. Le fournisseur voit : tailles, cadence, IP du relais
-(jamais celle d'un témoin), et compte facturier. C'est exactement le modèle de
+(jamais celle d'un témoin), et compte facturier ; depuis la refonte des rapports,
+aussi la signature d'écriture de chaque objet (une valeur publique, sans identité)
+et l'objet `manifest` d'un rapport clos (le nombre d'objets et leurs empreintes
+chiffrées). C'est exactement le modèle de
 menace déjà assumé pour MinIO ; le split ne crée **aucune** nouvelle classe
 d'exposition, il déplace un stockage untrusted d'une boîte US (Vultr) vers un
 fournisseur choisi.
@@ -233,7 +248,7 @@ fournisseur choisi.
 | Option | Coût S1→S3 | Effort | Verdict |
 |---|---|---|---|
 | **0. Statu quo + block storage Vultr** (déjà planifié) | $45→$520+ | quasi nul (geste therealshulgin : attacher /dev/vdb) | OK si le disque presse avant la bascule ; garde MinIO mort + relais US |
-| **1. Split S3 externe** (relais inchangé) | ~$25→~$130 | config + 5 adaptations §2 | Retire MinIO du chemin d'écriture ; paie l'egress VPS Vultr à l'échelle |
+| **1. Split S3 externe** (relais inchangé) | ~$25→~$130 | config + 6 adaptations §2 | Retire MinIO du chemin d'écriture ; paie l'egress VPS Vultr à l'échelle |
 | **2. Déménagement cohérent : relais EU + S3 externe EU** | **~€10→~€105** | migration runbook existant (backup/restore one-command, déjà écrit) + adaptations §2 | **Recommandé au moment test fermé/8.2.5** : coût minimal, MinIO retiré, juridiction relais réglée en même temps |
 | 2bis. Souveraineté max : Garage self-host + block storage | ~$45→$520+ | spike Garage | Si on refuse tout tiers ; plus cher, garde la charge d'ops stockage |
 | **3. Fédération** (les orgs hébergent leur relais) | →0 pour nous | docs de déploiement + durcissement | La vraie réponse à l'échelle, **post-audit** |
@@ -271,8 +286,8 @@ fournisseur choisi.
 - Prix relevés le 2026-07-09 ; Storj vient de changer les siens 8 jours avant
   (×10 sur le minimum) : les prix bougent, re-vérifier avant signature.
 - Vérification adverse multi-agents non passée sur ce doc (limite de session) ;
-  les chiffres sont recopiés des fiches sources conservées dans le scratchpad de
-  session. À re-passer si on en fait un canon.
+  les chiffres sont recopiés des fiches sources de la session d'étude, non
+  publiées. À re-passer si on en fait un canon.
 
 ## Annexe : sources principales (échantillon)
 

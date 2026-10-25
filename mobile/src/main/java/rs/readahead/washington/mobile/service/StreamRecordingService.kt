@@ -22,27 +22,43 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.RequestBody.Companion.asRequestBody
-import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
+import org.stream.crypto.StreamPreferences
 import org.stream.crypto.capture.ChunkEncoderBundle
 import org.stream.crypto.capture.RollingChunkRecorder
-import org.stream.crypto.capture.StreamChunkEncryptor
-import org.stream.crypto.upload.ChunkUploadQueue
+import org.stream.crypto.upload.EnvelopeNames
+import org.stream.crypto.upload.EnvelopeQueue
+import org.stream.crypto.upload.QueueKeyStore
+import org.stream.crypto.upload.ReportAlerts
+import org.stream.crypto.upload.ReportProducer
 import org.stream.crypto.upload.StreamUploadManager
 import rs.readahead.washington.mobile.R
+import rs.readahead.washington.mobile.util.jobs.ChunkUploadWorker
+import rs.readahead.washington.mobile.util.jobs.LegacyMigrationWorker
+import rs.readahead.washington.mobile.util.jobs.ProvenanceTimestampWorker
 import rs.readahead.washington.mobile.views.activity.StreamActivity
 import timber.log.Timber
 import java.io.File
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Foreground service for continuous encrypted video streaming.
  *
  * Pipeline: CameraX (camera bind + preview) → GL wedge + MediaCodec
- * (RollingChunkRecorder) → MP4 chunks (5s) → StreamChunkEncryptor (Rust crypto
- * over UniFFI) → STRM blobs → upload queue
+ * (RollingChunkRecorder) → MP4 chunks (5 s) → the report's writer
+ * ([ReportProducer], Rust over UniFFI: encrypt + sign + write an envelope) →
+ * envelope queue → one upload job per envelope ([ChunkUploadWorker]).
+ *
+ * One recording = one report. It is opened before the camera starts (its
+ * directory entry and its metadata are sealed first; if that fails the
+ * recording does not start), every chunk is sealed as it comes, and the
+ * report is closed after the last chunk: the closure is the writer's last
+ * task, submitted once the recorder's stop() has returned. The service stays
+ * in the foreground, wake lock held, until that closure is written; a stop
+ * never blocks the main thread.
  */
 class StreamRecordingService : Service(), LifecycleOwner {
 
@@ -55,10 +71,10 @@ class StreamRecordingService : Service(), LifecycleOwner {
         // Device-side low-storage thresholds (free bytes on
         // the internal /data partition, checked on the 1 Hz notification tick).
         // Below WARN we surface a heads-up in the notification; below CRITICAL
-        // we stop the recording cleanly (finalize + encrypt the current chunk)
-        // before a full disk makes chunk writes fail silently or the OS kills us
-        // uncleanly. CRITICAL is small but enough for a clean finalize (a 720p
-        // HEVC chunk + its .strm blob is only a few MB).
+        // we stop the recording cleanly (finalize + seal the current chunk,
+        // close the report) before a full disk makes chunk writes fail silently
+        // or the OS kills us uncleanly. CRITICAL is small but enough for a
+        // clean finalize (a 720p HEVC chunk + its envelope is only a few MB).
         const val DEVICE_STORAGE_WARN_BYTES = 400L * 1024 * 1024      // 400 MB
         const val DEVICE_STORAGE_CRITICAL_BYTES = 100L * 1024 * 1024  // 100 MB
 
@@ -66,6 +82,43 @@ class StreamRecordingService : Service(), LifecycleOwner {
         const val ACTION_CHUNK_UPDATE = "org.stream.CHUNK_UPDATE"
         const val EXTRA_CHUNKS_ENCRYPTED = "encrypted"
         const val EXTRA_CHUNKS_UPLOADED = "uploaded"
+        const val EXTRA_CHUNKS_LOST = "lost"
+
+        /**
+         * Intent action that ends the recording. Sent with startService, not
+         * stopService: the service then closes the report while still in the
+         * foreground and stops itself once the closure is written. A plain
+         * stopService still works (the same teardown runs from onDestroy), but
+         * without the foreground status protecting it.
+         */
+        const val ACTION_STOP = "org.stream.STOP_RECORDING"
+
+        /**
+         * The safety bound on the recorder's stop(): past it the report is
+         * closed anyway, and a chunk the recorder delivers later is counted
+         * lost and shown. Long on purpose: a normal stop takes well under a
+         * second, and closing early costs a chunk.
+         */
+        private const val RECORDER_STOP_BOUND_MS = 60_000L
+
+        /** How long the teardown waits for the closure to be written. */
+        private const val CLOSE_WAIT_MS = 120_000L
+
+        /**
+         * How long the teardown waits for a report the init thread is still
+         * opening (the migration's first steps, then the two opening seals).
+         */
+        private const val OPENING_WAIT_MS = 120_000L
+
+        /**
+         * After the closure is given up: how long to wait for the writer to
+         * report the chunks it can no longer seal. They fail at once once the
+         * key is gone; only a seal stuck in its own write takes longer.
+         */
+        private const val ABORT_DRAIN_MS = 10_000L
+
+        /** Slack on top of the teardown's own bounds, for the wake lock. */
+        private const val TEARDOWN_MARGIN_MS = 60_000L
 
         // Adaptive quality broadcast for HUD updates.
         const val ACTION_QUALITY_UPDATE = "org.stream.QUALITY_UPDATE"
@@ -91,20 +144,57 @@ class StreamRecordingService : Service(), LifecycleOwner {
         var lastQualityLabel: String = "720p"
             private set
 
+        /** Chunks of the current recording lost at capture (never sealed). */
+        @Volatile @JvmStatic
+        var lastChunksLost: Int = 0
+            private set
+
         /** Reset by the service when a new recording session starts. */
         fun resetCounters() {
             lastChunksEncrypted = 0
             lastChunksUploaded = 0
+            lastChunksLost = 0
             lastQualityLabel = "720p"
         }
 
         /**
-         * Process-local "is a recording session live ?"
-         * flag, read by [rs.readahead.washington.mobile.util.jobs.
-         * OrphanSweepWorker] so it can yield to an active recording
-         * (avoiding auth/upload races on the ratchet slot pool).
-         * Volatile + JvmStatic so cross-thread reads from the worker
-         * see the latest value without needing the service binder.
+         * Single-flight guard: one recording session per process, from the
+         * start command until its teardown has finished (closure written). A
+         * second start command while it is held is ignored: it must not start
+         * a second report, and must not stop the one running either. Rust
+         * refuses a second live writer too; this guard keeps the service from
+         * even trying.
+         */
+        private val sessionClaim = AtomicBoolean(false)
+
+        /** Whether a recording session (or its teardown) holds the process. */
+        @JvmStatic
+        fun isBusy(): Boolean = sessionClaim.get()
+
+        /**
+         * Ask a running recording to stop (closure written in the foreground).
+         * A no-op when no session is running.
+         */
+        fun requestStop(context: Context) {
+            if (!sessionClaim.get()) return
+            try {
+                context.startService(
+                    Intent(context, StreamRecordingService::class.java).setAction(ACTION_STOP)
+                )
+            } catch (e: Exception) {
+                // Background start refused: fall back to a plain stop, which
+                // runs the same teardown from onDestroy.
+                Timber.w(e, "stop intent refused, stopping the service directly")
+                context.stopService(Intent(context, StreamRecordingService::class.java))
+            }
+        }
+
+        /**
+         * Process-local "is a recording session live ?" flag, read by the
+         * workers and the lock-timeout controller so they leave authentication
+         * to the recording while it runs (avoiding races on the ratchet slot
+         * pool). Volatile + JvmStatic so cross-thread reads see the latest
+         * value without needing the service binder.
          */
         @Volatile @JvmStatic
         var isRunning: Boolean = false
@@ -113,15 +203,15 @@ class StreamRecordingService : Service(), LifecycleOwner {
         /**
          * Never let [isRunning] flip to false before this flag is true, and
          * never merge the two : `isShuttingDown` is raised at the very top
-         * of [onDestroy], before `isRunning = false`, and only goes back to
-         * false on the last line of [onDestroy]. Workers
+         * of [requestStop], before `isRunning = false`, and only goes back to
+         * false at the end of the teardown ([finishTeardown]). Workers
          * ([ChunkUploadWorker.ensureFallbackReAuth],
          * [rs.readahead.washington.mobile.util.jobs.OrphanSweepWorker])
          * gate on `isRunning || isShuttingDown`, written literally that
          * way, so the entire teardown window is covered — not just the
-         * instant where `isRunning` flips. Teardown here means the final
-         * queue-drain attempt, the chunkEncryptor close and the
-         * hevcRecorder + GL/encoder/muxer release.
+         * instant where `isRunning` flips. Teardown here means the recorder
+         * stop, the last seals, the report's closure and the release of the
+         * GL/encoder/muxer.
          *
          * What reopening that window costs : a worker that wakes up
          * between `isRunning=false` and the end of teardown (~50-500 ms
@@ -132,9 +222,9 @@ class StreamRecordingService : Service(), LifecycleOwner {
          * no_auth_token loop or a half-published JWT. Seen once, on
          * OnePlus 13 at 2026-05-19T00:14:34 (Blue HIGH-6, Phase H2-B.16).
          *
-         * Clearing it on the last line matters too : a new service
-         * instance, or a parallel orphan sweep running after this one is
-         * fully dead, has to start from a clean flag.
+         * Clearing it at the very end of the teardown matters too : a new
+         * service instance, or a parallel orphan sweep running after this one
+         * is fully dead, has to start from a clean flag.
          *
          * A normal stop does NOT wipe the V2 ratchet — only an explicit
          * `StreamUploadManager.lock()` / `panicWipe()` does. So
@@ -147,15 +237,14 @@ class StreamRecordingService : Service(), LifecycleOwner {
             private set
 
         /**
-         * Do not fold this into [pendingChunks] as a duplicate : it mirrors
-         * the same count, but [pendingChunks] is a private instance field
-         * and the service-less [V2LockTimeoutController] cannot read it,
-         * hence a process-scoped copy. The controller defers two teardown
-         * actions while this is > 0 — the upload-JWT auto-clear and the
-         * ratchet auto-lock. A chunk mid-encryption is not yet in the
-         * upload queue and so is invisible to that controller's
-         * queue-pending guard : that is the gap that strands the last chunk
-         * on `no_auth_token` (ROADMAP 2.2.6).
+         * Chunks handed to the writer and not sealed (or given up) yet. Do not
+         * fold this into [pendingChunks] as a duplicate : it mirrors the same
+         * count, but [pendingChunks] is a private instance field and the
+         * service-less [V2LockTimeoutController] cannot read it, hence a
+         * process-scoped copy. The controller defers the upload-JWT
+         * auto-clear and the ratchet auto-lock while this is > 0: a chunk
+         * being sealed is not in the queue yet, so the queue cannot vouch for
+         * it.
          */
         @JvmStatic
         private val encryptionsInFlightCounter = AtomicInteger(0)
@@ -169,7 +258,12 @@ class StreamRecordingService : Service(), LifecycleOwner {
 
     override fun getLifecycle(): Lifecycle = lifecycleRegistry
 
-    private var wakeLock: PowerManager.WakeLock? = null
+    // Created and taken on the main thread when the session claim is taken,
+    // released on the main thread at the very end of the teardown
+    // ([finishTeardown]): one thread for both, so the release can never run
+    // before the acquire. Not reference counted, so the re-acquire at the stop
+    // (which re-arms its timeout for the teardown) needs only one release.
+    @Volatile private var wakeLock: PowerManager.WakeLock? = null
     // [startCamera] drives this rolling HEVC recorder (GL wedge +
     // MediaCodec) as the sole capture pipeline.
     private var hevcRecorder: RollingChunkRecorder? = null
@@ -201,21 +295,62 @@ class StreamRecordingService : Service(), LifecycleOwner {
     @Volatile private var currentHevcBitrateMode:
         org.stream.crypto.capture.ChunkEncoderBundle.BitrateMode =
         org.stream.crypto.capture.ChunkEncoderBundle.BitrateMode.VBR
-    private var chunkEncryptor: StreamChunkEncryptor? = null
 
-    // §10.11 — provenance : hash SHA-256 de chaque chunk EN CLAIR, keyé par
-    // seqNum (l'ordre du Merkle ne dépend pas de l'ordre de fin des threads
-    // d'encryption). `provenanceActive` est un snapshot pris au démarrage de
-    // session (toggle ON + signer chargé) → cohérent sur tout l'enregistrement.
-    private val provenanceChunkHashes = java.util.concurrent.ConcurrentHashMap<Int, ByteArray>()
+    // The writer of this recording's report, through its single thread. Set
+    // once the report is open (directory entry + metadata sealed); null before
+    // that and for a start that failed.
+    @Volatile private var producer: ReportProducer? = null
+    private var envelopeQueue: EnvelopeQueue? = null
+
+    // The emergency-wipe generation when this session started. If it moved,
+    // the identity this session wrote for no longer exists: nothing more of it
+    // may be written (no alert, no timestamp ticket).
+    @Volatile private var wipeGenerationAtStart: Int = 0
+
+    // §10.11 — whether this recording is tracked for provenance: a snapshot
+    // taken at session start (toggle ON + signer loaded), so the perimeter stays
+    // the same for the whole recording even if the toggle changes meanwhile.
+    // The chunk hashes themselves come from the writer at closure.
     @Volatile private var provenanceActive: Boolean = false
-    private var uploadQueue: ChunkUploadQueue? = null
+
+    // Teardown state: requested once ([requestStop]); past the recorder's
+    // stop (or its safety bound) every chunk still delivered is lost.
+    private val stopRequested = AtomicBoolean(false)
+    @Volatile private var acceptingChunks = true
+
+    // Orders the start of the session's report and recorder against the
+    // teardown: whatever the teardown reads under it is what it stops, and
+    // nothing starts after that read.
+    private val lifecycleLock = Any()
+
+    // Counted down by the init thread once the report it opens is published
+    // (or once it gave up opening one). The teardown waits for it before it
+    // looks for the report, so a report opened while the stop was arriving is
+    // closed by the teardown, in the foreground and under the wake lock, and
+    // the session claim is only released after the writer is.
+    private val openingDone = java.util.concurrent.CountDownLatch(1)
+
+    // The network callback, registered by the init thread after the initial
+    // authentication and removed by requestStop: never registered after the
+    // stop, so none outlives the session.
+    private val networkRegistration =
+        org.stream.crypto.capture.StopGuardedRegistration<android.net.ConnectivityManager.NetworkCallback>()
+
+    // Whether this instance took the session claim (a start command that was
+    // ignored, or a stop request sent to an idle service, did not).
+    @Volatile private var ownsSession = false
+
+    // The session claim is released once BOTH the teardown has finished and
+    // onDestroy has run, whichever comes last: a start arriving in between
+    // would otherwise land on an instance that is being destroyed.
+    private var teardownFinished = false
+    private var destroyCalled = false
 
     // Revised H2-B §Bugs #5 — CameraX refs promoted to fields by
     // [startCamera]. They no longer serve to rebind the camera (a quality
     // swap is done in place by the recorder) : [applyQuality] reads them
     // only as a readiness signal — non-null means the initial startCamera
-    // bind ran. Reset to null in onDestroy so a late callback can't work on
+    // bind ran. Reset to null at the end of the teardown so a late callback can't work on
     // a dead service.
     private var cameraProviderRef: androidx.camera.lifecycle.ProcessCameraProvider? = null
     private var previewRef: Preview? = null
@@ -252,14 +387,15 @@ class StreamRecordingService : Service(), LifecycleOwner {
         }
         .build()
 
-    private var sessionId: String = ""
+    @Volatile private var sessionId: String = ""
     private val chunksEncrypted = AtomicInteger(0)
-    // Compteur des Threads d'encryption en cours : onChunkReady lance un
-    // Thread pour encrypter chaque chunk MP4, et onDestroy attend que ce
-    // compteur retombe à 0 avant de nettoyer le chunkDir. Ce n'est pas un
-    // compteur de confort — sans cette attente, le cleanup efface des MP4 dont
-    // le chiffrement n'a pas encore rendu de blob, donc des chunks perdus à
-    // l'arrêt (Phase 2.1.5).
+    // Chunks of this recording lost at capture. Written to the alerts in bulk
+    // at the closure, and one by one for a loss that comes after it.
+    @Volatile private var losses = org.stream.crypto.capture.CaptureLossLedger()
+    // Chunks remis à l'écrivain et pas encore terminés (scellés ou abandonnés).
+    // C'est la FIFO de l'écrivain qui ordonne la clôture après eux ; ce
+    // compteur est ce que lit le contrôleur de verrouillage (via
+    // encryptionsInFlightCounter) et ce qu'affiche la métrique snapshot.
     //
     // Ne jamais recompter les chunks uploadés avec un AtomicInteger incrémenté
     // à l'enqueue, comme le faisait `chunksUploaded` : scheduleUpload() reparcourt
@@ -271,34 +407,37 @@ class StreamRecordingService : Service(), LifecycleOwner {
     private val pendingChunks = AtomicInteger(0)
 
     /**
-     * Names of the blobs already passed to `WorkManager.enqueueUniqueWork`,
-     * so `scheduleUpload` doesn't re-enqueue the whole pending list every
-     * time a new chunk is produced.
+     * Names of the envelopes already passed to `WorkManager.enqueueUniqueWork`,
+     * so `scheduleUpload` doesn't re-enqueue the whole queue every time a new
+     * chunk is sealed.
      *
-     * This set MUST be emptied on NetworkCallback recovery — the
-     * `onAvailable` path calls `enqueuedBlobNames.clear()`. Without that
-     * reset, a worker that has FAILED, or whose ENQUEUED state was just
-     * cancelled, can never be re-enqueued and the whole backlog stays stuck
-     * until the process dies.
+     * This set MUST be emptied on NetworkCallback recovery — the `onAvailable`
+     * path calls `enqueuedEnvelopeNames.clear()`. Without that reset, a job
+     * that has ended, or whose ENQUEUED state was just cancelled, can never be
+     * re-enqueued from here.
      *
-     * The set is not there for correctness : `ExistingWorkPolicy.KEEP`
-     * already makes a re-enqueue a no-op on the WorkManager side. It is
-     * there for the cost, because `scheduleUpload` walks the entire pending
-     * list on every chunk produced and each call is an IPC roundtrip + a SQL
-     * hit on the WorkManager DB. With 200 pending blobs (long outage) and 1
-     * new chunk every 5 s, that's 200 IPC + 200 SQL hits per 5 s = 40 IPC/s
-     * baseline on Seeker (low-end MTK, contributed to thermal observed
-     * 2026-05-18), O(N²) over the outage window. With the set, each new blob
-     * costs at most 1 IPC call. Read that before dismissing it as an obscure
-     * micro-optimisation sitting in front of an already idempotent API
-     * (Blue MED-4, Phase H2-B.15).
+     * The set is not there for correctness : `ExistingWorkPolicy.KEEP` already
+     * makes a re-enqueue a no-op on the WorkManager side. It is there for the
+     * cost: each enqueue is an IPC roundtrip + a SQL hit on the WorkManager DB,
+     * and walking a 200-envelope backlog on every 5 s chunk adds up on low-end
+     * devices (Blue MED-4, Phase H2-B.15).
      *
-     * Thread-safety : ConcurrentHashMap.newKeySet, accessed from
-     * `scheduleUpload` (Thread bg from onChunkReady) and from the
-     * NetworkCallback path (binder thread).
+     * Thread-safety : ConcurrentHashMap.newKeySet, accessed from the writer
+     * thread (each sealed chunk) and from the NetworkCallback path.
      */
-    private val enqueuedBlobNames =
+    private val enqueuedEnvelopeNames =
         java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    // Runs the auth upkeep (offline-start recovery, JWT refresh) that used to
+    // ride on each chunk's encryption thread. Kept off the writer thread, which
+    // must never wait on the network. One task at a time; a kick while one is
+    // queued is dropped (the cooldowns make it redundant anyway).
+    private val authExecutor = java.util.concurrent.ThreadPoolExecutor(
+        1, 1, 0L, TimeUnit.MILLISECONDS,
+        java.util.concurrent.ArrayBlockingQueue(1),
+        { r -> Thread(r, "recording-auth").apply { isDaemon = true } },
+        java.util.concurrent.ThreadPoolExecutor.DiscardPolicy(),
+    )
 
     // 2026-05-09 — retry initServerSession au network-up (cas : recording
     // démarré offline, wifi arrive plus tard). Cooldown 30s pour ne pas
@@ -307,44 +446,23 @@ class StreamRecordingService : Service(), LifecycleOwner {
     @Volatile private var lastAuthAttemptMs: Long = 0L
     private val AUTH_RETRY_COOLDOWN_MS = 30_000L
     // Never cache the bearer JWT here as a String field. It lives in a
-    // Zeroizing holder inside Rust (stashed by verify()) and the upload path
-    // pulls a transient "Bearer <jwt>" from it via UploadAuthHolder.get() ;
-    // keeping a copy "to save an FFI roundtrip" puts the bearer back in the JVM
-    // heap and reopens the heap-dump finding (§10.6, 2026-06-13). What this
-    // service keeps is `authTokenIssuedAtMs` below : a non-secret "do we have
-    // an auth session" signal (> 0L) plus refresh clock.
+    // Zeroizing holder inside Rust (stashed by verify()); a creation request
+    // has Rust attach it from that holder. Keeping a copy "to save an FFI
+    // roundtrip" puts the bearer back in the JVM heap and reopens the heap-dump
+    // finding (§10.6, 2026-06-13). What this service keeps is
+    // `authTokenIssuedAtMs` below : a non-secret "do we have an auth session"
+    // signal (> 0L) plus refresh clock.
     //
-    // There is no server-assigned report id any more (Phase C, relay-blind
-    // reports). `reportId` is the phrase-derived, identity-free report address
-    // (reportKeyring.reportIdHex(reportIndex)), allocated locally at session
-    // start, with no network involved — do not add a "create report" POST, it
-    // would break both the offline start and the relay's blindness. The record
-    // is created lazily by the metadata blob's first PUT. `reportId` itself is
-    // only kept as a presence signal : the uploadKicker tick and maybeRetryAuth
-    // check it is non-null before doing anything. Addressing goes through
-    // `reportIndex` everywhere — both the chunk upload path and the opt-in
-    // provenance .ots upload carry the index and re-derive the id + signatures
-    // inside Rust from the live keyring.
+    // There is no report creation call either: the report is opened locally
+    // (Rust advances the report state, no network), and the relay creates its
+    // record from the first envelope sent in creation mode. A recording begun
+    // offline therefore has its report from the start.
     //
-    // @Volatile is load-bearing on `reportId` and on the auth-session signal
-    // (authTokenIssuedAtMs, below) : both are written on the init thread
-    // (Thread { initServerSession() } from onStartCommand) and read from at
-    // least three other threads :
-    //   - the main-looper notification refresher / uploadKicker tick
-    //   - the NetworkCallback (onAvailable runs on the binder pool)
-    //   - the onChunkReady encryption thread that fires scheduleUpload
-    // Without @Volatile the JMM doesn't guarantee the readers see the value the
-    // init thread wrote ; a reader left on a stale null simply never starts an
-    // upload, with no exception and no crash (Phase 3.36).
-    @Volatile private var reportId: String? = null
-
-    // Phase C — the report's derivation index n for this session (report_id =
-    // reportKeyring.reportIdHex(n)). Allocated once at session start via
-    // StreamPreferences.allocateReportIndexForSession (atomic + idempotent on
-    // sessionId). Passed to ChunkUploadWorker, which re-derives the capability
-    // (report_id + 0x07/0x08 signatures) inside Rust from the live reportKeyring.
-    // -1 until allocated.
-    @Volatile private var reportIndex: Int = -1
+    // @Volatile is load-bearing on the auth-session signal: it is written on
+    // the init thread and read from the notification refresher, the
+    // NetworkCallback (binder pool) and the auth executor. A reader left on a
+    // stale value simply never refreshes, with no exception and no crash
+    // (Phase 3.36).
 
     // JWT refresh proactif. Le token V2 dure 24h côté serveur
     // (config.JWT_EXPIRE_HOURS = 24). On rafraîchit quand age > 23h pour
@@ -358,12 +476,12 @@ class StreamRecordingService : Service(), LifecycleOwner {
     private val JWT_REFRESH_THRESHOLD_MS = 60 * 60 * 1000L  // refresh à T-1h
     private val JWT_REFRESH_COOLDOWN_MS = 30_000L
 
-    // NetworkCallback proper, déclenché par le système au moment
-    // exact où une nouvelle network VALIDATED devient disponible. Plus rapide
-    // que le polling à chaque chunk (5s) et beaucoup plus léger en CPU. Le
-    // cooldown 30s sur maybeRetryAuth() est conservé pour éviter de hammer
-    // auth si le réseau flap (wifi qui se connecte / déconnecte vite).
-    private var networkCallback: android.net.ConnectivityManager.NetworkCallback? = null
+    // Le NetworkCallback (voir [networkRegistration]) est déclenché par le
+    // système au moment exact où une nouvelle network VALIDATED devient
+    // disponible. Plus rapide que le polling à chaque chunk (5s) et beaucoup
+    // plus léger en CPU. Le cooldown 30s sur maybeRetryAuth() est conservé
+    // pour éviter de hammer auth si le réseau flap (wifi qui se connecte /
+    // déconnecte vite).
 
     // Notification persistante format complet
     // (`Streaming... 12 chunks • 00:01:05`). recordingStartMs est posé quand
@@ -371,14 +489,14 @@ class StreamRecordingService : Service(), LifecycleOwner {
     // vraiment"). Le notificationRefresher tique toutes les 1s pour que le
     // timer affiché bouge même entre deux chunks (chunk = 5s).
     @Volatile private var recordingStartMs: Long = 0L
-    // Set this flag in onDestroy BEFORE the `removeCallbacks()` calls, and
-    // keep the `if (isDestroyed) return` at the top of every Handler
+    // Set this flag when the teardown starts, BEFORE the `removeCallbacks()`
+    // calls, and keep the `if (isDestroyed) return` at the top of every Handler
     // runnable. removeCallbacks looks sufficient on its own and is not : a
-    // runnable already mid-`run()` when onDestroy calls remove re-schedules
+    // runnable already mid-`run()` when the teardown calls remove re-schedules
     // a NEW task with the postDelayed at the end of run(), one the prior
-    // removeCallbacks didn't cover. That task keeps the destroyed service's
+    // removeCallbacks didn't cover. That task keeps the stopping service's
     // runnable alive, logging stale snapshots and broadcasting stale HUD
-    // counters from the dead instance. Nothing crashes, no test turns red.
+    // counters from a dead session. Nothing crashes, no test turns red.
     //
     // The receiving side can't clean this up : the activity receiver has no
     // way to distinguish broadcasts by service generation, so this flag is
@@ -419,10 +537,10 @@ class StreamRecordingService : Service(), LifecycleOwner {
         override fun run() {
             if (isDestroyed) return  // Phase 3.47 — see notificationRefreshTask comment.
             try {
-                if (recordingStartMs > 0L && authTokenIssuedAtMs > 0L && reportId != null) {
-                    // Only count current-session blobs.
-                    // Orphans don't trigger a kick.
-                    val pending = uploadQueue?.getPendingCountForSession(sessionId) ?: 0
+                if (recordingStartMs > 0L) {
+                    // The whole queue, not only this session: an envelope needs
+                    // neither the session nor a bearer to be scheduled.
+                    val pending = envelopeQueue?.pendingCount() ?: 0
                     if (pending > 0 && isNetworkAvailable()) {
                         Timber.d("[Phase 3.23] kick — %d pending, reschedule", pending)
                         scheduleUpload()
@@ -451,7 +569,8 @@ class StreamRecordingService : Service(), LifecycleOwner {
     //        en scène sombre)
     // emitDeviceTelemetry n'émet exactement que ces deux grandeurs, une par
     // hypothèse. Tick toutes les 5 s pendant un recording (alignement
-    // glFrameRate cadence). Cleanup symétrique dans onDestroy (Phase H2-B.8).
+    // glFrameRate cadence). Cleanup symétrique au début de la fin de session
+    // (requestStop, Phase H2-B.8).
     @Volatile private var lastAeFpsRange: android.util.Range<Int>? = null
     private val deviceTelemetryRefresher = Handler(Looper.getMainLooper())
     private val deviceTelemetryTask = object : Runnable {
@@ -543,8 +662,9 @@ class StreamRecordingService : Service(), LifecycleOwner {
     private fun emitSnapshotMetric() {
         if (recordingStartMs <= 0L) return
         try {
-            val pending = uploadQueue?.getPendingCountForSession(sessionId) ?: -1
-            val totalOnDisk = uploadQueue?.getPendingCount() ?: -1
+            val queue = envelopeQueue
+            val pending = queue?.pendingChunksOfSession(sessionId) ?: -1
+            val totalOnDisk = queue?.pendingCount() ?: -1
             val orphans = (totalOnDisk - pending).coerceAtLeast(0)
             val quality = org.stream.crypto.capture.AdaptiveQualityHolder
                 .get()?.currentQuality?.displayLabel ?: "?"
@@ -553,9 +673,9 @@ class StreamRecordingService : Service(), LifecycleOwner {
             val net = detectNetworkType()
             val elapsedSec = (System.currentTimeMillis() - recordingStartMs) / 1000
             Timber.tag("StreamMetrics").i(
-                "snapshot t=%ds quality=%s cap=%d backlog=%d orphans=%d encrypted=%d uploaded=%d networkType=%s",
+                "snapshot t=%ds quality=%s cap=%d backlog=%d others=%d sealed=%d uploaded=%d lost=%d sealing=%d networkType=%s",
                 elapsedSec, quality, cap, pending, orphans,
-                chunksEncrypted.get(), lastChunksUploaded, net,
+                chunksEncrypted.get(), lastChunksUploaded, losses.total, pendingChunks.get(), net,
             )
         } catch (e: Exception) {
             Timber.tag("StreamMetrics").w(e, "snapshot failed")
@@ -618,26 +738,28 @@ class StreamRecordingService : Service(), LifecycleOwner {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // Mark service as running so OrphanSweepWorker
-        // yields its tick instead of racing for auth slots.
-        isRunning = true
-        // Defensive clear. Normally `onDestroy` of the
-        // previous instance has already reset `isShuttingDown` to false
-        // (at the very end, after teardown), but if a brand-new
-        // service instance starts before the prior one's onDestroy
-        // fully completed (uncommon but legal), clearing here ensures
-        // workers don't see a stale "shutdown in progress" indicator.
-        isShuttingDown = false
-        // Fresh session : drop any stray in-flight count a
-        // prior crashed instance might have left non-zero.
-        encryptionsInFlightCounter.set(0)
+        // A stop request comes through startService (not stopService) so that
+        // the closure is written while the service is still in the foreground.
+        // It needs no startForeground: it was not sent with
+        // startForegroundService.
+        if (intent?.action == ACTION_STOP) {
+            if (sessionClaim.get()) {
+                requestStop("user")
+            } else {
+                stopSelf()
+            }
+            return START_NOT_STICKY
+        }
 
-        // CRITIQUE — Bug 2026-05-09 reproduit in-vivo therealshulgin :
+        // CRITIQUE — Bug 2026-05-09 reproduit sur appareil :
         // ForegroundServiceDidNotStartInTimeException kill le process si
         // startForeground() n'est pas appelé < 5s après startForegroundService().
         // Hardening : startForeground EN PREMIER, avant TOUT autre init.
-        // Aucun appel JNI / IO / réseau / DB avant. Tout le reste va dans
-        // un Thread bg qui ne peut pas faire planter le main thread.
+        // Aucun appel JNI / IO / réseau / DB avant (le wake lock est pris plus
+        // bas, après startForeground). Tout le reste va dans
+        // un Thread bg qui ne peut pas faire planter le main thread. Ceci vaut
+        // aussi pour une commande de démarrage ignorée plus bas : chaque
+        // startForegroundService exige son startForeground.
 
         // 1. Notification minimale safe — fallback si buildNotification throw
         //    (canal pas encore créé, ressource manquante, etc.)
@@ -669,22 +791,60 @@ class StreamRecordingService : Service(), LifecycleOwner {
             // sur Android 12+ par exemple), on ne peut rien faire de plus —
             // mieux vaut stopSelf cleanly que laisser le process être killed.
             Timber.e(e, "startForeground threw — stopping service")
-            stopSelf()
+            if (!sessionClaim.get()) stopSelf()
             return START_NOT_STICKY
         }
+
+        // Single-flight: a second start while a session (or its teardown)
+        // holds the process is ignored. Never stopSelf here: that would end
+        // the session that is running.
+        if (!sessionClaim.compareAndSet(false, true)) {
+            Timber.w("start command ignored: a recording session is already active")
+            return START_STICKY
+        }
+        ownsSession = true
+
+        // The wake lock is taken here, on the main thread, and released by
+        // finishTeardown on the same thread: a stop that arrives before the
+        // init thread has run can no longer release it first and leave the
+        // init thread to take it for hours afterwards.
+        try {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "frappuccino:stream").apply {
+                setReferenceCounted(false)
+                acquire(4 * 60 * 60 * 1000L)
+            }
+        } catch (e: Exception) {
+            Timber.w(e, "wake lock not taken")
+        }
+
+        // Mark the session running so the workers leave authentication to it.
+        isRunning = true
+        // Defensive clear: a previous instance clears it at the end of its
+        // teardown, which this claim waited for.
+        isShuttingDown = false
+        // Fresh session : drop any stray in-flight count a prior crashed
+        // instance might have left non-zero.
+        encryptionsInFlightCounter.set(0)
+        stopRequested.set(false)
+        acceptingChunks = true
 
         Timber.d("StreamRecordingService — startForeground OK at %d", System.currentTimeMillis())
 
         // 3. Tout le reste de l'init dans un Thread bg avec try/catch global.
-        //    Si quoi que ce soit throw (uploadManager null, NPE,
-        //    encryptMetadata fail, etc.), on log + stopSelf — pas de
+        //    Si quoi que ce soit throw, on log + on arrête proprement (la
+        //    même fin de session qu'un stop utilisateur) — pas de
         //    propagation d'exception qui kill le process.
         Thread {
             try {
                 initializePipelineFromOnStart()
             } catch (e: Exception) {
                 Timber.e(e, "Pipeline init failed — stopping service")
-                stopSelf()
+                requestStop("init")
+            } finally {
+                // Whatever happened, the teardown must not wait for an opening
+                // that will never come.
+                openingDone.countDown()
             }
         }.start()
 
@@ -692,27 +852,28 @@ class StreamRecordingService : Service(), LifecycleOwner {
     }
 
     /**
-     * Sépare le pipeline init lourd (encryption, server auth, camera bind)
-     * du onStartCommand. Appelé depuis un Thread bg pour ne jamais bloquer
-     * le main thread > 5s (qui ferait crasher le process avec
+     * Sépare le pipeline init lourd (ouverture du rapport, server auth, camera
+     * bind) du onStartCommand. Appelé depuis un Thread bg pour ne jamais
+     * bloquer le main thread > 5s (qui ferait crasher le process avec
      * ForegroundServiceDidNotStartInTimeException).
+     *
+     * Le rapport est ouvert AVANT la caméra : son entrée d'annuaire et ses
+     * métadonnées (seq 0) sont scellées d'abord, et un échec arrête tout,
+     * caméra jamais démarrée. L'index ouvert est alors perdu, ce que le
+     * secours tolère (un trou dans la suite des index).
      */
     private fun initializePipelineFromOnStart() {
-        // Wake lock
-        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "frappuccino:stream")
-        wakeLock?.acquire(4 * 60 * 60 * 1000L)
-
-        // V2 live streaming uses chunk capture (no legacy vault provider).
-        // `isUnlocked()` est le bon predicate.
+        // Opening a report reads the report state, sealed under the PIN-session
+        // key: the device must be unlocked.
         val uploadManager = StreamUploadManager.getInstance()
         if (uploadManager == null || !uploadManager.isUnlocked()) {
             Timber.e("StreamUploadManager not unlocked — cannot stream")
-            stopSelf()
+            requestStop("locked")
             return
         }
 
         sessionId = generateSessionId()
+        wipeGenerationAtStart = StreamUploadManager.wipeGeneration()
 
         // Re-arm QUIC for this recording. A previous session that hit a
         // UDP-blocked network latched the transport to DirectTls so its
@@ -724,130 +885,77 @@ class StreamRecordingService : Service(), LifecycleOwner {
         //
         // This call is the whole reason the latch clears at all: it used to be a
         // side effect of `uploadCreateReport`, which lost its last caller when
-        // report creation became lazy (minted by the seq-0 PUT), so the re-arm
-        // stopped firing without anything failing. Do not fold it back into
-        // another call for tidiness. It is idempotent and cannot throw.
+        // report creation became lazy, so the re-arm stopped firing without
+        // anything failing. Do not fold it back into another call for tidiness.
+        // It is idempotent and cannot throw.
         uniffi.frappuccino.uploadTransportRearm()
 
-        uploadQueue = ChunkUploadQueue(this)
+        val queue = EnvelopeQueue.get(this)
+        envelopeQueue = queue
 
-        // allocateReportIndexForSession is atomic + idempotent on sessionId, so
-        // a process restart mid-session reuses the same n (never a 2nd report).
-        // Don't replace it with a direct derivation and don't move the call :
-        // the blobs already handed to the relay are addressed to the report_id
-        // of the first n, and a second n would leave them attached to nothing.
-        // The derivation is LOCAL (no network: works offline, unlike the old
-        // report-creation POST it replaces), so don't put a connectivity check
-        // or a retry in front of it either. The server-side record is created
-        // lazily by the metadata blob's first PUT (seq 0 = creation).
-        //
-        // reportKeyring is loaded at unlock (mirror of provenanceSigner); if it
-        // is somehow absent on an unlocked manager (best-effort reload failed)
-        // we can't address a report — bail cleanly, rather than record chunks
-        // that could not be attached to anything. That is deliberately harsher
-        // than OrphanSweepWorker, which defers and retries in the same
-        // situation. (Phase C, relay-blind reports.)
-        val reportKeyring = uploadManager.reportKeyring
-        if (reportKeyring == null) {
-            Timber.e("Phase C: reportKeyring absent on unlocked manager — cannot derive report, stopping")
-            stopSelf()
+        // No report can be opened before the report state exists. A device
+        // updated from the legacy scheme gets it from the migration, normally
+        // run right after the unlock; if this recording came first, only the
+        // migration's first steps (the state) run here, and its conversions go
+        // on in the background (LegacyMigrationWorker).
+        if (!uploadManager.hasReportState() && uploadManager.needsLegacyMigration()) {
+            LegacyMigrationWorker.ensureStateBlocking(this)
+            LegacyMigrationWorker.start(this)
+        }
+        if (!uploadManager.hasReportState()) {
+            Timber.e("no report state — cannot open a report, stopping")
+            requestStop("no_state")
             return
         }
-        val reportEntry = org.stream.crypto.StreamPreferences.allocateReportIndexForSession(
-            this, sessionId
-        ) { n -> reportKeyring.reportIdHex(n.toUInt()) }
-        reportIndex = reportEntry.reportIndex
-        reportId = reportEntry.reportId
-        Timber.i(
-            "Phase C: session %s → report index %d (id %s…)",
-            sessionId, reportIndex, reportId?.take(8) ?: "?"
-        )
-        // Phase C — append this index to the report directory so the rescue can
-        // read the authoritative n_max and enumerate reports EXACTLY (no
-        // hole-tolerance guess). Idempotent per index (unique work), retried by
-        // WorkManager; serves the rescue, not the live upload.
-        scheduleDirectoryEntry(reportIndex)
+        if (!QueueKeyStore.ensureInstalled(this)) {
+            Timber.e("no queue key — no envelope can be written, stopping")
+            requestStop("no_queue_key")
+            return
+        }
+        // A stop that came meanwhile (during the migration, say): open no
+        // report for it, which would spend an index and leave an empty report.
+        if (stopRequested.get()) return
+
+        // Reset les compteurs statiques pour que l'UI ne montre
+        // pas des valeurs périmées d'une session précédente. Avant
+        // l'ouverture du rapport : dès qu'il est publié, le démontage peut
+        // les lire.
+        chunksEncrypted.set(0)
+        losses = org.stream.crypto.capture.CaptureLossLedger()
+        resetCounters()
+
+        // Open the report: Rust advances the state durably, then hands back
+        // the writer. Its directory entry and its metadata are sealed before
+        // the camera starts.
+        val writer = try {
+            uploadManager.openReportWriter()
+        } catch (e: uniffi.frappuccino.FfiException.WriterBusy) {
+            Timber.e("a report writer is already live in this process, stopping")
+            requestStop("writer_busy")
+            return
+        }
+        val p = ReportProducer(writer, queue, sessionId) { QueueKeyStore.ensureInstalled(this) }
+        try {
+            p.open(buildSessionMetadata().toByteArray(Charsets.UTF_8))
+        } catch (e: Exception) {
+            Timber.e(e, "report opening failed — recording not started")
+            requestStop("open_failed")
+            return
+        }
+        // Published even if the stop came while the report was being opened:
+        // the teardown waits for [openingDone] before it looks for the report,
+        // so it is the one that closes it, in the foreground and under the
+        // wake lock. Nothing more starts after a stop: no camera, no auth.
+        synchronized(lifecycleLock) { producer = p }
+        openingDone.countDown()
+        if (stopRequested.get()) return
+        Timber.i("report opened for this session")
 
         // Transport plan, ROADMAP §10.9 Gate 0 — start the
         // per-session upload counters and log the active TCP congestion
-        // control. The sender governs upload throughput, so this is the
-        // datum that tells us whether field chunk-loss is CC-bound (cubic
-        // collapsing under loss) or not. Logging-only, no behaviour change.
+        // control. Logging-only, no behaviour change.
         rs.readahead.washington.mobile.util.jobs.UploadSessionStats
             .startSession(sessionId)
-
-        // Never cancel this work by tag. `cancelAllWorkByTag` also kills
-        // RUNNING workers — including those currently mid-PUT — as it did when
-        // the user tapped REC : their retry counter bumps and after 3 cycles
-        // the OrphanSweepWorker secure-deletes the blob, costing legitimate
-        // user data. It also cancels the ENQUEUED workers belonging to the
-        // orphan_sweep tag (Phase 3.26-B), which directly undoes the
-        // OrphanSweepWorker's own scheduling work from the prior tick. Only
-        // ENQUEUED `stream_chunk_upload` workers that are NOT part of an
-        // orphan sweep may be cancelled at session start.
-        //
-        // The anti-pattern was explicitly forbidden by Phase 3.12 and was
-        // re-introduced once anyway ; Phase 3.36 is the ENQUEUED filter plus
-        // orphan_sweep exemption that replaced it. The reconnect path in
-        // [registerNetworkCallback] iterates manually for the same reason —
-        // note that one cancels every ENQUEUED entry, without the orphan_sweep
-        // exemption made here.
-        //
-        // Clear WorkManager entries from previous sessions
-        // (they reference the wrong reportId so they'd 404 forever),
-        // BUT keep the blobs themselves on disk. We do NOT purge them
-        // because they may represent rescuable user data (recording
-        // stopped with a backlog, user starts a new session before the
-        // backlog drained) : it is the WorkManager entries that are stale,
-        // not the bytes. The HUD only counts current-session blobs
-        // and scheduleUpload only enqueues current-session blobs, so
-        // the orphans don't pollute the new session. They'll be
-        // cleared by sweepStaleChunks below once their TTL elapses, or
-        // by a future rescue path that re-authenticates against their
-        // original report.
-        try {
-            val wm = androidx.work.WorkManager.getInstance(this)
-            val infos = wm.getWorkInfosByTag("stream_chunk_upload").get()
-            var cancelled = 0
-            var preservedRunning = 0
-            var preservedOrphan = 0
-            for (info in infos) {
-                val isOrphan = info.tags.contains("orphan_sweep")
-                if (info.state == androidx.work.WorkInfo.State.ENQUEUED && !isOrphan) {
-                    wm.cancelWorkById(info.id)
-                    cancelled++
-                } else if (info.state == androidx.work.WorkInfo.State.RUNNING) {
-                    preservedRunning++
-                } else if (isOrphan) {
-                    preservedOrphan++
-                }
-            }
-            wm.pruneWork()
-            Timber.i(
-                "[Phase 3.25/3.36] cleared %d ENQUEUED entries (RUNNING preserved=%d, orphan_sweep preserved=%d)",
-                cancelled, preservedRunning, preservedOrphan,
-            )
-        } catch (e: Exception) {
-            Timber.w(e, "[Phase 3.25/3.36] WorkManager cleanup failed (non-fatal)")
-        }
-
-        // Read the 48h bound from OrphanSweepWorker.PURGE_AGE_MS, never inline
-        // a copy of it here : the StreamActivity at-risk banner derives its
-        // warning window from that same constant, and a second copy would make
-        // the banner announce a deadline that is no longer the one at which the
-        // user's data is destroyed (Phase 3.26-E, single source of truth).
-        //
-        // Don't lengthen the TTL back towards the 7d it came from either.
-        // Orphan blobs sitting unuploadable (no matching server-side report)
-        // shouldn't keep ciphertext + nonces on disk for a week. 48h is
-        // generous enough for a user to come back the next day and a half ;
-        // beyond that, assume the data is lost and secure-delete to shrink the
-        // forensic surface. Audit R-10 (originally 7d) is satisfied either
-        // way ; the bound was tightened (Phase 3.25) once we knew that
-        // accumulating blobs is normal in failure modes.
-        uploadQueue?.sweepStaleChunks(
-            rs.readahead.washington.mobile.util.jobs.OrphanSweepWorker.PURGE_AGE_MS
-        )
 
         // Start each session with a clean rolling window
         // for the adaptive concurrency cap, so the first adjustment
@@ -862,31 +970,22 @@ class StreamRecordingService : Service(), LifecycleOwner {
         rs.readahead.washington.mobile.util.jobs
             .UploadConcurrencyLimiter.resetSamples()
 
-        // Reset les compteurs statiques pour que l'UI ne montre
-        // pas des valeurs périmées d'une session précédente.
-        chunksEncrypted.set(0)
-        resetCounters()
-
-        chunkEncryptor = uploadManager.createChunkEncryptor(File(cacheDir, "stream_encrypted"))
-
         // §10.11 — capture une fois si cet enregistrement est tracké pour la
-        // provenance (toggle ON + signer chargé au unlock). Le hash par chunk
-        // ET le manifeste de fin sont gatés sur ce snapshot, donc le périmètre
-        // reste cohérent même si le toggle change pendant l'enregistrement.
-        provenanceChunkHashes.clear()
-        provenanceActive = org.stream.crypto.StreamPreferences.isProvenanceEnabled(this) &&
+        // provenance (toggle ON + signer chargé au unlock). L'engagement de fin
+        // est gaté sur ce snapshot, donc le périmètre reste cohérent même si le
+        // toggle change pendant l'enregistrement.
+        provenanceActive = StreamPreferences.isProvenanceEnabled(this) &&
             uploadManager.provenanceSigner != null
-        if (provenanceActive) Timber.d("Provenance tracking active for session %s", sessionId)
+        if (provenanceActive) Timber.d("Provenance tracking active for this session")
 
-        // Encrypt + enqueue session metadata
-        val metadata = buildSessionMetadata()
-        val metaBlob = chunkEncryptor!!.encryptMetadata(metadata, sessionId)
-        if (metaBlob != null) {
-            uploadQueue!!.enqueue(metaBlob)
-            scheduleUpload()
-        }
+        // The two opening envelopes go to the queue now; neither needs the
+        // network to be sealed, and both are sent whenever it comes.
+        scheduleEnvelope(p.directoryEntryFile)
+        scheduleEnvelope(p.metadataFile)
 
-        // Auth + report creation (network, ~1-3s), puis start camera sur main thread.
+        // Auth (network, ~1-3s), puis start camera sur main thread. The auth
+        // only serves the creation requests (report and directory); nothing
+        // waits for it to start recording.
         initServerSession()
 
         // Ne jamais remonter cet appel au-dessus de initServerSession() : le
@@ -899,7 +998,7 @@ class StreamRecordingService : Service(), LifecycleOwner {
         // hors-ligne doit continuer de marcher :
         // - Cas en ligne (commun) : auth OK, callback registered ; callback
         //   fire onAvailable mais maybeRetryAuth() return early grâce au guard
-        //   à trois termes `authTokenIssuedAtMs > 0L && reportId != null &&
+        //   à trois termes `authTokenIssuedAtMs > 0L && producer != null &&
         //   UploadAuthHolder.isPresent()`.
         // - Cas offline : auth retourne sans token (catch dans
         //   initServerSession), callback registered ; quand réseau revient,
@@ -907,15 +1006,21 @@ class StreamRecordingService : Service(), LifecycleOwner {
         //   `authTokenIssuedAtMs == 0L` (l'horloge n'est posée qu'au succès de
         //   l'auth), passe le cooldown (jamais set), retry → succès.
         // (Phase 2.4.2.)
+        // L'auth ci-dessus peut durer plusieurs secondes : un arrêt arrivé
+        // pendant ce temps a déjà désenregistré le callback, qui n'est donc
+        // plus enregistré (sinon il survivrait à la session, ré-authentifiant
+        // à chaque changement de réseau).
         registerNetworkCallback()
+        if (stopRequested.get()) return
         android.os.Handler(Looper.getMainLooper()).post {
+            if (stopRequested.get()) return@post
             try {
                 lifecycleRegistry.currentState = Lifecycle.State.STARTED
                 lifecycleRegistry.currentState = Lifecycle.State.RESUMED
                 startCamera()
             } catch (e: Exception) {
                 Timber.e(e, "startCamera failed on main thread")
-                stopSelf()
+                requestStop("camera")
             }
         }
     }
@@ -962,6 +1067,10 @@ class StreamRecordingService : Service(), LifecycleOwner {
         }, "scratch-cleaner").start()
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
+            // A stop that came while CameraX was initialising: build nothing.
+            // The stops that can land here all run on this (main) thread, so
+            // none can come between this check and the recorder's construction.
+            if (stopRequested.get()) return@addListener
             try {
                 val cameraProvider = cameraProviderFuture.get()
                 Timber.d("[Phase 7.12] cameraProvider ready at %d", System.currentTimeMillis())
@@ -1094,6 +1203,15 @@ class StreamRecordingService : Service(), LifecycleOwner {
                         // The crosscheck was wired for exactly that decision
                         // (Phase H2-B.7-bis).
                         orientationHintDegrees = 0,
+                        // The recorder's seq is the report's capture number:
+                        // unique and increasing for the whole session, because
+                        // this is the session's only recorder. A quality change
+                        // and the HEVC → H.264 fallback both swap the encoder
+                        // inside it (swapVideoConfig) and keep its counter;
+                        // nothing creates a second recorder for the same
+                        // session. If something ever does, it must continue the
+                        // numbering, never restart it: the writer refuses a seq
+                        // it already sealed.
                         onChunkReady = { chunkFile, seqNum ->
                             onChunkReady(chunkFile, seqNum)
                         },
@@ -1101,10 +1219,10 @@ class StreamRecordingService : Service(), LifecycleOwner {
                             if (e is org.stream.crypto.capture.CaptureUnrecoverableException) {
                                 // Fail-closed backstop (#2/N1): the capture pipeline
                                 // can't recover (rotation failed MAX_ROTATION_FAILURES
-                                // times). Stop cleanly on the main thread — stopSelf()
-                                // drives onDestroy -> hevcRecorder.stop(), which
-                                // finalizes + encrypts the in-flight clear chunk (via
-                                // onChunkReady) instead of letting it grow unbounded,
+                                // times). Stop cleanly — requestStop() runs
+                                // hevcRecorder.stop(), which finalizes the in-flight
+                                // clear chunk (sealed via onChunkReady) instead of
+                                // letting it grow unbounded, then closes the report,
                                 // and tells the operator. Same clean path as a user
                                 // stop / the device-storage-critical stop.
                                 Timber.e(e, "[Phase H2-B.7] HEVC pipeline unrecoverable — stopping capture cleanly")
@@ -1113,7 +1231,7 @@ class StreamRecordingService : Service(), LifecycleOwner {
                                         try {
                                             updateNotification("Erreur caméra — enregistrement arrêté (données sauvegardées)")
                                         } catch (_: Exception) { }
-                                        stopSelf()
+                                        requestStop("capture")
                                     }
                                 }
                             } else {
@@ -1121,7 +1239,8 @@ class StreamRecordingService : Service(), LifecycleOwner {
                             }
                         },
                     )
-                    hevcRecorder = rec
+                    // Under the lock: the teardown reads it under the same one.
+                    synchronized(lifecycleLock) { hevcRecorder = rec }
                     // Wire the on-screen preview Surface
                     // if the activity already pushed one before service
                     // started. setPreviewSurface stores the ref ; the
@@ -1230,7 +1349,17 @@ class StreamRecordingService : Service(), LifecycleOwner {
                 // it up even without a quality change.
                 broadcastQualityUpdate(initialQuality)
 
-                hevcRecorder!!.start()
+                val started = synchronized(lifecycleLock) {
+                    if (stopRequested.get()) false else {
+                        hevcRecorder?.start()
+                        true
+                    }
+                }
+                if (!started) {
+                    Timber.w("stop requested before the recorder started")
+                    releaseUnstartedRecorder()
+                    return@addListener
+                }
 
                 // Démarrage du timer + refresher notification.
                 // Le timer démarre ici (et pas plus tôt) pour ne pas compter
@@ -1255,8 +1384,27 @@ class StreamRecordingService : Service(), LifecycleOwner {
 
             } catch (e: Exception) {
                 Timber.e(e, "Failed to start camera")
+                // A recorder built before the failure (bindToLifecycle threw,
+                // say) never started: its stop() would do nothing for it.
+                releaseUnstartedRecorder()
+                requestStop("camera")
             }
         }, ContextCompat.getMainExecutor(this))
+    }
+
+    /**
+     * Free a recorder that was built but never started, and forget it: its
+     * constructor already holds a GL thread, an EGL context and the first
+     * chunk's encoders. Does nothing for a recorder that started (the
+     * teardown stops it), nor when there is none.
+     */
+    private fun releaseUnstartedRecorder() {
+        val rec = synchronized(lifecycleLock) { hevcRecorder } ?: return
+        try {
+            if (rec.release()) synchronized(lifecycleLock) { if (hevcRecorder === rec) hevcRecorder = null }
+        } catch (e: Exception) {
+            Timber.w(e, "unstarted recorder release failed")
+        }
     }
 
     /**
@@ -1785,144 +1933,173 @@ class StreamRecordingService : Service(), LifecycleOwner {
         }
     }
 
+    /**
+     * Every finalized chunk MP4 arrives here, from the recorder's drain
+     * threads or from its stop(). It is handed to the report's writer thread,
+     * which seals it (encrypt, sign, write the envelope durably) and only then
+     * deletes the MP4. Nothing here waits on the writer: a drain thread must
+     * never block on encryption.
+     *
+     * A chunk that arrives once the report is closing (after the recorder's
+     * stop, or past its safety bound) cannot be sealed any more: its MP4 is
+     * deleted and the loss is counted and shown.
+     */
     private fun onChunkReady(chunkFile: File, seqNum: Int) {
-        Timber.d("Chunk #%d ready: %s (%d bytes)", seqNum, chunkFile.name, chunkFile.length())
+        Timber.d("Chunk #%d ready (%d bytes)", seqNum, chunkFile.length())
 
-        // Mirror the chunk MP4 to
-        // filesDir/debug_raw/ when fixed-bitrate mode is on. The HEVC
-        // pipeline (RollingChunkRecorder) wires onChunkReady directly,
-        // so the mirror happens here. Done synchronously, before kicking
-        // the encryption thread, so the source file is still intact at
-        // copy time.
+        // Mirror the chunk MP4 to filesDir/debug_raw/ when fixed-bitrate mode
+        // is on. Done synchronously, before the seal is queued, so the source
+        // file is still intact at copy time.
         saveRawDebugCopyIfEnabled(chunkFile, seqNum)
 
-        // Track les Threads d'encryption pour pouvoir attendre
-        // leur fin dans onDestroy avant de cleanup le chunkDir. increment AVANT
-        // de start le Thread pour qu'on ne rate aucun chunk même si onDestroy
-        // arrive juste après.
+        val p = producer
+        if (p == null || !acceptingChunks) {
+            dropLateChunk(chunkFile, seqNum)
+            return
+        }
+        // Both counts go up BEFORE the hand-over, so that a reader (the
+        // lock-timeout controller, the snapshot) can never miss a chunk that
+        // is between the two.
         pendingChunks.incrementAndGet()
-        encryptionsInFlightCounter.incrementAndGet()  // Phase 2.2.6 — mirror for V2LockTimeoutController
-
-        // Encrypt on background thread
-        val encThread = Thread {
+        encryptionsInFlightCounter.incrementAndGet()
+        val submitted = p.submitChunk(seqNum, chunkFile) { result ->
             try {
-                // §10.11 — hash le chunk EN CLAIR AVANT encryptChunk (qui le
-                // secure-delete). On ne commit le hash dans la map QU'APRÈS un
-                // encrypt réussi, pour que l'ensemble de chunks du manifeste
-                // corresponde exactement au média qu'un vérificateur réassemble.
-                // Best-effort : un échec de hash ne bloque jamais le pipeline.
-                val provHash: ByteArray? = if (provenanceActive) {
-                    try {
-                        uniffi.frappuccino.provenanceHashPlaintextFile(chunkFile.absolutePath)
-                    } catch (e: Exception) {
-                        Timber.w(e, "provenance hash failed for chunk #%d (non-fatal)", seqNum)
-                        null
-                    }
-                } else null
-
-                val blob = chunkEncryptor?.encryptChunk(chunkFile, sessionId, seqNum)
-                if (blob != null) {
-                    if (provHash != null) provenanceChunkHashes[seqNum] = provHash
-                    chunksEncrypted.incrementAndGet()
-                    uploadQueue?.enqueue(blob)
-                    broadcastChunkUpdate()
-
-                    // 2026-05-09 — retry l'auth ici si elle a échoué au start
-                    // (cas : recording démarré offline, wifi arrivé entretemps).
-                    // Cooldown 30s pour ne pas épuiser le batch de clés
-                    // éphémères : maybeRetryAuth() est appelé une fois par
-                    // chunk, et tout authenticateV2() qui passe challenge()
-                    // consomme 1 slot sur les 50 du batch courant, quelle que
-                    // soit la suite (signAndAdvance est atteint avant le verify
-                    // et avant la création du rapport). Le check réseau, lui,
-                    // ne préserve aucun slot — un appel qui échoue dès
-                    // challenge() n'en consomme pas — il sert à échouer vite ;
-                    // voir le bloc de la sonde /health dans maybeRetryAuth.
-                    maybeRetryAuth()
-
-                    // Refresh proactif du JWT si proche de
-                    // l'expiration (24h - 1h = 23h). Pour une session normale
-                    // (<23h) c'est un no-op : juste 2 comparaisons d'entiers.
-                    maybeRefreshJwt()
-
-                    scheduleUpload()
-                    // Pas d'updateNotification ici, le refresher
-                    // 1Hz s'en charge ; ça évite un flush notification manager
-                    // sur chaque chunk en plus du refresher périodique.
-                }
-            } catch (e: Exception) {
-                Timber.e(e, "Encryption error for chunk #%d", seqNum)
+                onChunkSealed(result)
             } finally {
                 pendingChunks.decrementAndGet()
-                encryptionsInFlightCounter.decrementAndGet()  // Phase 2.2.6 — mirror
+                encryptionsInFlightCounter.decrementAndGet()
             }
         }
-        // Never move the two counter increments down into the thread body, and
-        // never drop this catch. They are incremented ABOVE on purpose, so that
-        // onDestroy's drain and the V2LockTimeoutController can never miss a
-        // chunk that races their read between the increment and the thread
-        // actually starting. But if Thread.start() itself throws — OOM "unable
-        // to create native thread" under memory pressure — the body's finally
-        // never runs, so the counters would stay >0 forever: onDestroy spins to
-        // its deadline and encryptionsInFlight() never returns to 0, wedging the
-        // lock-timeout controller (and delaying auto-lock). Rolling the
-        // pre-increments back on a failed start is what preserves liveness; the
-        // chunk file stays on disk. (WP-F2, L-6/L-7/F-B1.)
-        try {
-            encThread.start()
-        } catch (t: Throwable) {
-            pendingChunks.decrementAndGet()
-            encryptionsInFlightCounter.decrementAndGet()
-            Timber.e(
-                t,
-                "onChunkReady: encryption thread start() failed for chunk #%d — counters rolled back",
-                seqNum
-            )
+        when (submitted) {
+            ReportProducer.Submit.ACCEPTED -> Unit
+            ReportProducer.Submit.DUPLICATE -> {
+                // The same chunk delivered a second time: the file is the one
+                // the first submission is sealing, and that one deletes it.
+                // Deleting it here would destroy what is being sealed.
+                pendingChunks.decrementAndGet()
+                encryptionsInFlightCounter.decrementAndGet()
+                Timber.tag("StreamMetrics").w("chunkDuplicate seq=%d", seqNum)
+            }
+            ReportProducer.Submit.REFUSED -> {
+                pendingChunks.decrementAndGet()
+                encryptionsInFlightCounter.decrementAndGet()
+                dropLateChunk(chunkFile, seqNum)
+            }
+        }
+    }
+
+    /** Runs on the writer thread, once per chunk. Never blocks on the network. */
+    private fun onChunkSealed(result: ReportProducer.ChunkResult) {
+        when (result) {
+            is ReportProducer.ChunkResult.Sealed -> {
+                chunksEncrypted.incrementAndGet()
+                scheduleEnvelope(result.envelope)
+                broadcastChunkUpdate()
+                // The auth upkeep that used to follow each chunk runs on its
+                // own thread now: offline-start recovery (maybeRetryAuth, with
+                // its 30 s cooldown) and the proactive JWT refresh.
+                kickAuthUpkeep()
+            }
+            is ReportProducer.ChunkResult.Lost -> {
+                persistLateLoss(losses.onLoss())
+                broadcastChunkUpdate()
+            }
+            is ReportProducer.ChunkResult.Dropped -> Unit
         }
     }
 
     /**
-     * There is **no manifest, no signature, no sealing** here. Re-signing, or
-     * storing a manifest, would not be finishing this path — it would break the
-     * motto: attribution is on-demand at disclosure, never baked into a stored,
-     * seizable artifact (a seizure exposes nothing). The ProvenanceSigner this
-     * function fetches is there to derive the salt, not to sign anything. The
-     * only thing that may leave the device is the opt-in `.ots` proof.
-     *
-     * At recording stop, computes the salted OTS commitment over the media Merkle
-     * root and, if the witness opted into timestamping, submits it to the relay
-     * (§10.11, the lean "hash + Bitcoin" design). Best-effort — never blocks or
-     * breaks the stop path. The commitment is built only if every encrypted chunk
-     * was hashed (size match), so the media root covers exactly the uploaded
-     * media; relaxing that check yields a root that matches nothing verifiable,
-     * so an incomplete set is skipped instead.
+     * A chunk the report can no longer take: delete the MP4, count the loss.
+     * A file that holds nothing (an empty MP4, or one the teardown already
+     * purged and counted) is not a loss.
      */
-    private fun maybeSubmitProvenanceTimestamp() {
+    private fun dropLateChunk(chunkFile: File, seqNum: Int) {
+        val hadVideo = chunkFile.length() > 0L
+        EnvelopeQueue.secureDelete(chunkFile)
+        if (StreamUploadManager.wipeGeneration() != wipeGenerationAtStart) return
+        if (!hadVideo) return
+        persistLateLoss(losses.onLoss())
+        Timber.tag("StreamMetrics").w("chunkLost seq=%d reason=after_close", seqNum)
+        broadcastChunkUpdate()
+    }
+
+    /**
+     * Write [count] losses the closure's bulk alert did not include (the
+     * ledger hands back 0 until the bulk is written). After the teardown the
+     * HUD is gone, so the alert is the only place the witness sees them.
+     */
+    private fun persistLateLoss(count: Int) {
+        if (count <= 0) return
+        StreamUploadManager.unlessWipedSince(wipeGenerationAtStart) {
+            StreamPreferences.addReportAlert(this, count, recordingStartMs, ReportAlerts.Reason.CAPTURE_LOST)
+        }
+    }
+
+    private fun kickAuthUpkeep() {
+        if (StreamUploadManager.wipeGeneration() != wipeGenerationAtStart) return
+        try {
+            authExecutor.execute {
+                try {
+                    maybeRetryAuth()
+                    maybeRefreshJwt()
+                } catch (e: Exception) {
+                    Timber.w(e, "auth upkeep failed")
+                }
+            }
+        } catch (e: java.util.concurrent.RejectedExecutionException) {
+            // Shut down by the teardown: nothing left to keep up.
+        }
+    }
+
+    /**
+     * §10.11 — at the report's closure, write the opt-in timestamp ticket.
+     *
+     * There is **no manifest, no signature, no sealing** of provenance here.
+     * The commitment is a salted hash over the plaintext hashes of the chunks
+     * the closure lists (in seq order, as the writer returns them): exactly the
+     * media a verifier reassembles from the verified objects. The salt comes
+     * from the provenance seed (the signer this reads signs nothing), so the
+     * relay cannot link the stamp to the report. Attribution stays on-demand at
+     * disclosure, never baked into a stored, seizable artifact.
+     *
+     * Default OFF: a `.ots` is a permanent public Bitcoin breadcrumb. Needs the
+     * provenance signer, which a lock during the recording wipes: no ticket then.
+     * The ticket (sealed under the queue key by Rust) is all the worker gets;
+     * it asks for the stamp once a PIN session is open, and gets a bearer
+     * itself if none is held.
+     *
+     * The ticket and its job are written as one step with respect to an
+     * emergency wipe ([StreamUploadManager.unlessWipedSince]): both before
+     * the wipe starts, or neither, so the ticket's directory is not recreated
+     * once a wipe has renamed it away.
+     */
+    private fun writeTimestampTicket(info: uniffi.frappuccino.CloseInfo) {
         if (!provenanceActive) return
-        val mgr = StreamUploadManager.getInstance() ?: return
-        val signer = mgr.provenanceSigner ?: return
-        val encryptedCount = chunksEncrypted.get()
-        if (provenanceChunkHashes.isEmpty() || provenanceChunkHashes.size != encryptedCount) {
-            Timber.w(
-                "Provenance: hash count %d != chunk count %d for %s — skipping",
-                provenanceChunkHashes.size, encryptedCount, sessionId
-            )
+        if (!StreamPreferences.isProvenanceTimestampEnabled(this)) return
+        if (StreamUploadManager.wipeGeneration() != wipeGenerationAtStart) return
+        if (info.plaintextHashes.isEmpty()) return
+        val signer = StreamUploadManager.getInstance()?.provenanceSigner ?: run {
+            Timber.d("Provenance TS: signer gone (locked during the recording), no ticket")
             return
         }
+        val queue = envelopeQueue ?: return
         try {
-            val orderedHashes = provenanceChunkHashes.toSortedMap().values.toList()
-            // SHA-256(salt ‖ chunk_merkle_root(hashes)) — the ONLY provenance
-            // artifact now. The root is recomputable from the disclosed chunks at
-            // verify time, so nothing is sealed or stored.
             val commitment = uniffi.frappuccino.provenanceOtsCommitment(
-                orderedHashes, recordingIdFor(sessionId), signer
+                info.plaintextHashes, recordingIdFor(sessionId), signer
             )
-            // Opt-in trustless timestamp: submit the salted commitment to the
-            // relay (which stamps it via the OpenTimestamps calendars). Default
-            // OFF — a `.ots` is a permanent public Bitcoin breadcrumb.
-            maybeScheduleProvenanceTimestamp(sessionId, commitment)
+            val written = StreamUploadManager.unlessWipedSince(wipeGenerationAtStart) {
+                val dir = File(filesDir, org.stream.crypto.upload.LegacyReportMigration.PROVENANCE_DIR)
+                    .apply { mkdirs() }
+                val ticket = File(dir, "$sessionId.ticket")
+                uniffi.frappuccino.otsTicketWrite(ticket.absolutePath, info.otsName, commitment)
+                ProvenanceTimestampWorker.enqueue(
+                    this, ticket, queue.pathFor(EnvelopeNames.timestampProof(sessionId)),
+                    DEFAULT_SERVER_URL, wipeGenerationAtStart,
+                )
+            }
+            if (written != null) Timber.i("Provenance timestamp ticket written")
         } catch (e: Exception) {
-            Timber.w(e, "provenance commitment failed (non-fatal)")
+            Timber.w(e, "provenance ticket failed (non-fatal)")
         }
     }
 
@@ -1931,97 +2108,6 @@ class StreamRecordingService : Service(), LifecycleOwner {
         java.security.MessageDigest.getInstance("SHA-256")
             .digest(sessionId.toByteArray(Charsets.UTF_8))
             .copyOf(16)
-
-    /**
-     * §10.11 Phase B (slice 2) — schedule the opt-in trustless timestamp for this
-     * recording. Gated on the per-recording toggle (default OFF), an auth
-     * session, and a report. Submits the salted OTS commitment (computed in Rust
-     * from the Merkle root of the chunk hashes, salted from the provenance seed
-     * and the recording id — there is no manifest and no signature) to the relay.
-     */
-    private fun maybeScheduleProvenanceTimestamp(sessionId: String, commitment: ByteArray) {
-        if (!org.stream.crypto.StreamPreferences.isProvenanceTimestampEnabled(this)) return
-        if (commitment.isEmpty()) {
-            Timber.w("Provenance TS: empty commitment for %s, skipping", sessionId)
-            return
-        }
-        if (authTokenIssuedAtMs == 0L) {
-            Timber.d("Provenance TS: no auth session, skipping for %s", sessionId)
-            return
-        }
-        // Phase C — the .ots upload is a relay-blind capability write; carry the
-        // report's derivation index n (the worker re-derives the report_id).
-        val idx = reportIndex
-        if (idx < 0) {
-            Timber.d("Provenance TS: no report index, skipping for %s", sessionId)
-            return
-        }
-        val commitmentHex = commitment.joinToString("") { "%02x".format(it.toInt() and 0xFF) }
-        scheduleProvenanceTimestamp(sessionId, commitmentHex, idx)
-    }
-
-    /**
-     * §10.11 Phase B (slice 2) — enqueue a unique WorkManager chain:
-     *   1. [ProvenanceTimestampWorker] POSTs the commitment and writes the
-     *      returned `.ots` to `filesDir/stream_provenance/<sid>.ots`.
-     *   2. on its success, the chained [ProvenanceUploadWorker] makes that `.ots`
-     *      durable on the relay (and secure-deletes the local copy).
-     * Keyed on the `.ots` blob name (KEEP) so re-runs are idempotent.
-     */
-    private fun scheduleProvenanceTimestamp(sessionId: String, commitmentHex: String, reportIndex: Int) {
-        try {
-            val otsBlobName = "$sessionId.ots"
-            val otsPath = File(File(filesDir, "stream_provenance"), otsBlobName).absolutePath
-            val constraints = androidx.work.Constraints.Builder()
-                .setRequiredNetworkType(androidx.work.NetworkType.CONNECTED)
-                .build()
-            val stampReq = androidx.work.OneTimeWorkRequest.Builder(
-                rs.readahead.washington.mobile.util.jobs.ProvenanceTimestampWorker::class.java
-            )
-                .setConstraints(constraints)
-                .setInputData(
-                    rs.readahead.washington.mobile.util.jobs.ProvenanceTimestampWorker.buildInputData(
-                        commitmentHex = commitmentHex,
-                        serverUrl = DEFAULT_SERVER_URL,
-                        sessionId = sessionId,
-                        otsFilePath = otsPath,
-                    )
-                )
-                .setBackoffCriteria(
-                    androidx.work.BackoffPolicy.EXPONENTIAL,
-                    10, java.util.concurrent.TimeUnit.SECONDS
-                )
-                .addTag("stream_provenance_timestamp")
-                .addTag(sessionId)
-                .build()
-            val uploadReq = androidx.work.OneTimeWorkRequest.Builder(
-                rs.readahead.washington.mobile.util.jobs.ProvenanceUploadWorker::class.java
-            )
-                .setConstraints(constraints)
-                .setInputData(
-                    rs.readahead.washington.mobile.util.jobs.ProvenanceUploadWorker.buildInputData(
-                        filePath = otsPath,
-                        serverUrl = DEFAULT_SERVER_URL,
-                        reportIndex = reportIndex,
-                        blobName = otsBlobName,
-                    )
-                )
-                .setBackoffCriteria(
-                    androidx.work.BackoffPolicy.EXPONENTIAL,
-                    10, java.util.concurrent.TimeUnit.SECONDS
-                )
-                .addTag("stream_provenance_upload")
-                .addTag(sessionId)
-                .build()
-            androidx.work.WorkManager.getInstance(this)
-                .beginUniqueWork(otsBlobName, androidx.work.ExistingWorkPolicy.KEEP, stampReq)
-                .then(uploadReq)
-                .enqueue()
-            Timber.i("Provenance timestamp scheduled: %s → report idx %d", otsBlobName, reportIndex)
-        } catch (e: Exception) {
-            Timber.w(e, "provenance timestamp scheduling failed (non-fatal) for %s", sessionId)
-        }
-    }
 
     /**
      * `onAvailable` est appelé sur un thread binder système, pas sur le main
@@ -2052,6 +2138,9 @@ class StreamRecordingService : Service(), LifecycleOwner {
                         detectNetworkType()
                     )
                     Thread {
+                        // Never for a session that is stopping: its teardown
+                        // owns what is left, and the workers take over after.
+                        if (stopRequested.get()) return@Thread
                         try {
                             // Kick the upload backlog at reconnect time
                             // without disturbing in-flight PUTs. Cancel
@@ -2085,18 +2174,17 @@ class StreamRecordingService : Service(), LifecycleOwner {
                             // - pruneWork() = drop terminal entries
                             //   (SUCCEEDED/CANCELLED) so the next
                             //   scheduleUpload doesn't double-enqueue.
-                            // - scheduleUpload() = re-enqueue the
-                            //   filesystem-backed pending. A re-PUT of
-                            //   identical bytes is a server-side no-op, so
-                            //   a concurrent worker finishing on its own is
-                            //   harmless.
+                            // - scheduleUpload() = re-enqueue every queued
+                            //   envelope. A re-send of identical bytes is a
+                            //   server-side no-op, so a concurrent worker
+                            //   finishing on its own is harmless.
                             rs.readahead.washington.mobile.util.jobs
                                 .UploadCircuitBreaker.reset()
                             try {
                                 val wm = androidx.work.WorkManager
                                     .getInstance(this@StreamRecordingService)
                                 val infos = wm.getWorkInfosByTag(
-                                    "stream_chunk_upload"
+                                    ChunkUploadWorker.TAG
                                 ).get()
                                 var cancelled = 0
                                 for (info in infos) {
@@ -2115,13 +2203,12 @@ class StreamRecordingService : Service(), LifecycleOwner {
                             }
                             // Blue MED-4 fix. Wipe the
                             // already-enqueued name set on recovery so a
-                            // worker that may have FAILED (or whose
-                            // ENQUEUED state was just cancelled above) can
-                            // be re-enqueued by the upcoming
-                            // scheduleUpload(). Without this, the set
-                            // would block all retries indefinitely
+                            // job that has ended (or whose ENQUEUED state
+                            // was just cancelled above) can be re-enqueued
+                            // by the upcoming scheduleUpload(). Without
+                            // this, the set would block those retries
                             // until process death.
-                            enqueuedBlobNames.clear()
+                            enqueuedEnvelopeNames.clear()
                             maybeRetryAuth()
                             scheduleUpload()
                             // Don't drop these two calls as redundant with the
@@ -2166,9 +2253,13 @@ class StreamRecordingService : Service(), LifecycleOwner {
                     Timber.tag("StreamMetrics").i("networkEvent type=onLost")
                 }
             }
-            cm.registerNetworkCallback(request, cb)
-            networkCallback = cb
-            Timber.d("[Phase 2.4.2] NetworkCallback registered")
+            // Not registered once the stop has run: its unregister would
+            // never come again (see [networkRegistration]).
+            val registered = networkRegistration.registerUnlessStopped {
+                cm.registerNetworkCallback(request, cb)
+                cb
+            }
+            Timber.d("[Phase 2.4.2] NetworkCallback registered=%b", registered)
         } catch (e: Exception) {
             Timber.e(e, "[Phase 2.4.2] Failed to register NetworkCallback — fallback polling")
         }
@@ -2176,23 +2267,23 @@ class StreamRecordingService : Service(), LifecycleOwner {
 
     private fun unregisterNetworkCallback() {
         try {
-            val cb = networkCallback ?: return
-            val cm = getSystemService(Context.CONNECTIVITY_SERVICE)
-                as android.net.ConnectivityManager
-            cm.unregisterNetworkCallback(cb)
-            Timber.d("[Phase 2.4.2] NetworkCallback unregistered")
+            networkRegistration.stop { cb ->
+                val cm = getSystemService(Context.CONNECTIVITY_SERVICE)
+                    as android.net.ConnectivityManager
+                cm.unregisterNetworkCallback(cb)
+                Timber.d("[Phase 2.4.2] NetworkCallback unregistered")
+            }
         } catch (e: Exception) {
             Timber.w(e, "[Phase 2.4.2] Failed to unregister NetworkCallback")
         }
-        networkCallback = null
     }
 
     /**
      * Ne pas baisser ni retirer le cooldown de 30 s : il ne sert pas qu'à
      * ménager le relais, il dédoublonne deux sources d'appel qui peuvent tirer
      * quasi simultanément — le `NetworkCallback.onAvailable` (Phase 2.4.2,
-     * instantané au reconnect) et le polling de repli depuis `onChunkReady`
-     * (Phase 2.4.1, gardé au cas où le callback ne fire pas). Sans lui, une
+     * instantané au reconnect) et le polling de repli après chaque chunk
+     * scellé (Phase 2.4.1, gardé au cas où le callback ne fire pas). Sans lui, une
      * simple reconnexion déclenche deux `authenticateV2()` de suite, soit deux
      * slots consommés sur les 50 du batch éphémère pour un seul événement
      * réseau.
@@ -2204,12 +2295,14 @@ class StreamRecordingService : Service(), LifecycleOwner {
      * est disponible et si le cooldown est écoulé.
      *
      * Une fois l'auth récupérée, ce sont les appelants qui enchaînent sur
-     * scheduleUpload() — cette fonction ne l'appelle pas elle-même — et le
-     * pending de la session courante part alors sur le réseau.
+     * scheduleUpload() — cette fonction ne l'appelle pas elle-même. L'auth ne
+     * sert qu'aux envois en mode création (le premier objet d'un rapport, une
+     * entrée d'annuaire, ou un objet pour lequel le relais a répondu 425) ;
+     * toute autre enveloppe part sur sa seule signature.
      */
     private fun maybeRetryAuth() {
         // Never simplify the guard below to `authTokenIssuedAtMs > 0 &&
-        // reportId != null`: the isPresent() term is the only thing that makes
+        // producer != null`: the isPresent() term is the only thing that makes
         // a 401 taken mid-session recoverable. Gap C (2026-06-15) — such a 401
         // (server-side JWT_SECRET rotated, or token blacklisted / expired
         // early) clears the Rust-held bearer (UploadAuthHolder.clear →
@@ -2218,32 +2311,34 @@ class StreamRecordingService : Service(), LifecycleOwner {
         // maybeRetryAuth sees "already authed" and returns.
         //
         // What that costs is narrower than every chunk, and worth stating
-        // exactly. Only the creation chunk (seq 0) carries the bearer; later
-        // chunks authorise purely by write-sig and cross no auth gate at all
-        // (see ChunkUploadWorker), and the relay asks for a JWT only while the
-        // report record does not exist yet (server/app/routes/upload.py). A 401
-        // landing after the report is created therefore costs the chunk path
-        // nothing. One landing before it stalls seq 0 on no_auth_token — and
-        // with it the record — so every other chunk of the session comes back
-        // 425 "Report not yet created" and waits on disk. Either way nothing
-        // re-authenticates until the recording stops: the workers defer to the
-        // service through ensureFallbackReAuth's `isRunning || isShuttingDown`
-        // gate. With isPresent(), a cleared holder re-drives the full re-auth
-        // here.
+        // exactly. Only a creation request carries the bearer (the envelope
+        // worker's creation mode); every other envelope goes on its signature
+        // alone, and the relay asks for a JWT only while the report record
+        // does not exist yet (server/app/routes/upload.py). A 401 landing after
+        // the report is created therefore costs nothing. One landing before it
+        // leaves the creating envelopes waiting for a bearer, and every other
+        // object of the session comes back 425 and waits on disk. Nothing
+        // re-authenticates for them until the recording stops: the workers
+        // defer to the service through ensureFallbackReAuth's
+        // `isRunning || isShuttingDown` gate. With isPresent(), a cleared
+        // holder re-drives the full re-auth here.
         //
-        // Re-driving it is safe on three counts. Phase C — initServerSession is
-        // now auth-only (the report is derived + persisted at session start,
-        // created lazily by the metadata PUT), so re-invoking it only refreshes
-        // the ephemeral JWT and can never mint a second report; reportId is
-        // already non-null from start, it just confirms the session is fully
-        // initialised. It is bounded by AUTH_RETRY_COOLDOWN_MS +
-        // isRelayReachable below. And only the service re-auths while it runs
-        // (the worker keeps deferring), so there is no slot-pool race —
-        // invariant H2-B.16 preserved. isPresent() (not get()) keeps the bearer
-        // out of the JVM heap (heap-0, §10.6).
-        if (authTokenIssuedAtMs > 0L && reportId != null &&
+        // Re-driving it is safe on three counts. initServerSession is auth-only
+        // (the report is opened locally at session start), so re-invoking it
+        // only refreshes the ephemeral JWT and can never open a second report;
+        // `producer != null` just confirms the session is fully initialised. It
+        // is bounded by AUTH_RETRY_COOLDOWN_MS + isRelayReachable below. And
+        // only the service re-auths while it runs (the worker keeps deferring),
+        // so there is no slot-pool race — invariant H2-B.16 preserved.
+        // isPresent() (not get()) keeps the bearer out of the JVM heap (heap-0,
+        // §10.6).
+        if (authTokenIssuedAtMs > 0L && producer != null &&
             rs.readahead.washington.mobile.util.jobs.UploadAuthHolder.isPresent()
         ) return  // déjà OK
+        // A stopping session authenticates no more: the creations still
+        // pending keep the bearer already held, and the workers take over the
+        // authentication once the teardown is done.
+        if (stopRequested.get()) return
         val now = System.currentTimeMillis()
         if (now - lastAuthAttemptMs < AUTH_RETRY_COOLDOWN_MS) return
         if (!isNetworkAvailable()) {
@@ -2343,19 +2438,20 @@ class StreamRecordingService : Service(), LifecycleOwner {
      * deux divergent, la fenêtre de refresh disparaît en silence — déclenchée
      * trop tard, après l'expiration, ou jamais.
      *
-     * Ce que le refresh avant T-1h protège, c'est le PUT de création d'un
-     * rapport ouvert au-delà de l'expiration. Sur le chemin des CHUNKS, le
-     * bearer ne sert qu'au chunk de création (seq 0) ; les suivants
-     * s'autorisent uniquement par write-sig, sans aucune garde d'auth, et le
-     * relais ne réclame un JWT que tant que l'enregistrement du rapport
-     * n'existe pas. Un JWT périmé ne fait donc pas échouer les workers de chunk
-     * déjà en queue : il fait repartir la création sur un 401 → fail → backoff.
+     * Ce que le refresh avant T-1h protège, ce sont les envois en mode
+     * création d'un rapport ouvert au-delà de l'expiration. Le bearer ne sert
+     * qu'à eux (le premier objet du rapport, une entrée d'annuaire, un objet
+     * qui a reçu 425) ; toute autre enveloppe s'autorise par sa seule
+     * signature, sans aucune garde d'auth, et le relais ne réclame un JWT que
+     * tant que l'enregistrement du rapport n'existe pas. Un JWT périmé ne fait
+     * donc pas échouer les autres envois : il fait repartir la création sur un
+     * 401 → bearer effacé → nouvel essai.
      *
-     * Ne pas en déduire que le chunk de création est le seul consommateur du
-     * bearer : d'autres workers en dépendent, entre autres DirectoryEntryWorker
-     * (l'entrée d'index 0, celle qui crée le rapport d'annuaire) et
-     * ProvenanceTimestampWorker (soumission .ots), qui se mettent en retry tant
-     * que UploadAuthHolder n'a rien à leur donner.
+     * Ne pas en déduire que les envois de création sont les seuls
+     * consommateurs du bearer : ProvenanceTimestampWorker (soumission .ots) en
+     * dépend aussi ; sans bearer, il en obtient un lui-même hors
+     * enregistrement (ensureBearer), et attend la fin de l'enregistrement
+     * sinon.
      *
      * Cooldown 30s pour éviter de hammer si réseau flap.
      */
@@ -2402,182 +2498,37 @@ class StreamRecordingService : Service(), LifecycleOwner {
     }
 
     /**
-     * Appends this session's allocated index to the report directory, a
-     * singleton phrase-derived report (Phase C, relay-blind reports).
-     *
-     * An entry's relay-visible blob name must stay the opaque, secret-derived
-     * `keyring.directoryEntryNameHex(n)` (M-1), never the plain index: the
-     * index is what would turn the directory into a session counter a blind
-     * relay can read straight off. The same rule governs the entry's body,
-     * written just below.
-     *
-     * The directory is what gives the rescue an authoritative `n_max`:
-     * `list_blobs(directory)` yields the opaque names, the witness re-derives
-     * `directoryEntryNameHex(0..)` and matches them back, and reports `0..n_max`
-     * are then enumerated exactly instead of guessing where to stop — see
-     * [DirectoryEntryWorker] for why guessing truncates the recovery. One tiny
-     * write-once entry per session, enqueued here at index allocation so
-     * `n_max` is always ≥ any created report; the worker creates the directory
-     * on index 0 and appends
-     * otherwise, retried by WorkManager, idempotent per index via unique work.
-     *
-     * Best-effort: a failure here must never block recording. It only degrades
-     * the rescue to its dense-enumeration fallback, so do not turn the catch
-     * below into a fatal error.
+     * Schedule the upload of one envelope (unique work named after the file,
+     * KEEP). Needs neither a bearer nor the unlocked state: the envelope is
+     * already signed, and the worker decides when it can go. Nothing is
+     * scheduled once an emergency wipe has started: a seal that finished while
+     * the wipe was aborting the writer must not leave a job row behind it.
      */
-    private fun scheduleDirectoryEntry(index: Int) {
+    private fun scheduleEnvelope(envelope: File) {
+        if (!enqueuedEnvelopeNames.add(envelope.name)) return
         try {
-            val filename = rs.readahead.washington.mobile.util.jobs
-                .DirectoryEntryWorker.localStagingName(index)
-            val dir = File(cacheDir, "directory_entries").apply { mkdirs() }
-            val entryFile = File(dir, filename)
-            if (!entryFile.exists() || entryFile.length() == 0L) {
-                // M-1 — the body must NOT carry the index: it is uploaded
-                // UNSEALED and the relay stores it in cleartext, so writing `n`
-                // here would re-leak the session count/cadence the opaque NAME
-                // just closed. The rescue never reads a directory entry body (it
-                // recovers n_max by derive-and-match over NAMES), so the body is
-                // a single constant byte — only needed because the relay rejects
-                // empty uploads. Constant (not random) keeps write-once re-PUTs
-                // byte-identical on retry.
-                entryFile.writeBytes(byteArrayOf(0x01))
+            if (!ChunkUploadWorker.enqueue(this, envelope, DEFAULT_SERVER_URL, wipeGenerationAtStart)) {
+                enqueuedEnvelopeNames.remove(envelope.name)
             }
-            val req = androidx.work.OneTimeWorkRequest.Builder(
-                rs.readahead.washington.mobile.util.jobs.DirectoryEntryWorker::class.java
-            )
-                .setConstraints(
-                    androidx.work.Constraints.Builder()
-                        .setRequiredNetworkType(androidx.work.NetworkType.CONNECTED)
-                        .build()
-                )
-                .setInputData(
-                    rs.readahead.washington.mobile.util.jobs.DirectoryEntryWorker.buildInputData(
-                        filePath = entryFile.absolutePath,
-                        serverUrl = DEFAULT_SERVER_URL,
-                        reportIndex = index,
-                    )
-                )
-                .setBackoffCriteria(
-                    androidx.work.BackoffPolicy.EXPONENTIAL,
-                    10, java.util.concurrent.TimeUnit.SECONDS
-                )
-                .addTag("stream_directory_entry")
-                .build()
-            androidx.work.WorkManager.getInstance(this)
-                .enqueueUniqueWork(
-                    "directory_entry_$filename",
-                    androidx.work.ExistingWorkPolicy.KEEP,
-                    req,
-                )
-            Timber.d("Phase C: directory entry %d scheduled", index)
         } catch (e: Exception) {
-            Timber.w(e, "Phase C: scheduleDirectoryEntry failed (non-fatal) for index %d", index)
+            // Not scheduled: forget it so the next pass tries again. The
+            // envelope stays in the queue either way.
+            enqueuedEnvelopeNames.remove(envelope.name)
+            Timber.w(e, "envelope scheduling failed")
         }
     }
 
+    /**
+     * Schedule every queued envelope, whichever session or report it belongs
+     * to: an envelope left by an earlier recording, or converted by the
+     * migration, goes the same way as this session's.
+     */
     private fun scheduleUpload() {
-        // §10.6 — gate on the auth-session signal being present
-        // locally (no point enqueueing if the session has no auth). The bearer
-        // itself lives in the Rust holder; on the chunk path nothing pulls a
-        // copy of it into the JVM. The worker only reads the existence bit
-        // (UploadAuthHolder.isPresent()), and for the creation chunk alone Rust
-        // attaches the bearer from its own holder during the PUT — do not
-        // introduce an UploadAuthHolder.get() call here.
-        if (authTokenIssuedAtMs == 0L) return
-        // Phase C — the chunk path carries the report's derivation index n; the
-        // worker re-derives the identity-free report_id from the live keyring.
-        val idx = reportIndex
-        if (idx < 0) return
-        // Only enqueue blobs that belong to the current
-        // session. Orphans from previous sessions stay on disk (they
-        // may be rescuable later, audit R-10 sweep eventually removes
-        // them at TTL) but would fail under the wrong report index here.
-        val pending = uploadQueue?.getPendingForSession(sessionId) ?: return
-
-        for (blob in pending) {
-            // Blue MED-4 fix. Skip if we already
-            // enqueued this blob since the last NetworkCallback
-            // recovery. WorkManager's KEEP policy would have made the
-            // call a no-op anyway, but we save the IPC + SQL hit. On
-            // recovery, `enqueuedBlobNames.clear()` is called in the
-            // `onAvailable` callback so workers that may have FAILED
-            // can be re-enqueued.
-            if (!enqueuedBlobNames.add(blob.name)) {
-                continue
-            }
-            val workRequest = androidx.work.OneTimeWorkRequest.Builder(
-                rs.readahead.washington.mobile.util.jobs.ChunkUploadWorker::class.java
-            )
-                .setConstraints(
-                    androidx.work.Constraints.Builder()
-                        .setRequiredNetworkType(androidx.work.NetworkType.CONNECTED)
-                        .build()
-                )
-                .setInputData(
-                    rs.readahead.washington.mobile.util.jobs.ChunkUploadWorker.buildInputData(
-                        filePath = blob.absolutePath,
-                        serverUrl = DEFAULT_SERVER_URL,
-                        reportIndex = idx
-                    )
-                )
-                // Backoff EXPONENTIAL 10s base au lieu de
-                // LINEAR 30s. Sur réseau pourri, LINEAR 30s constant fait
-                // que tous les workers d'une cohorte retry en cluster toutes
-                // les 30s → surcharge réseau quand le serveur revient.
-                // EXPONENTIAL 10s : 10s, 20s, 40s, 80s, ... cappé à 5h par
-                // WorkManager. Plus rapide à récupérer (10s) si la coupure
-                // était courte ; plus relax à long terme (évite le poll
-                // inutile sur device en mode avion 2h).
-                .setBackoffCriteria(
-                    androidx.work.BackoffPolicy.EXPONENTIAL,
-                    10, java.util.concurrent.TimeUnit.SECONDS
-                )
-                // Manual jitter on initial enqueue. WorkManager
-                // doesn't expose a jitter knob, but `setInitialDelay`
-                // randomized over a short window decorrelates a cohort
-                // of workers that would otherwise hit the server in
-                // lockstep after the same backoff bucket (R-08 audit
-                // finding ; AWS Architecture Blog "Exponential Backoff
-                // and Jitter", Marc Brooker 2015).
-                .setInitialDelay(
-                    (Math.random() * 3000L).toLong(),
-                    java.util.concurrent.TimeUnit.MILLISECONDS
-                )
-                .addTag("stream_chunk_upload")
-                .addTag(sessionId)
-                .build()
-
-            // Never replace enqueueUniqueWork(blob.name, KEEP) with a
-            // plain enqueue(). scheduleUpload is re-run on every chunk
-            // and on every reconnection, so without a unique key each
-            // pass re-enqueues a fresh worker for every blob still
-            // pending, and the worker count grows as O(N²) in the
-            // number of chunks produced during an outage. The defect is
-            // invisible on a short test — measured in vivo on
-            // 2026-05-13 : 2 min wifi off → ~24 chunks pending → 301
-            // ENQUEUED workers at the Phase 3.12 reconnect flush of the
-            // network-recovery block above (= 24×25/2 = 300, ✓ math).
-            //
-            // KEEP, not REPLACE: KEEP keeps the existing worker if one
-            // is already ENQUEUED/RUNNING for this filename and lets a
-            // new one run if the previous terminated
-            // (SUCCEEDED/FAILED/CANCELLED), where REPLACE would kill an
-            // upload in flight. uniqueName is scoped per-blob and not
-            // per-session, so independent chunks remain parallelisable
-            // up to UploadConcurrencyLimiter.
-            androidx.work.WorkManager.getInstance(this)
-                .enqueueUniqueWork(
-                    /* uniqueName = */ blob.name,
-                    /* policy = */ androidx.work.ExistingWorkPolicy.KEEP,
-                    /* workRequest = */ workRequest,
-                )
-        }
-        // Phase 3.7 — un seul broadcast après l'enqueue de tout le pending,
-        // au lieu d'un par blob. broadcastChunkUpdate() lit pendingCount
-        // depuis le filesystem, donc la valeur reste cohérente.
+        val queue = envelopeQueue ?: return
+        for (envelope in queue.pending()) scheduleEnvelope(envelope)
+        // One broadcast after the whole pass, not one per envelope: the count
+        // is read from the queue, so it stays consistent.
         broadcastChunkUpdate()
-        // La notification est rafraîchie par le refresher 1Hz,
-        // pas besoin d'updateNotification manuel ici.
     }
 
     private fun initServerSession() {
@@ -2615,284 +2566,361 @@ class StreamRecordingService : Service(), LifecycleOwner {
             }
             authTokenIssuedAtMs = System.currentTimeMillis()  // Phase 2.4.3
             // §10.6 — the bearer is stashed in the Rust holder by verify(). On
-            // the chunk PUT path only the existence bit crosses the FFI
-            // (UploadAuthHolder.isPresent()): the creation chunk (seq 0) has
-            // Rust read the bearer, later chunks authorise by write-sig with no
-            // bearer at all, so it never enters the JVM heap. One caller still
-            // pulls a transient copy via UploadAuthHolder.get() — the
+            // the envelope path only the existence bit crosses the FFI
+            // (UploadAuthHolder.isPresent()): a creation request has Rust
+            // attach the bearer itself, every other envelope goes without one,
+            // so it never enters the JVM heap there. One caller still pulls a
+            // transient copy via UploadAuthHolder.get() — the
             // ProvenanceTimestampWorker, for the .ots submission. Nothing is
             // persisted by WorkManager (Audit R-01) and the JWT is never a
             // long-lived JVM String.
             Timber.i("V2 auth OK — batch=%d remaining=%d",
                 manager.currentBatchNumber(), manager.remainingKeysInBatch())
 
-            // Do not add a report-creation POST back here: its absence is
-            // deliberate, not an oversight. The report is addressed by a
-            // phrase-DERIVED id, allocated + persisted at session start in
-            // initializePipelineFromOnStart (via
-            // StreamPreferences.allocateReportIndexForSession) and created
-            // lazily by the metadata blob's first PUT (seq 0, carrying the 0x07
-            // create-sig + bearer). A session therefore has exactly one derived
-            // report_id for its whole life, fixed before the first chunk is
-            // ever enqueued, which makes the old split-report field bug
-            // (2026-05-20: one session POSTing twice → chunks halved across two
-            // report_ids) structurally impossible rather than merely avoided.
-            // Deriving locally also removes the network dependency at start-up,
-            // so a recording begun offline still gets its report id.
-            // Phase C (relay-blind reports).
+            // Do not add a report-creation call here: its absence is
+            // deliberate. The report was opened locally at session start (Rust
+            // advanced the report state; no network), and the relay creates
+            // its record from the first envelope sent in creation mode. A
+            // session therefore has exactly one report for its whole life,
+            // fixed before the first chunk exists, which makes the old
+            // split-report field bug (2026-05-20: one session creating twice →
+            // chunks halved across two report ids) structurally impossible.
             //
             // initServerSession is auth-only as a result: it stays idempotently
             // re-runnable from maybeRetryAuth (offline-start recovery) and can
-            // never mint a second report — there is nothing to mint.
+            // never open a second report.
 
         } catch (e: Exception) {
             Timber.e(e, "Failed to init V2 server session")
         }
     }
 
-    override fun onDestroy() {
-        Timber.d("StreamRecordingService stopping — flushing last chunk (Phase 2.1.5)")
+    /**
+     * End the recording: idempotent, never blocks the caller. The teardown
+     * runs on its own thread while the service stays in the foreground with
+     * its wake lock, and the service stops itself once the report's closure is
+     * written (or given up).
+     *
+     * Every way a recording ends comes through here: the user's stop
+     * ([ACTION_STOP]), the Lock button, a full device, an unrecoverable
+     * capture, a failed start, and [onDestroy] when the service is stopped
+     * from outside.
+     */
+    private fun requestStop(reason: String) {
+        if (!stopRequested.compareAndSet(false, true)) return
+        Timber.i("recording stop requested (%s)", reason)
+        if (!ownsSession) {
+            Thread({ teardown() }, "recording-teardown").start()
+            return
+        }
 
         // Never let [isRunning] flip before this shutdown indicator. Workers
-        // (ChunkUploadWorker.ensureFallbackReAuth, OrphanSweepWorker) gate on
-        // `isRunning || isShuttingDown`, and only this order covers the entire
-        // teardown window — until the final `isShuttingDown = false` at the
-        // bottom of this method — instead of just the instant where [isRunning]
-        // changes state. See the companion object doc on [isShuttingDown] for
-        // the full bug rationale (Phase H2-B.16, Blue HIGH-6 fix, 2026-05-19 :
-        // no_auth_token race observed on OnePlus 13 at 2026-05-19T00:14:34).
+        // gate on `isRunning || isShuttingDown`, and only this order covers the
+        // entire teardown window — until `isShuttingDown = false` at the end of
+        // [finishTeardown] — instead of just the instant where [isRunning]
+        // changes state. See the companion object doc on [isShuttingDown]
+        // (Phase H2-B.16, Blue HIGH-6 fix, 2026-05-19).
         isShuttingDown = true
 
-        // Set this volatile flag before the removeCallbacks below, never after :
-        // removeCallbacks does not stop an iteration already running on the main
-        // looper, and that iteration posts a fresh task that survives onDestroy.
-        // With the flag set first, it bails at its next `if (isDestroyed) return`
-        // check instead. Otherwise the destroyed service keeps broadcasting stale
-        // HUD counters and emitting snapshot metrics every 30 s, racing the next
-        // service instance's broadcasts and making the UI flicker between the
-        // real values and the zombie's "0/0" (Phase 3.47).
+        // Set before the removeCallbacks below, never after: removeCallbacks
+        // does not stop an iteration already running on the main looper, and
+        // that iteration posts a fresh task. With the flag set first, it bails
+        // at its next `if (isDestroyed) return` check instead (Phase 3.47).
         isDestroyed = true
-
-        // Mark the service stopped early in the teardown. Since
-        // H2-B.16 this does NOT make the OrphanSweepWorker free to act on this
-        // session's leftovers : combined with `isShuttingDown = true` just
-        // above, workers that gate on `isRunning || isShuttingDown` defer
-        // through the entire teardown, up to the final `isShuttingDown = false`.
-        // The flag is set here so a parallel sweep tick that races onDestroy
-        // sees the right state, not to open the door for it.
         isRunning = false
 
-        // Stop le timer notification immédiatement, sinon il
-        // peut continuer à tick sur le main looper après que le service est
-        // détruit (et appeler updateNotification sur un context mort).
         notificationRefresher.removeCallbacks(notificationRefreshTask)
-        // Symmetric stop of the upload kicker.
         uploadKicker.removeCallbacks(uploadKickerTask)
-        // Symmetric stop of the device telemetry refresher.
         deviceTelemetryRefresher.removeCallbacks(deviceTelemetryTask)
 
-        // Unregister le NetworkCallback avant flush pour ne plus
-        // recevoir d'event onAvailable pendant onDestroy (qui pourrait
-        // déclencher une auth pendant qu'on est en train de détruire les
-        // ressources upload). Le ConnectivityManager fuit silencieusement les
-        // callbacks non-unregistered jusqu'à kill du process.
+        // No more network events during the teardown: one could start an auth
+        // while the session is being taken down. A callback that is never
+        // unregistered stays with the ConnectivityManager until the process
+        // dies; [networkRegistration] also keeps the init thread from
+        // registering one after this.
         unregisterNetworkCallback()
 
-        // Flush du dernier chunk au stop : finalize + encrypt + enqueue.
-        // hevcRecorder.stop() draine le chunk in-flight de façon synchrone, il
-        // doit donc être appelé depuis un thread != main et avec un join borné :
-        // le join juste en dessous plafonne l'attente à 3,5 s, ce qu'un stop()
-        // appelé directement ici ne permettrait pas. La suite se lit juste en
-        // dessous — le chunk part en Thread d'encryption via onChunkReady, on
-        // attend pendingChunks==0, puis scheduleUpload() final pour que le
-        // dernier blob passe en queue WorkManager — et, plus bas dans
-        // onDestroy, CaptureScratchCleaner.purgeOrphanChunks() secure-delete les
-        // MP4 résiduels du chunkDir.
-        //
-        // En pratique <1s sur un device fluide. On bloque onDestroy pendant ce
-        // temps plutôt que de rendre la main au risque de perdre le dernier
-        // chunk : l'user attend la fin du recording qu'il vient lui-même de
-        // demander (Phase 2.1.5).
-        val flushThread = Thread {
+        // The teardown's own bounds, re-armed now: the timeout taken at the
+        // start may have run out during a long recording, and the closure has
+        // to be written with the screen off too.
+        try {
+            wakeLock?.acquire(RECORDER_STOP_BOUND_MS + OPENING_WAIT_MS + CLOSE_WAIT_MS + ABORT_DRAIN_MS + TEARDOWN_MARGIN_MS)
+        } catch (e: Exception) {
+            Timber.w(e, "wake lock not re-armed for the teardown")
+        }
+
+        try {
+            updateNotification(getString(R.string.stream_recording_finalizing))
+        } catch (_: Exception) { }
+
+        Thread({ teardown() }, "recording-teardown").start()
+    }
+
+    /**
+     * In order: stop the recorder (all its deliveries returned), close the
+     * report as the writer's last task, write the timestamp ticket, schedule
+     * what is left, purge the MP4 scratch, release the camera, and only then
+     * leave the foreground.
+     */
+    private fun teardown() {
+        try {
+            // No session ran on an instance that never took the claim (a
+            // failed start, a stop sent to an idle service): nothing to stop,
+            // close or purge.
+            if (ownsSession) closeSession()
+        } catch (t: Throwable) {
+            // Whatever failed, the service must still leave the foreground and
+            // release the session; the queue keeps whatever was written.
+            Timber.e(t, "teardown failed")
+        } finally {
+            // 5. Release the camera and leave the foreground, on the main
+            //    thread.
+            android.os.Handler(Looper.getMainLooper()).post { finishTeardown() }
+        }
+    }
+
+    private fun closeSession() {
+        val wiped = { StreamUploadManager.wipeGeneration() != wipeGenerationAtStart }
+
+        // 1. The recorder's stop() returns once every chunk it produced has
+        //    been handed over (onChunkReady returned). It runs on its own
+        //    thread so that a wedged encoder cannot hold the closure for
+        //    ever: past the safety bound the report is closed anyway, and a
+        //    chunk delivered later is counted lost.
+        // Under the lock: once this read is done no recorder can start any
+        // more (the camera listener checks stopRequested under the same lock).
+        val recorder = synchronized(lifecycleLock) { hevcRecorder }
+        if (recorder != null) {
+            val stopper = Thread({
+                try {
+                    if (!recorder.stop()) {
+                        Timber.w("recorder stop returned with deliveries still running")
+                    }
+                } catch (e: Exception) {
+                    Timber.e(e, "Error stopping recorder")
+                }
+                // A recorder built but never started (the stop came while the
+                // camera was binding) still holds its GL thread, its EGL
+                // context and its encoders; this frees them. It does nothing
+                // for a recorder that ran.
+                try {
+                    recorder.release()
+                } catch (e: Exception) {
+                    Timber.w(e, "recorder release failed")
+                }
+            }, "recorder-stop")
+            stopper.start()
             try {
-                // Stop the HEVC recorder. Its
-                // stop() drains the in-flight chunk synchronously and
-                // delivers it via onChunkReady, so the downstream
-                // encryption / upload flow is unaffected.
-                hevcRecorder?.stop()
-            } catch (e: Exception) {
-                Timber.e(e, "Error stopping recorder")
+                stopper.join(RECORDER_STOP_BOUND_MS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+            if (stopper.isAlive) {
+                Timber.e("recorder stop exceeded its safety bound — closing the report anyway")
             }
         }
-        flushThread.start()
+
+        // 2. The closure: the writer's last task. Everything the recorder
+        //    delivered is already queued ahead of it. A report the init thread
+        //    is still opening is waited for first, so that this teardown is
+        //    the one that closes it, in the foreground and under the wake lock.
         try {
-            flushThread.join(3500)  // 3s pour Finalize + 500ms marge
+            if (!openingDone.await(OPENING_WAIT_MS, TimeUnit.MILLISECONDS)) {
+                Timber.e("report opening still running past its bound")
+            }
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
         }
-
-        // Wait pour que les Threads d'encryption async se terminent. Ne pas
-        // redescendre ce budget sous 3 s. pendingChunks est incrémenté avant le
-        // Thread.start() et n'est décrémenté que dans le finally du Thread
-        // d'encryption : attendre pendingChunks==0 couvre donc tout le corps du
-        // try — encryption, enqueue, maybeRetryAuth, maybeRefreshJwt,
-        // scheduleUpload. Ces étapes peuvent prendre :
-        //   - encryption : 50-100 ms
-        //   - enqueue + fsync queueDir : 50-200 ms (eMMC)
-        //   - maybeRetryAuth : potentiellement un appel network
-        //     (authenticateV2 sur recovery réseau juste avant stop)
-        //     pouvant prendre 1-30 s
-        //   - scheduleUpload : ~ms IPC vers WorkManager
-        // 1.5 s était insuffisant quand maybeRetryAuth firait un
-        // appel network juste au moment du stop → le dernier chunk
-        // pouvait être abandonné (Phase H2-B.15, Blue HIGH-2 fix,
-        // 2026-05-18 : timeout 1.5 s → 3 s). 3 s couvre les cas réalistes
-        // sans bloquer trop longtemps l'utilisateur qui attend la fin de
-        // session.
-        val deadline = System.currentTimeMillis() + 3000
-        while (pendingChunks.get() > 0 && System.currentTimeMillis() < deadline) {
-            try { Thread.sleep(50) } catch (_: InterruptedException) { break }
+        val p = synchronized(lifecycleLock) {
+            acceptingChunks = false
+            producer
         }
-        if (pendingChunks.get() > 0) {
-            Timber.w("Phase 2.1.5: %d encryption Threads still running at onDestroy timeout",
-                pendingChunks.get())
+        var writerIdle = true
+        val closeResult: ReportProducer.CloseResult? = p?.let {
+            val (result, idle) = closeReport(it)
+            writerIdle = idle
+            result
+        }
+        authExecutor.shutdown()
+
+        when (closeResult) {
+            is ReportProducer.CloseResult.Closed -> {
+                scheduleEnvelope(closeResult.envelope)
+                writeTimestampTicket(closeResult.info)
+                Timber.tag("StreamMetrics").i(
+                    "reportClosed objects=%d lost=%d", closeResult.info.objectCount.toInt(), losses.total
+                )
+            }
+            ReportProducer.CloseResult.Interrupted -> if (!wiped()) {
+                // The key went without a closure: every object stays verifiable
+                // on its own, the end of the recording is not certified.
+                StreamUploadManager.unlessWipedSince(wipeGenerationAtStart) {
+                    StreamPreferences.addReportAlert(this, 1, recordingStartMs, ReportAlerts.Reason.INTERRUPTED)
+                }
+            }
+            ReportProducer.CloseResult.Aborted, null -> Unit
+        }
+        // Every loss so far, in one alert; the chunks cut off by giving up on
+        // the closure are in it (closeReport waited for the writer to report
+        // them). A loss counted after this point is written on its own
+        // (persistLateLoss).
+        val bulkLost = losses.close()
+        StreamUploadManager.unlessWipedSince(wipeGenerationAtStart) {
+            StreamPreferences.addReportAlert(this, bulkLost, recordingStartMs, ReportAlerts.Reason.CAPTURE_LOST)
         }
 
-        // §10.11 (lean) — point du teardown où les chunks sont normalement tous
-        // chiffrés + hashés ; calcule le commitment OTS (racine Merkle salée) et,
-        // si opt-in, planifie l'horodatage. Attention, le drain ci-dessus est
-        // borné à 3 s : s'il expire, les derniers chunks manquent au commitment.
-        // Best-effort : ne bloque ni ne casse jamais le chemin d'arrêt.
-        maybeSubmitProvenanceTimestamp()
-
-        // Final flush — enqueue tout reste pending dans uploadQueue
-        scheduleUpload()
-
-        // Transport plan, ROADMAP §10.9 Gate 0 — emit the
-        // per-session upload summary (logging-only). Snapshot the at-stop
-        // pending count so a cubic-vs-bbr field comparison can see how far
-        // behind the upload was when the user stopped. The WorkManager
-        // drain continues after this point; this is an at-stop snapshot.
+        // 3. Whatever is still queued gets a job, then the session summary.
         try {
-            val pendingAtStop = uploadQueue?.getPendingForSession(sessionId)?.size ?: -1
+            scheduleUpload()
+        } catch (e: Exception) {
+            Timber.w(e, "final scheduling failed (the sweep retries)")
+        }
+        try {
+            val pendingAtStop = envelopeQueue?.pendingChunksOfSession(sessionId) ?: -1
             rs.readahead.washington.mobile.util.jobs.UploadSessionStats
                 .summarize(pendingAtStop, detectNetworkType())
         } catch (e: Exception) {
             Timber.tag("StreamMetrics").w(e, "sessionSummary failed")
         }
 
-        // Teardown safety net for the chunkDir scratch: secure-delete every MP4
-        // still present, ANY size, not just the 0-byte ones. A finalized chunk
-        // whose encryption was interrupted or failed is footage left in the
-        // clear, recoverable off a seized device, and nothing else sweeps it —
-        // OrphanSweepWorker only walks the queued `.strm` blobs. "Failed" is
-        // not hypothetical : encryptChunk() runs under a catch that only logs
-        // (see onChunkReady), so an exception there leaves the MP4 behind even
-        // though the drain completed normally.
-        // Keep the call here, after the drain and with the recorder stopped, so
-        // nothing live is being written: each delivered chunk's MP4 is already
-        // secure-deleted right after encryption (StreamChunkEncryptor), and the
-        // drain above gives in-flight encryptions a deadline to finish.
-        // debug_raw is deliberately NOT purged here — it is purged at the next
-        // service start (so the operator can pull the raw clips after a stop).
-        // (Phase 3.7 + F-01, cross-audit 2026-06-30.)
+        // 4. Scratch safety net, after the closure, so no seal is still
+        //    waiting for an MP4: secure-delete every MP4 left in the chunk
+        //    directory, any size. A finalized chunk whose seal never ran is
+        //    footage in the clear, readable off a seized device, and nothing
+        //    else sweeps it. debug_raw is deliberately NOT purged here — it is
+        //    purged at the next service start (so the operator can pull the
+        //    raw clips after a stop). (Phase 3.7 + F-01, cross-audit 2026-06-30.)
+        //
+        //    A non-empty MP4 still here is, in practice, a chunk that will
+        //    never be sealed: the one a recorder stuck past its bound was
+        //    still writing, or one a drain never delivered. It is counted
+        //    lost. Not while the writer is still busy: it may be sealing one
+        //    of them, and reports that chunk itself. The rare MP4 whose own
+        //    deletion failed after its seal would be counted too.
         try {
-            org.stream.crypto.capture.CaptureScratchCleaner.purgeOrphanChunks(
-                org.stream.crypto.capture.CaptureScratchCleaner.defaultChunkDir(this)
-            )
+            val chunkDir = org.stream.crypto.capture.CaptureScratchCleaner.defaultChunkDir(this)
+            val unsealed = if (writerIdle) {
+                org.stream.crypto.capture.CaptureScratchCleaner.nonEmptyChunkCount(chunkDir)
+            } else 0
+            org.stream.crypto.capture.CaptureScratchCleaner.purgeOrphanChunks(chunkDir)
+            if (unsealed > 0 && !wiped()) {
+                Timber.tag("StreamMetrics").w("chunkLost count=%d reason=never_delivered", unsealed)
+                persistLateLoss(losses.onLoss(unsealed))
+            }
         } catch (e: Exception) {
-            Timber.w(e, "CaptureScratchCleaner.purgeOrphanChunks failed at onDestroy")
+            Timber.w(e, "CaptureScratchCleaner.purgeOrphanChunks failed at teardown")
         }
-        // Null out the HEVC recorder ref so
-        // a stale callback can't reach it. The recorder's stop() above
-        // already released GL / encoders / muxer / AudioRecord.
-        hevcRecorder = null
-        // Clear cached preview Surface so a destroyed
-        // SurfaceView's Surface can't be re-used at the next start().
-        hevcPreviewSurface = null
 
-        // FRAG-R1-7 — release the Rust UniFFI handle behind
-        // StreamChunkEncryptor. Each instance pins an `Arc<Identity>` in
-        // the Rust core; on process churn (start/stop cycles in the same
-        // VM, e.g. multiple short recording sessions) the leak isn't a
-        // secret-bearing one (the Arc owns public keys), but it
-        // accumulates handles indefinitely. close() is idempotent and
-        // wraps `ffiIdentity.destroy()` (see StreamChunkEncryptor.close()).
-        try {
-            chunkEncryptor?.close()
-        } catch (e: Exception) {
-            Timber.w(e, "chunkEncryptor.close() threw at onDestroy")
-        }
-        chunkEncryptor = null
-
-        // Drop the adaptive quality manager so any upload
-        // worker that runs after this point (re-enqueued retries, etc.)
-        // doesn't keep mutating stale recording-session state.
+        // Drop the adaptive quality manager so an upload worker that runs
+        // after this point doesn't keep mutating stale recording-session state.
         org.stream.crypto.capture.AdaptiveQualityHolder.clear()
 
-        // DO NOT clear UploadAuthHolder here. The original Phase 3.13 cleared
-        // it on every onDestroy "to collapse post-stop exposure to zero", but
-        // that made every chunk still pending in the WorkManager queue at stop
-        // time fail with `no_auth_token` — repro 2026-05-14 in-vivo :
-        // recording stopped right after a forced backlog downgrade, 7 chunks
-        // pending, 0 ever made it to the server. Draining the pending queue
-        // after the user stops recording is the expected behaviour : that's
-        // what the WorkManager survival story is for (Phase 3.35).
-        // The JWT is already short-lived (24 h) and is dropped on every path
-        // that should drop privileges :
-        //   - the Lock button : lock() wipes the ratchet, and the call site
-        //     clears the bearer right after (StreamSettingsActivity)
-        //   - V2LockTimeoutController's drain-gated clear (fires once no chunk
-        //     is encrypting and the queue is empty)
-        //   - StreamUploadManager.panicWipe(), which clears the bearer itself
-        //   - process death : the bearer lives in a Zeroizing holder inside
-        //     Rust, process-local, nothing on disk
-        // Audit R-01 fix (no on-disk persistence of the JWT) stays intact.
-
-        // §10.6 (2026-06-13) — drop this service's auth-session signal. The
-        // bearer itself no longer lives in the JVM at all (it is held in a
-        // Zeroizing holder inside Rust, stashed by verify()), so there is no
-        // String to null here — only the non-secret issuance clock. The Rust
-        // holder is NOT cleared on onDestroy (Phase 3.35: a post-stop drain may
-        // still need it); it is zeroized by the drain-gated
-        // V2LockTimeoutController, by panicWipe(), and by the UI Lock gesture,
-        // which calls UploadAuthHolder.clear() next to lock().
-        // StreamUploadManager.lock() itself does not clear the bearer: the
-        // ratchet auto-lock goes through lock() alone, so the bearer stays in
-        // place there until the controller's separate clear.
-        authTokenIssuedAtMs = 0L
-
-        // Release CameraX refs so a stale callback fired
-        // after onDestroy can't try to rebind on a dead service.
-        cameraProviderRef = null
-        previewRef = null
-
-        lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
-
-        wakeLock?.let { if (it.isHeld) it.release() }
-        wakeLock = null
-
-        // A normal stop does NOT wipe the V2 ratchet — only an explicit
-        // lock() / panicWipe() does. Never add one here "for hygiene" : a
-        // ratchet locked at the end of every recording leaves every chunk still
-        // in the queue unuploadable until the user re-enters the PIN by hand.
-        // As it stands, a surviving process's workers can re-auth cleanly via
-        // their own authenticateV2 against the still-unlocked ratchet ; if the
-        // process died and relaunched locked, recovery waits for the user to
-        // re-open + re-PIN (then OrphanSweepWorker finishes the queued chunks).
+        // DO NOT clear UploadAuthHolder here. Clearing it on every stop made
+        // every creation still pending at stop time fail with
+        // `no_auth_token` (repro 2026-05-14 in-vivo, Phase 3.35): sending the
+        // queue after the user stops recording is the expected behaviour. The
+        // bearer is dropped on every path that should drop privileges: the
+        // Lock button, the drain-gated V2LockTimeoutController, panicWipe(),
+        // and process death (it lives in a Zeroizing holder inside Rust,
+        // process-local, nothing on disk). Audit R-01 (no on-disk JWT) holds.
         //
-        // Teardown is complete at this point : chunkEncryptor closed,
-        // hevcRecorder + GL/encoder released, final queue-drain attempt done —
-        // which is why the flag is cleared here and not higher up. Workers then
-        // exit their defer loop (Phase H2-B.16, Blue HIGH-6 fix, 2026-05-19).
-        isShuttingDown = false
-
-        super.onDestroy()
+        // Only this service's non-secret issuance clock is reset.
+        authTokenIssuedAtMs = 0L
     }
 
     /**
-     * Opaque random session id : 16 bytes of CSPRNG, hex, with no internal
-     * `_` or `.`.
+     * Submit the closure as the writer's last task and wait for it, bounded
+     * by [CLOSE_WAIT_MS]. Past the bound the closure is given up
+     * ([ReportProducer.abort]): the chunks still queued behind it can no longer
+     * be sealed and are reported lost, which this waits for, briefly, so the
+     * bulk alert includes them. A closure that was in fact written while the
+     * abort waited for the writer is still taken as written.
+     *
+     * Returns the outcome, and whether the writer thread is idle at the end.
+     */
+    private fun closeReport(p: ReportProducer): Pair<ReportProducer.CloseResult, Boolean> {
+        val future = p.submitClose()
+        val result = try {
+            future.get(CLOSE_WAIT_MS, TimeUnit.MILLISECONDS)
+        } catch (e: TimeoutException) {
+            Timber.e("closure not written in time — giving it up")
+            p.abort()
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "closure task failed")
+            p.abort()
+            null
+        }
+        val idle = p.awaitIdle(ABORT_DRAIN_MS)
+        if (result != null) return result to idle
+        val late = if (future.isDone) {
+            try {
+                future.get()
+            } catch (e: Exception) {
+                null
+            }
+        } else null
+        return (if (late is ReportProducer.CloseResult.Closed) late else ReportProducer.CloseResult.Interrupted) to idle
+    }
+
+    /**
+     * Last step, on the main thread. A normal stop does NOT wipe the V2
+     * ratchet — only an explicit lock() / panicWipe() does. Never add one here
+     * "for hygiene": a ratchet locked at the end of every recording leaves the
+     * envelopes that still need a bearer waiting until the user re-enters the
+     * PIN.
+     */
+    private fun finishTeardown() {
+        hevcRecorder = null
+        // A destroyed SurfaceView's Surface must not be re-used next time.
+        hevcPreviewSurface = null
+        cameraProviderRef = null
+        previewRef = null
+        producer = null
+        try {
+            lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
+        } catch (e: Exception) {
+            Timber.w(e, "lifecycle teardown")
+        }
+        wakeLock?.let { if (it.isHeld) it.release() }
+        wakeLock = null
+        try {
+            androidx.core.app.ServiceCompat.stopForeground(
+                this, androidx.core.app.ServiceCompat.STOP_FOREGROUND_REMOVE
+            )
+        } catch (e: Exception) {
+            Timber.w(e, "stopForeground")
+        }
+        // Teardown is complete: workers may act again (Phase H2-B.16).
+        if (ownsSession) isShuttingDown = false
+        synchronized(lifecycleLock) { teardownFinished = true }
+        releaseClaimIfDone()
+        stopSelf()
+    }
+
+    override fun onDestroy() {
+        Timber.d("StreamRecordingService destroyed")
+        // Stopped from outside (stopService, the system) without a stop
+        // request: run the same teardown. It continues after this method
+        // returns, without the foreground status but with the wake lock, and
+        // releases the wake lock when done.
+        requestStop("destroyed")
+        synchronized(lifecycleLock) { destroyCalled = true }
+        releaseClaimIfDone()
+        super.onDestroy()
+    }
+
+    /** A new session may start once this instance is torn down AND destroyed. */
+    private fun releaseClaimIfDone() {
+        val done = synchronized(lifecycleLock) { teardownFinished && destroyCalled }
+        if (done && ownsSession) {
+            ownsSession = false
+            sessionClaim.set(false)
+        }
+    }
+
+    /**
+     * Opaque random session id : 16 bytes of CSPRNG, lowercase hex.
      *
      * Never put an identity prefix or a timestamp back into it. The id used to
      * be `<pk[..4]>_<unixSeconds>_<rand>`, which leaked the witness's identity
@@ -2903,15 +2931,15 @@ class StreamRecordingService : Service(), LifecycleOwner {
      * surface where object names travel (MinIO backups, nginx URL logs, bucket
      * listings).
      *
-     * The ban on `_` and `.` is what keeps two parsers in another module
-     * working : the `<id>_<seq>.strm` seq-parsing (ChunkUploadWorker) and the
-     * `<id>_<seq>` → id grouping (OrphanSweepWorker.sessionIdOf,
-     * last-underscore).
+     * Keep it lowercase hex: the local envelope names are built from it, and
+     * EnvelopeNames accepts nothing else for a chained session (that is what
+     * keeps them apart from the legacy names, which start with `L`).
      *
-     * The id is a purely opaque device-local correlation key for the upload
-     * queue; the recording time now travels only inside the encrypted session
-     * metadata blob (`startedAt`), never in a plaintext name.
-     * (§10.11, MAJEUR-2, 2026-06-25.)
+     * On the relay a chained report's objects are named by their seq alone
+     * (`000001.strm`); the id names the local envelopes, and otherwise travels
+     * only inside the encrypted session metadata (`sessionId`, from which the
+     * opt-in timestamp's salt is derived), as the recording time does
+     * (`startedAt`). (§10.11, MAJEUR-2, 2026-06-25.)
      */
     private fun generateSessionId(): String {
         val bytes = ByteArray(16)
@@ -2965,15 +2993,15 @@ class StreamRecordingService : Service(), LifecycleOwner {
     private fun refreshNotification() {
         // Watch the free space on this 1 Hz tick: before a full disk starts
         // failing chunk writes (silent loss) or the OS kills us uncleanly, stop
-        // cleanly so the footage up to now is finalized + encrypted. Probing
+        // cleanly so the footage up to now is finalized + sealed. Probing
         // filesDir alone is enough, and no second threshold on cacheDir is
         // needed: filesDir and cacheDir share the internal /data partition, so
         // filesDir.usableSpace covers both the in-progress plaintext MP4
-        // (cacheDir/stream_chunks) and the encrypted .strm queue (filesDir).
-        // stopSelf() drives onDestroy then hevcRecorder.stop(), the same clean
-        // path as a user stop; the isShuttingDown guard keeps a later tick from
-        // re-entering it. Device-side analog of the HTTP 507 (server-full) path
-        // just below (Phase 8.1.6-#4b).
+        // (cacheDir/stream_chunks) and the envelope queue (filesDir).
+        // requestStop() runs hevcRecorder.stop() and closes the report, the
+        // same clean path as a user stop; the isShuttingDown guard keeps a later
+        // tick from re-entering it. Device-side analog of the HTTP 507
+        // (server-full) path just below (Phase 8.1.6-#4b).
         val freeBytes = try { filesDir.usableSpace } catch (e: Exception) { Long.MAX_VALUE }
         if (recordingStartMs > 0L && !isShuttingDown &&
             freeBytes < DEVICE_STORAGE_CRITICAL_BYTES
@@ -2985,7 +3013,7 @@ class StreamRecordingService : Service(), LifecycleOwner {
             try {
                 updateNotification("Stockage de l'appareil plein — enregistrement arrêté")
             } catch (_: Exception) { }
-            stopSelf()
+            requestStop("storage")
             return
         }
         val text = if (recordingStartMs == 0L) {
@@ -2996,12 +3024,16 @@ class StreamRecordingService : Service(), LifecycleOwner {
             // Recording keeps going and blobs queue locally — they upload
             // once space frees, nothing is lost. This 1 Hz tick clears the
             // message automatically on the next successful upload.
-            val backlog = uploadQueue?.getPendingCountForSession(sessionId) ?: 0
+            val backlog = envelopeQueue?.pendingChunksOfSession(sessionId) ?: 0
             "Server storage full — contact admin ($backlog queued)"
         } else {
             val elapsed = formatElapsed(System.currentTimeMillis() - recordingStartMs)
             val low = if (freeBytes < DEVICE_STORAGE_WARN_BYTES) " • stockage faible" else ""
-            "Streaming... ${chunksEncrypted.get()} chunks • $elapsed$low"
+            val lost = losses.total
+            val lostText = if (lost > 0) {
+                " • " + resources.getQuantityString(R.plurals.stream_chunks_lost, lost, lost)
+            } else ""
+            "Streaming... ${chunksEncrypted.get()} chunks • $elapsed$low$lostText"
         }
         try {
             updateNotification(text)
@@ -3016,9 +3048,9 @@ class StreamRecordingService : Service(), LifecycleOwner {
             broadcastChunkUpdate()
             // Feed the current backlog to the adaptive
             // quality manager so it can gate upgrades while we're behind.
-            // Current-session only ; orphans don't drive
-            // the quality decisions for this session.
-            val pending = uploadQueue?.getPendingCountForSession(sessionId) ?: 0
+            // This session's chunks only: envelopes of other reports don't
+            // drive the quality decisions for this one.
+            val pending = envelopeQueue?.pendingChunksOfSession(sessionId) ?: 0
             org.stream.crypto.capture.AdaptiveQualityHolder.setBacklog(pending)
         }
     }
@@ -3044,25 +3076,28 @@ class StreamRecordingService : Service(), LifecycleOwner {
     }
 
     private fun broadcastChunkUpdate() {
-        // Mirror to the static last-known counters so the
-        // activity can recover the value at onResume even if the broadcast
-        // was dropped while the activity was paused.
-        // Phase 3.7 : `uploaded` est dérivé de `encrypted - pending` plutôt
-        // que d'un AtomicInteger incrémenté à l'enqueue (qui montait
-        // quadratiquement pendant un wifi off, vu in-vivo 2026-05-10).
-        // pendingCount lit le filesystem (cheap : listFiles() ~ms), c'est
-        // la source de vérité de "ce qui n'a pas encore été uploadé".
+        // Mirror to the static last-known counters so the activity can recover
+        // the value at onResume even if the broadcast was dropped while it was
+        // paused. `uploaded` is derived from `sealed - pending - refused` at
+        // broadcast time rather than counted at enqueue (Phase 3.7: a counter
+        // bumped at each scheduling pass climbed quadratically during an
+        // outage). Pending is read from the queue (one cached listing per
+        // second at most); a chunk the relay refused for good leaves the queue
+        // for the failed directory and must not show as sent.
         val encrypted = chunksEncrypted.get()
-        // Current-session only. Orphan blobs from previous
-        // sessions are kept on disk (rescuable, audit R-10) but they
-        // don't drive this session's HUD or its `uploaded` derivation.
-        val pending = uploadQueue?.getPendingCountForSession(sessionId) ?: 0
-        val uploaded = (encrypted - pending).coerceAtLeast(0)
+        // This session's chunks only: envelopes of earlier recordings are
+        // still sent, but they don't drive this session's HUD.
+        val pending = envelopeQueue?.pendingChunksOfSession(sessionId) ?: 0
+        val refused = envelopeQueue?.failedChunksOfSession(sessionId) ?: 0
+        val uploaded = org.stream.crypto.upload.HudCounters.delivered(encrypted, pending, refused)
+        val lost = losses.total
         lastChunksEncrypted = encrypted
         lastChunksUploaded = uploaded
+        lastChunksLost = lost
         val intent = Intent(ACTION_CHUNK_UPDATE).apply {
             putExtra(EXTRA_CHUNKS_ENCRYPTED, encrypted)
             putExtra(EXTRA_CHUNKS_UPLOADED, uploaded)
+            putExtra(EXTRA_CHUNKS_LOST, lost)
             setPackage(packageName)
         }
         sendBroadcast(intent)

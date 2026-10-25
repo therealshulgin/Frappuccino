@@ -58,16 +58,53 @@ fn single_prefix() -> (ArchiveIdentity, Vec<u8>) {
 // ── :161  CHUNKED minimum length: `body.len() < NONCE_PREFIX_BYTES + 4` ──────
 
 #[test]
-fn chunked_min_length_exact_is_accepted() {
+fn chunked_min_length_exact_passes_the_length_check() {
     // body == NONCE_PREFIX_BYTES + 4 (= 24): a 20-byte prefix + chunk_count 0.
-    // The loop runs zero times → empty plaintext, NOT "too short". A
-    // `<`→`<=` mutant rejects this exact length.
+    // This exact length passes the length guard and is then refused by the
+    // zero-chunk guard, NOT as "too short". A `<`→`<=` mutant would answer
+    // "too short" instead, so the message pins the boundary.
     let (archive, mut blob) = chunked_prefix();
     let mut body = vec![0u8; NONCE_PREFIX_BYTES];
     body.extend_from_slice(&0u32.to_be_bytes()); // chunk_count = 0
     assert_eq!(body.len(), NONCE_PREFIX_BYTES + 4);
     blob.extend_from_slice(&body);
-    let (pt, meta) = decrypt(&blob, &archive).expect("min-length CHUNKED body must decrypt");
+    let err = decrypt(&blob, &archive).expect_err("a CHUNKED body with no chunk must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("zero chunks"),
+        "expected the zero-chunk guard, got: {msg}"
+    );
+    assert!(
+        !msg.contains("too short"),
+        "length guard fired at the exact minimum: {msg}"
+    );
+}
+
+#[test]
+fn chunked_zero_chunks_is_refused_whatever_the_source_header() {
+    // The guarantee does not depend on how the header was produced: a header
+    // taken from a SINGLE blob, relabelled CHUNKED with no chunk, is refused
+    // too. Nothing is accepted without at least one verified tag.
+    let (archive, mut blob) = single_prefix();
+    let last = blob.len() - 1;
+    blob[last] = MODE_CHUNKED;
+    blob.extend_from_slice(&[0u8; NONCE_PREFIX_BYTES]);
+    blob.extend_from_slice(&0u32.to_be_bytes());
+    let err = decrypt(&blob, &archive).expect_err("no chunk, no verified tag: refused");
+    assert!(err.to_string().contains("zero chunks"), "got: {err}");
+}
+
+#[test]
+fn encrypt_chunked_empty_plaintext_carries_one_authenticated_chunk() {
+    // The encoder side of the same guarantee: an empty plaintext still yields
+    // one chunk, so the round trip goes through a verified tag.
+    let archive = archive();
+    let author = archive.identity().clone();
+    let blob = encrypt_chunked(&[], &author).expect("empty CHUNKED encrypt");
+    let off = HEADER_SIZE_NO_GRANTS + 1 + NONCE_PREFIX_BYTES;
+    let chunk_count = u32::from_be_bytes(blob[off..off + 4].try_into().unwrap());
+    assert_eq!(chunk_count, 1, "empty plaintext must still carry one chunk");
+    let (pt, meta) = decrypt(&blob, &archive).expect("empty CHUNKED round trip");
     assert!(pt.is_empty());
     assert_eq!(meta.mode, MODE_CHUNKED);
 }

@@ -20,7 +20,7 @@ import android.provider.Settings
  * aggressively kills foreground services that aren't on the user's
  * battery-optimization whitelist. When the screen turns off during a
  * recording, the system can suspend the StreamRecordingService and gate the
- * ChunkUploadWorker queue; the symptom, seen in vivo by therealshulgin on 2026-05-07,
+ * ChunkUploadWorker queue; the symptom, seen in vivo on 2026-05-07,
  * was "écran éteint = peu d'uploads". An upload queue that stalls with the
  * screen off points at this whitelist first, not at the upload pipeline.
  *

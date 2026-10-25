@@ -146,32 +146,47 @@ tout**, et une phrase perdue rend les archives définitivement illisibles. Le
 design concentre délibérément la défaillance sur un artefact physique unique,
 hors ligne, sous contrôle humain - plutôt que sur dix points logiciels.
 
-### 2.4 Le passé est hors d'atteinte - et c'est prouvé
+### 2.4 Le passé est hors d'atteinte - ce qui est prouvé, et ce qui ne l'est pas
 
 Après enrôlement, le téléphone peut **chiffrer** et **signer**, mais ne peut
-**jamais déchiffrer son propre passé** ni forger des signatures pour des
-sessions antérieures :
+**jamais déchiffrer son propre passé**, et il ne peut plus **étendre ni réécrire
+un enregistrement terminé** :
 
 - La clé privée de lecture (X25519) n'est **jamais persistée** sur l'appareil : elle
   n'est dérivable que depuis la phrase papier, vit en mémoire verrouillée le temps
   d'une session en mode archive, et s'efface à la sortie. Le téléphone qui vient
-  d'enregistrer ne l'a jamais eue.
+  d'enregistrer ne l'a jamais eue. C'est **cela**, et non le ratchet, qui rend le
+  contenu passé illisible.
+- Chaque enregistrement (un « rapport ») est **signé pendant qu'il se fait**, par
+  une clé qui lui est propre. À l'arrêt, le téléphone signe une **clôture** qui
+  liste exactement ce que contient le rapport, puis **efface sa clé** ; ce qu'il
+  conserve ne permet plus de la retrouver. Une fois la clôture reçue, le relais
+  refuse tout nouvel objet dans ce rapport, et le secours revérifie chaque
+  signature avec la clé qu'il re-dérive de la phrase.
 - L'authentification repose sur un **ratchet de clés éphémères** inspiré du
   mécanisme de forward security du consensus **Algorand** : des lots de 50 clés
   de signature à usage unique, chaque clé **détruite immédiatement** après
   usage, chaque lot authentifié par le précédent jusqu'à l'identité d'origine.
 
 Un adversaire qui obtient le téléphone, le PIN, et même un dump mémoire,
-obtient au pire la capacité de signer quelques sessions *futures* - bornée,
-détectable, révocable - mais **pas un octet de contenu passé**, ni la
-possibilité de réécrire l'histoire.
+n'obtient **pas un octet de contenu passé**, et ne peut plus toucher à un
+rapport **clos**. Il obtient en revanche, sans limite de durée et sans que rien
+n'en avertisse le témoin, la capacité de signer le rapport en cours à ce
+moment-là, tous les rapports ouverts ensuite, et des entrées dans l'annuaire de
+rapports : un faux rapport placé « après » ne se distingue pas
+cryptographiquement d'un vrai, et le secours affiche les dates de chaque rapport
+pour aider à repérer ce qui suit une perte ou une saisie. Il n'existe pas de
+révocation d'identité ; la parade est une ré-inscription avec une phrase neuve.
+Le détail est dans l'architecture (§10.1) et le registre des résidus.
 
-Cette propriété n'est pas une intention : la **forward secrecy du protocole est
-prouvée formellement** (modèle Dolev-Yao vérifié par **Tamarin**, 10/10 lemmes,
-avec contrôles négatifs qui falsifient quand on retire le mécanisme), sa
-machine à états est model-checkée exhaustivement (**TLA+/TLC**), et l'effacement
-effectif des clés en mémoire est vérifié **au niveau du code compilé** (audit
-d'IR LLVM : le wipe n'est pas éliminé par l'optimiseur).
+Ce qui est prouvé formellement, précisément : la **forward security de
+l'authentification** (modèle Dolev-Yao vérifié par **Tamarin**, 10/10 lemmes,
+avec contrôles négatifs qui falsifient quand on retire le mécanisme), la
+machine à états du ratchet, model-checkée exhaustivement (**TLA+/TLC**), et
+l'effacement effectif des clés en mémoire, vérifié **au niveau du code compilé**
+(audit d'IR LLVM : le wipe n'est pas éliminé par l'optimiseur). La clôture des
+rapports, elle, n'a **pas** de modèle formel : elle repose sur des tests, des
+vecteurs croisés Rust/Python et la revue.
 
 ### 2.5 La confiance ne se déclare pas, elle se vérifie
 
@@ -187,7 +202,7 @@ rejouable par commande et munie d'un contrôle négatif :
 
 | Preuve | Ce qu'elle garantit |
 |---|---|
-| **Tamarin** (protocole, Dolev-Yao) | Secret des clés, authentification, anti-rejeu, inforgeabilité des rotations, forward secrecy |
+| **Tamarin** (protocole, Dolev-Yao) | Secret des clés, authentification, anti-rejeu, inforgeabilité des rotations, forward security de l'authentification |
 | **TLA+/TLC** (machine à états, 2 800 états) | Monotonie, anti-rejeu, anti-rollback, usage unique des clés, et **rotation toujours possible** (le dernier slot d'un lot est réservé à la rotation, donc un lot ne peut pas être consommé jusqu'à l'impasse) |
 | **Kani** (model-checking borné) | Le parseur d'en-tête ne panique sur **aucune** entrée de 0 à 200 octets, exhaustivement (l'espace borné qui couvre un en-tête complet plus une entrée de grant) |
 | **Diff-fuzz Kotlin↔Rust** (759/759 vecteurs) | La migration Rust est byte-identique à la référence |
@@ -211,8 +226,18 @@ hors ligne devient un projet industriel), liste de refus anti-essais, **TLS
 épinglé** au certificat du relais (un MITM avec une autorité de certification
 valide est rejeté - testé), écrans sensibles protégés contre la capture,
 verrouillage automatique du ratchet à l'inactivité, **bouton d'effacement
-d'urgence** (panic wipe) qui détruit l'état local - les streams, eux, sont déjà
-ailleurs, récupérables par les 12 mots.
+d'urgence** (panic wipe) qui détruit l'état local, la file d'envoi, les copies
+récupérées pour la lecture dans l'app et les exportations qu'une version
+antérieure de l'app avait faites dans `Download/Frappuccino` - les streams, eux,
+sont déjà ailleurs, récupérables par les 12 mots. Ce qu'il n'efface pas, et
+l'app le dit : les exports que le témoin a faits lui-même par le sélecteur de
+fichiers du système, et les enregistrements pas encore envoyés, qui sont perdus.
+
+Récupérées par la phrase sur le téléphone, les vidéos restent **chiffrées dans
+l'app**, ne sont déchiffrées que quelques fragments à la fois pendant qu'on les
+regarde, et sont effacées à la fermeture du mode archive ; un export est un
+geste explicite, précédé d'un avertissement, et ne contient que ce qui a été
+vérifié.
 
 ---
 
@@ -227,8 +252,9 @@ terrain. Le tableau situe la combinaison ; le détail nuance.
 | Pensé pour le témoignage vidéo de terrain | **Oui** | Oui | Non (messagerie) | Oui (photo/vidéo) | Oui |
 | Le contenu quitte l'appareil **pendant** la capture, chiffré | **Oui** | Non (envoi a posteriori) | Non | Non | Non (envoi après capture) |
 | Serveur structurellement incapable de lire (relais aveugle) | **Oui** | Non¹ | Hors objet² | Hors objet | Non (l'institution lit - c'est sa fonction) |
-| Saisie de l'appareil : rien de lisible localement | **Oui** | Partiel (coffre local = cible) | Partiel | Non | Partiel (après envoi) |
-| Compromission de l'appareil : le passé reste illisible (forward secrecy) | **Oui, prouvée formellement** | Non | Oui (messages) | Hors objet | Non documenté³ |
+| Saisie de l'appareil : rien de lisible localement | **Oui** (hors exports explicites du témoin) | Partiel (coffre local = cible) | Partiel | Non | Partiel (après envoi) |
+| Compromission de l'appareil : le passé reste illisible | **Oui** (aucune clé de lecture sur l'appareil) | Non | Oui (messages) | Hors objet | Non documenté³ |
+| Compromission de l'appareil : un enregistrement terminé ne peut plus être modifié | **Oui pour les rapports clos** (pas pour le rapport en cours ni les suivants) | Non | Hors objet | Hors objet | Non documenté³ |
 | Récupération souveraine sans tiers (phrase 12 mots) | **Oui** | Non | Non | Non | Non (via l'institution) |
 | Authenticité / chaîne de custody pour un tribunal | **Non (pas l'objet)** | Partiel (métadonnées) | Non | **Oui** | **Oui** |
 | Maturité, communauté, audits externes | **Pas encore** | Oui | Oui | Oui | Oui |
@@ -391,6 +417,6 @@ Le positionnement, lui, tient en trois lignes :
 
 > **Pas « mieux que tout ». Une combinaison que rien d'autre n'offre, à notre
 > connaissance : le témoignage vidéo qui quitte l'appareil pendant la capture,
-> chiffré vers un relais incapable de le lire, dont le passé est hors d'atteinte
-> de l'appareil lui-même - preuve formelle à l'appui - et dont la seule clé
-> tient en 12 mots sur un papier, dans la poche du témoin.**
+> chiffré vers un relais incapable de le lire, dont le passé est illisible pour
+> l'appareil lui-même et figé une fois l'enregistrement clos, et dont la seule
+> clé tient en 12 mots sur un papier, dans la poche du témoin.**

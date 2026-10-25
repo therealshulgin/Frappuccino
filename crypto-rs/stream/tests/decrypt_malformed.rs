@@ -110,9 +110,11 @@ fn decrypt_chunked_v1_rejected_rt02() {
     // Shipped build (no `legacy-strm`): `parse_header` refuses the V1 version
     // byte outright, so the blob never reaches `decrypt_chunked`. That is the
     // stronger position and the one the `.so` is in.
+    // `decrypt` reports a parse refusal as `Malformed(<parse error text>)`, so
+    // the variant name never appears; the refusal text is what to match.
     #[cfg(not(feature = "legacy-strm"))]
     assert!(
-        msg.contains("LegacyVersionNotSupported"),
+        msg.contains("is not decoded by this build"),
         "expected the V1 blob to be refused at parse in a V3-only build, got {msg}"
     );
 

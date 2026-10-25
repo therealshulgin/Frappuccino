@@ -28,6 +28,13 @@ use std::io::Read;
 use std::sync::Arc;
 use std::time::Duration;
 
+mod archive;
+
+pub use archive::{
+    ArchiveClosure, ArchiveListing, ArchiveObject, StoredObject, WriteSigHeader,
+    OBJECT_FETCH_TIMEOUT, RATE_LIMIT_MIN_BACKOFF,
+};
+
 /// Errors bubbling up from a [`StreamServerClient`] call.
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
@@ -49,6 +56,14 @@ pub enum ProtocolError {
     /// (mid-stream network read error, or the local sink rejecting the write).
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// The relay answered 429 (per-address rate limit). Retry after
+    /// `retry_after`, which is never less than [`RATE_LIMIT_MIN_BACKOFF`]:
+    /// the relay sends no `Retry-After`, so the wait is the client's.
+    #[error("rate limited by the relay, retry after {retry_after:?}")]
+    RateLimited {
+        /// How long to wait before the next request.
+        retry_after: Duration,
+    },
 }
 
 /// Outcome of an enrollment attempt.
@@ -125,7 +140,16 @@ impl StreamServerClient {
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(verifier))
             .with_no_client_auth();
+        Self::with_tls_config(base_url, config)
+    }
 
+    /// Build the client over an already-assembled TLS configuration. Private
+    /// to the crate: production goes through [`Self::new`] and its pins, tests
+    /// pin a local server's certificate.
+    pub(crate) fn with_tls_config(
+        base_url: impl Into<String>,
+        config: ClientConfig,
+    ) -> Result<Self, ProtocolError> {
         let http = reqwest::blocking::Client::builder()
             .use_preconfigured_tls(config)
             .connect_timeout(Duration::from_secs(10))
@@ -297,87 +321,14 @@ impl StreamServerClient {
             .send()?;
         Ok(resp.status().is_success())
     }
-
-    // =========================================================================
-    // Archive retrieval (Phase 4.4 — rescue device)
-    // =========================================================================
-
-    /// `GET /api/v2/archive/reports/{report_id}/blobs` — list every blob in a
-    /// report. **Phase C relay-blind: NO auth** — the `report_id` (derived from
-    /// the BIP-39 phrase) IS the capability, so reads carry no bearer and the
-    /// relay never sees an identity.
-    ///
-    /// Returns `Ok(None)` on **404** — no record at this `report_id`, i.e. a
-    /// *hole* in the rescue enumeration (an index allocated but never uploaded,
-    /// or the end of the range). Returns `Ok(Some(blobs))` when the report
-    /// exists. Network / 5xx / TLS surface as `Err` so the caller retries and
-    /// NEVER mistakes a transient failure for a hole.
-    pub fn archive_list_blobs(
-        &self,
-        report_id: &str,
-    ) -> Result<Option<Vec<ArchiveBlobInfo>>, ProtocolError> {
-        let resp = self
-            .http
-            .get(format!(
-                "{}/api/v2/archive/reports/{report_id}/blobs",
-                self.base_url
-            ))
-            .send()?;
-        // 404 = record absent (a hole), distinct from a network/5xx failure.
-        if resp.status().as_u16() == 404 {
-            return Ok(None);
-        }
-        let resp = resp.error_for_status()?;
-        let raw = read_capped(resp, crate::header::MAX_LISTING_BYTES)?;
-        let body: ArchiveBlobsResponse = serde_json::from_slice(&raw)?;
-        Ok(Some(body.blobs))
-    }
-
-    /// `GET /api/v2/archive/reports/{report_id}/{filename}` — fetch a single
-    /// blob and stream it into [`writer`]. Doesn't load the whole body in RAM
-    /// (uses [`reqwest::blocking::Response::copy_to`]). **Phase C relay-blind:
-    /// NO auth.**
-    ///
-    /// Returns the number of bytes written.
-    pub fn archive_download_blob<W: std::io::Write>(
-        &self,
-        report_id: &str,
-        filename: &str,
-        writer: &mut W,
-    ) -> Result<u64, ProtocolError> {
-        let resp = self
-            .http
-            .get(format!(
-                "{}/api/v2/archive/reports/{report_id}/{filename}",
-                self.base_url
-            ))
-            .send()?
-            .error_for_status()?;
-        // M-2 (WP-C): bound the copy. The relay is the adversary — a hostile
-        // response body could be unbounded, and the FFI archive path buffers it
-        // in RAM before decrypting (OOM) while the CLI streams it to disk
-        // (disk-fill). `Read::take` reads at most cap+1 bytes; if we actually
-        // copy more than the cap the relay over-served, so we reject. `resp`
-        // implements `Read` (imported at module top); `take` consumes it.
-        let cap = crate::header::MAX_ARCHIVE_BLOB_BYTES;
-        let mut limited = resp.take(cap + 1);
-        let copied = std::io::copy(&mut limited, writer)?; // io::Error -> ProtocolError::Io
-        if copied > cap {
-            return Err(ProtocolError::Invalid(format!(
-                "archive blob exceeds MAX_ARCHIVE_BLOB_BYTES ({cap})"
-            )));
-        }
-        Ok(copied)
-    }
 }
 
 /// Read at most `cap` bytes of a **control / listing** response body into RAM,
 /// rejecting an over-served body. Phase-C motto: the relay is the adversary — an
 /// unbounded response body would OOM a low-end rescue device that buffers it in
-/// RAM before serde parses it. Mirrors the `Read::take` bound
-/// `archive_download_blob` already applies to the blob body: `take` reads at
-/// most `cap + 1` so an over-serve is detectable. `resp` implements `Read`
-/// (imported at the module top).
+/// RAM before serde parses it. Same `Read::take` bound as the object download
+/// (`protocol::archive`): `take` reads at most `cap + 1` so an over-serve is
+/// detectable.
 pub(crate) fn read_capped(
     resp: reqwest::blocking::Response,
     cap: u64,
@@ -456,11 +407,6 @@ pub struct ArchiveBlobInfo {
     pub size: u64,
     #[serde(default)]
     pub last_modified: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ArchiveBlobsResponse {
-    blobs: Vec<ArchiveBlobInfo>,
 }
 
 // ============================================================================
@@ -616,10 +562,11 @@ mod tests {
                 {"filename": "chunk_2.strm", "size": 4096, "last_modified": null}
             ]
         }"#;
-        let parsed: ArchiveBlobsResponse = serde_json::from_str(raw).unwrap();
+        let parsed = archive::parse_listing(raw.as_bytes()).unwrap();
         assert_eq!(parsed.blobs.len(), 2);
         assert_eq!(parsed.blobs[0].filename, "chunk_1.strm");
         assert_eq!(parsed.blobs[0].size, 2048);
         assert!(parsed.blobs[1].last_modified.is_none());
+        assert!(parsed.closure.is_none());
     }
 }

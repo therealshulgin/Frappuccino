@@ -4,7 +4,9 @@ Periodic reaper for report records left with zero blobs.
 Two collectors, easy to confuse at a glance. `blob_cleanup` purges the MinIO
 **blobs** past the long retention TTL (BLOB_TTL_SECONDS, 6 months); this one
 removes the report **records** whose blobs are all gone, so `reports.json` does
-not accumulate orphans after a purge. Same cadence, one hour.
+not accumulate orphans after a purge. Same cadence, one hour. A closed report's
+record is the exception: it stays, as a tombstone that refuses every write, so
+its closure is never forgotten.
 
 What makes that safe with no per-record timestamp — the relay deliberately
 stores no createdAt — is the lazy blob-first invariant: a record is written

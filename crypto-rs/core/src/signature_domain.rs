@@ -26,6 +26,7 @@
 //! | 0x06 | `ProvenanceKeyAttestation` | (RETIRED, lean provenance) | — | (nothing signs or verifies this) |
 //! | 0x07 | `ReportCreate`  | per-report key `R_n` (seed-derived) | `report_id(16)‖report_pk(32)` | `PUT /file/{rid}/{name}` (1st chunk) |
 //! | 0x08 | `ReportWrite`   | per-report key `R_n` (seed-derived) | `report_id(16)‖filename‖sha256(body)(32)` | `PUT /file/{rid}/{name}` (every chunk) |
+//! | 0x09 | `ReportClose`   | per-report key `R_n` (seed-derived) | `report_id(16)‖u32_be(seq_limit)‖sha256(manifest)(32)` | `POST /close/{rid}` |
 //!
 //! **0x07 and 0x08 — the Phase C relay-blind report capability signatures.**
 //! Each report is addressed and authorized by a key `R_n` derived from the
@@ -39,6 +40,16 @@
 //! creation* of `report_id` at its first chunk PUT (binds the id to its pk);
 //! 0x08 authorizes writing one chunk (binds the id to the filename + body
 //! hash) and rides every chunk. Both are permanent wire-protocol constants.
+//!
+//! **0x09 — the report closure.** When a recording stops, the same per-report
+//! key signs the closing manifest (the ordered list of `(seq, sha256(blob))` of
+//! every object the report holds, `core::report::Manifest`) together with
+//! `seq_limit`, the first sequence number past the last listed object. The relay
+//! verifies it at `POST /close/{rid}` and, once the closure is recorded, refuses
+//! any new object name outside the declared range; the rescue device verifies
+//! it again under the `report_pk` it re-derives from the phrase.
+//! Server-mirrored, like 0x07/0x08, and a permanent wire-protocol constant. The
+//! byte layouts of 0x07, 0x08 and 0x09 all live in `core::report`.
 //!
 //! **0x05 and 0x06 are RESERVED, and nothing emits them.** They were specified
 //! for the signed-manifest provenance design: 0x05 over a sealed manifest, 0x06
@@ -102,6 +113,11 @@ pub enum SignatureDomain {
     /// Rides **every** chunk PUT; the relay verifies it under the stored
     /// `report_pk`. Server-mirrored.
     ReportWrite = 0x08,
+    /// Per-report capability key `R_n` signs `report_id(16) ‖ u32_be(seq_limit)
+    /// ‖ sha256(manifest)(32)` to close report `report_id`. Verified by the relay
+    /// at `POST /close/{rid}` under the stored `report_pk`, and by the rescue
+    /// device under the `report_pk` it re-derives. Server-mirrored.
+    ReportClose = 0x09,
 }
 
 impl SignatureDomain {
@@ -139,8 +155,9 @@ mod tests {
             SignatureDomain::ProvenanceKeyAttestation.tag(),
             SignatureDomain::ReportCreate.tag(),
             SignatureDomain::ReportWrite.tag(),
+            SignatureDomain::ReportClose.tag(),
         ];
-        // Stable wire values. 0x01-0x03 + 0x07-0x08 are verified by the relay,
+        // Stable wire values. 0x01-0x03 + 0x07-0x09 are verified by the relay,
         // so their Python mirror must stay byte-identical. 0x04-0x06 are
         // reserved bytes of flows that no longer exist and nothing emits them;
         // the two states differ, though: 0x04 still HAS a reserved constant in
@@ -148,7 +165,7 @@ mod tests {
         // never reused there either), while 0x05/0x06 never had one, having
         // been offline-only when they were believed live. All three are pinned
         // here so none can be quietly reused.
-        assert_eq!(tags, [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+        assert_eq!(tags, [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09]);
         // Pairwise distinct (the whole point of domain separation).
         for i in 0..tags.len() {
             for j in (i + 1)..tags.len() {
@@ -182,7 +199,7 @@ mod tests {
     /// The COMPLETE, frozen protocol surface: `(variant, tag, server-mirror)`,
     /// in exactly the set the Tamarin model (`core/proofs/RatchetProtocol.spthy`),
     /// the server mirror, and `ARCHITECTURE_TECHNIQUE_COMPLETE.md` §4.4 describe.
-    const FROZEN_SURFACE: [(SignatureDomain, u8, ServerMirror); 8] = [
+    const FROZEN_SURFACE: [(SignatureDomain, u8, ServerMirror); 9] = [
         (SignatureDomain::AuthChallenge, 0x01, ServerMirror::Yes),
         (SignatureDomain::BatchRotation, 0x02, ServerMirror::Yes),
         (SignatureDomain::Enrollment, 0x03, ServerMirror::Yes),
@@ -199,6 +216,7 @@ mod tests {
         ),
         (SignatureDomain::ReportCreate, 0x07, ServerMirror::Yes),
         (SignatureDomain::ReportWrite, 0x08, ServerMirror::Yes),
+        (SignatureDomain::ReportClose, 0x09, ServerMirror::Yes),
     ];
 
     /// The descriptor every domain MUST have. The `match` is **exhaustive with
@@ -215,6 +233,7 @@ mod tests {
             SignatureDomain::ProvenanceKeyAttestation => (0x06, ServerMirror::Retired),
             SignatureDomain::ReportCreate => (0x07, ServerMirror::Yes),
             SignatureDomain::ReportWrite => (0x08, ServerMirror::Yes),
+            SignatureDomain::ReportClose => (0x09, ServerMirror::Yes),
             // ── ADDING AN ARM HERE? The protocol surface changed. In lockstep:
             //   1. update the Tamarin model RatchetProtocol.spthy (+ neg controls)
             //      if the domain is in the auth/rotation flow;
@@ -235,8 +254,8 @@ mod tests {
     fn signature_domain_surface_is_frozen() {
         assert_eq!(
             FROZEN_SURFACE.len(),
-            8,
-            "the V2 protocol has exactly 8 signature domains (0x01-0x08)"
+            9,
+            "the V2 protocol has exactly 9 signature domains (0x01-0x09)"
         );
         for (domain, tag, mirror) in FROZEN_SURFACE {
             assert_eq!(domain.tag(), tag, "wire tag drift for {domain:?}");
@@ -268,10 +287,18 @@ mod tests {
             SignatureDomain::BatchRotation.prefixed(msg),
             SignatureDomain::Enrollment.prefixed(msg),
         );
-        // Phase C report tags: create vs write must never share a TBS buffer.
+        // Report tags: create, write and close must never share a TBS buffer.
         assert_ne!(
             SignatureDomain::ReportCreate.prefixed(msg),
             SignatureDomain::ReportWrite.prefixed(msg),
+        );
+        assert_ne!(
+            SignatureDomain::ReportWrite.prefixed(msg),
+            SignatureDomain::ReportClose.prefixed(msg),
+        );
+        assert_ne!(
+            SignatureDomain::ReportCreate.prefixed(msg),
+            SignatureDomain::ReportClose.prefixed(msg),
         );
     }
 }

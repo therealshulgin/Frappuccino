@@ -1,10 +1,13 @@
 name: Relay server (pytest)
 
-# The V2 signature-domain contract (tags 0x01-0x08) is mirrored across two trees:
+# The V2 signature-domain contract (tags 0x01-0x09) is mirrored across two trees:
 # the Rust source of truth (crypto-rs) and the Python relay (server). The
 # cross-language KATs pin the SAME bytes on both sides —
-#   crypto-rs/core/tests/auth_sig_kat.rs   <-> server/tests/test_auth_sig_kat.py   (0x01/0x02/0x03)
-#   crypto-rs/core/src/report.rs (KAT)     <-> server/tests/test_report_sig_kat.py (0x07/0x08)
+#   crypto-rs/core/tests/auth_sig_kat.rs     <-> server/tests/test_auth_sig_kat.py     (0x01/0x02/0x03)
+#   crypto-rs/core/src/report.rs (KAT)       <-> server/tests/test_report_sig_kat.py   (0x07/0x08)
+#   crypto-rs/core/tests/report_chain_kat.rs <-> server/tests/test_report_close_kat.py (0x09, chained 0x07/0x08)
+# and server/tests/test_signature_domain_mirror.py reads
+# crypto-rs/core/src/signature_domain.rs to check the tag table itself,
 # so a one-sided drift in a domain tag, a signed-message layout, or a key
 # derivation is only caught when both suites run (WP-E2).
 #

@@ -148,6 +148,59 @@ public class MyApplication extends MultiDexApplication implements Configuration.
         CommonPrefs.getInstance().init(this);
         SharedPrefs.getInstance().init(this);
 
+        // Envelope queue housekeeping, synchronously and first: nothing can be
+        // writing an envelope yet, so a `.part` found now is the remains of a
+        // write a process death interrupted, never one in progress.
+        try {
+            org.stream.crypto.upload.EnvelopeQueue.Companion.get(this).sweepPartFiles();
+        } catch (Throwable t) {
+            Timber.w(t, "envelope .part sweep failed (non-fatal)");
+        }
+        // An emergency wipe interrupted by a process death left renamed
+        // directories behind: finish overwriting them.
+        try {
+            java.util.List<String> wipeable =
+                    org.stream.crypto.upload.StreamUploadManager.Companion.wipeableDirNames();
+            org.stream.crypto.SecureDirWiper.INSTANCE.finishLeftovers(getFilesDir(), wipeable);
+            org.stream.crypto.SecureDirWiper.INSTANCE.finishLeftovers(getCacheDir(), wipeable);
+        } catch (Throwable t) {
+            Timber.w(t, "wipe leftovers sweep failed (non-fatal)");
+        }
+        // The capture scratch a process death left behind: MP4s in the clear
+        // that nothing can seal any more (the writer's key died with the
+        // process). No recorder exists yet at this point, the app has a single
+        // process; renamed now, overwritten off the main thread, and finished
+        // at the next start if this one dies first (finishLeftovers above).
+        try {
+            java.io.File scratch = org.stream.crypto.capture.CaptureScratchCleaner.INSTANCE
+                    .detachForStartup(getCacheDir());
+            if (scratch != null) {
+                org.stream.crypto.SecureDirWiper.INSTANCE.wipeInBackground(
+                        java.util.Collections.singletonList(scratch), "capture-scratch-wipe",
+                        () -> kotlin.Unit.INSTANCE);
+            }
+        } catch (Throwable t) {
+            Timber.w(t, "capture scratch sweep at startup failed (non-fatal)");
+        }
+        // The internal archive viewer's files never survive a process start
+        // (renamed now, overwritten off the main thread).
+        try {
+            rs.readahead.washington.mobile.archive.ArchiveLocalData.INSTANCE.purgeOnStartup(this);
+        } catch (Throwable t) {
+            Timber.w(t, "archive view purge at startup failed (non-fatal)");
+        }
+        // Install the queue key for this process, off the main thread (a
+        // Keystore operation). Anything that needs it before this thread is
+        // done installs it itself: the install is synchronised and idempotent.
+        final Context appContext = getApplicationContext();
+        new Thread(() -> {
+            try {
+                org.stream.crypto.upload.QueueKeyStore.INSTANCE.ensureInstalled(appContext);
+            } catch (Throwable t) {
+                Timber.w(t, "queue key install at startup failed");
+            }
+        }, "queue-key-install").start();
+
         // Phase 6.1.16 — pure-V2 lock-timeout controller. Owns the upload-JWT
         // auto-clear (Phase 1.14 / 3.38-D) on a dedicated ProcessLifecycle
         // observer. The Tella key/unlock infra that used to be initialised here

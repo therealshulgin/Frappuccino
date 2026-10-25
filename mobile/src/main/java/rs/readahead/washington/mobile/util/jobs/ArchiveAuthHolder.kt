@@ -2,42 +2,43 @@ package rs.readahead.washington.mobile.util.jobs
 
 import org.stream.crypto.ArchiveIdentity
 import org.stream.crypto.upload.ArchiveSession
+import rs.readahead.washington.mobile.archive.RescueSession
+import java.util.concurrent.atomic.AtomicInteger
 import uniffi.frappuccino.ProvenanceSigner as FfiProvenanceSigner
 
 /**
- * Process-local RAM holder that hands the unlocked archive identity and the
- * authenticated session from `ArchiveModeActivity` to
- * `ArchiveDownloadService` (Phase 4.4.8).
+ * Process-local RAM holder of the rescue secrets, shared by the archive
+ * screens (`ArchiveModeActivity`, `ArchivePlayerActivity`) and
+ * `ArchiveDownloadService`.
  *
  * Never carry these secrets any other way — not an Intent extra, not a
  * Bundle, not a persisted field — even though parcelling them is the obvious
  * Android reflex for replacing a singleton like this one. The
  * [ArchiveIdentity] wraps the x25519 secret key (mlock'd + ZeroizeOnDrop on
- * the Rust side) and the [provenanceSigner] holds the seed-derived provenance
- * secret; sending either across Binder would expose a secret to a
- * device-seizure adversary, exactly the leak class [UploadAuthHolder] (audit
- * R-01) exists to avoid. Only public report ids belong in the Intent. (Phase C
- * relay-blind: the [ArchiveSession] is now identity-free — no bearer, no cached
- * mnemonic — so it carries no secret itself, but it rides along here too since
- * the activity hands the whole rescue context to the service at once.)
+ * the Rust side), the provenance signer holds the seed-derived provenance
+ * secret, and the [ArchiveSession] holds the links of the report key chain;
+ * sending any of them across Binder would expose a secret to a device-seizure
+ * adversary, exactly the leak class [UploadAuthHolder] exists to avoid. Only
+ * public values (a report's position in the list, a random directory name)
+ * belong in an Intent.
  *
- * Ownership and wipe, "last one alive wipes": by default the activity owns
- * the identity, the session and the provenance signer, and wipes them in its
- * `onDestroy`. While a batch runs, the service borrows them through this
- * holder. The [activityAlive] flag arbitrates who performs the final wipe:
- *   - activity destroyed mid-batch  → `activityAlive=false` → the
- *     service calls [clear] when it stops (the activity can't, it's gone).
- *   - batch finishes, activity alive → the service leaves them; the
- *     activity wipes on its own `onDestroy`.
- * Without that arbitration, either the secrets stay alive in RAM with nobody
- * left to call [clear], or the service wipes while the activity is still
- * downloading and the batch dies asking for the twelve words again. The wipe
- * calls behind [clear] are idempotent, so a race between the two paths is a
- * harmless double no-op.
+ * Ownership and wipe, "the last one alive wipes": every archive screen
+ * [attachActivity]s in `onCreate` and [detachActivity]s in `onDestroy`; the
+ * service runs batches with what it borrows from here. Whoever ends while the
+ * other side is gone performs the final [clear] (and the purge of the local
+ * copies, see `ArchiveLocalData`):
+ *   - a screen destroyed while a batch runs leaves everything to the service,
+ *     which clears when the batch ends if no screen is attached by then;
+ *   - a batch that ends while a screen is attached leaves everything to the
+ *     screens, the last of which clears when it goes.
+ * A counter rather than a flag, because the player is a second screen on top
+ * of the rescue screen: with a flag, closing the player would wipe the
+ * identity from under the screen below. The calls behind [clear] are
+ * idempotent, so a race between the two paths is a harmless double no-op.
  *
  * The references are RAM-only and lost at process death. Do not repair that
- * by persisting them: the loss is intended and costs nothing, since the
- * identity can't be reconstructed without re-entering the phrase anyway.
+ * by persisting them: the loss is intended and costs nothing, since nothing
+ * here can be reconstructed without re-entering the phrase anyway.
  */
 object ArchiveAuthHolder {
 
@@ -47,67 +48,77 @@ object ArchiveAuthHolder {
     @Volatile
     private var session: ArchiveSession? = null
 
-    // §10.11 Phase B — the phrase-derived provenance signer, held alongside the
-    // identity so the rescue download can re-derive the per-recording OTS salt
-    // (HKDF(provenance seed, recording_id)) to export into the disclosure bundle.
-    // Same RAM-only, never-serialised, last-one-alive-wipes lifecycle as above.
+    // The phrase-derived provenance signer, held so the rescue can re-derive
+    // the per-recording timestamp salt (HKDF(provenance seed, recording_id)).
+    // Null when its derivation failed: the timestamp check is then skipped.
     @Volatile
     private var provenanceSigner: FfiProvenanceSigner? = null
 
-    /**
-     * True while an `ArchiveModeActivity` instance is alive. Read by
-     * `ArchiveDownloadService` to decide whether IT must perform the
-     * final secret wipe (the activity is gone) or leave it to the
-     * still-living activity.
-     */
-    @Volatile
-    var activityAlive: Boolean = false
-        private set
+    private val attached = AtomicInteger(0)
 
-    /**
-     * Hand the unlocked identity + authenticated session (+ optional provenance
-     * signer for §10.11 Phase B OTS-salt re-derivation) to the service.
-     */
+    /** True while at least one archive screen is alive. */
+    val activityAlive: Boolean get() = attached.get() > 0
+
+    /** Register an archive screen (from its `onCreate`). */
+    fun attachActivity() {
+        attached.incrementAndGet()
+    }
+
+    /** Unregister an archive screen (from its `onDestroy`); returns how many
+     *  are still alive. Never goes below zero. */
+    fun detachActivity(): Int {
+        // A compare-and-set loop rather than updateAndGet, which needs API 24.
+        while (true) {
+            val now = attached.get()
+            val next = if (now > 0) now - 1 else 0
+            if (attached.compareAndSet(now, next)) return next
+        }
+    }
+
+    /** Install the secrets derived at unlock. Replaces (and wipes) any
+     *  previous set. */
     fun set(id: ArchiveIdentity, sess: ArchiveSession, provSigner: FfiProvenanceSigner?) {
+        if (identity !== id || session !== sess) clear()
         identity = id
         session = sess
         provenanceSigner = provSigner
     }
 
+    /** Whether a phrase has been unlocked and not wiped since. */
+    fun isUnlocked(): Boolean = identity?.isClosed == false && session != null
+
     fun getIdentity(): ArchiveIdentity? = identity
 
     fun getSession(): ArchiveSession? = session
 
-    /** §10.11 Phase B — the phrase-derived provenance signer (null if the rescue
-     *  device couldn't derive it), for re-deriving the OTS salt at disclosure. */
     fun getProvenanceSigner(): FfiProvenanceSigner? = provenanceSigner
 
-    fun setActivityAlive(alive: Boolean) {
-        activityAlive = alive
-    }
-
     /**
-     * Wipe the held secrets (session, identity, provenance signer) and drop
-     * the references. Idempotent: the underlying `close()` / `destroy()`
-     * calls are no-ops once already called, so the activity and the service
-     * can both call this without harm.
+     * Wipe the held secrets (rescue context, identity, provenance signer) and
+     * the rescue's in-memory state, and drop the references. Idempotent: the
+     * underlying `close()` / `destroy()` calls are no-ops once already
+     * called, so every screen and the service can call this without harm.
+     * It does not touch the files on disk: that is `ArchiveLocalData`'s job.
      */
     fun clear() {
-        try {
-            session?.close()
-        } catch (_: Exception) {
-        }
+        val sess = session
+        val id = identity
+        val signer = provenanceSigner
         session = null
-        try {
-            identity?.close()
-        } catch (_: Exception) {
-        }
         identity = null
-        // §10.11 Phase B — wipe the provenance signer (mlock'd seed) too.
+        provenanceSigner = null
+        RescueSession.reset()
         try {
-            provenanceSigner?.destroy()
+            sess?.close()
         } catch (_: Exception) {
         }
-        provenanceSigner = null
+        try {
+            id?.close()
+        } catch (_: Exception) {
+        }
+        try {
+            signer?.destroy()
+        } catch (_: Exception) {
+        }
     }
 }
