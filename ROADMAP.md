@@ -97,7 +97,7 @@ Numérotation linéaire 1 → 9, chemin critique unique vers l'audit externe.
 | 6 | Sécurité restante + CI hardening | 🟢 **Quasi-close** — ✅ 6.1.4 (crypto 100 % Rust) + 6.1.5/7→15 + 6.2 CI complète + **6.1.16 ✅** (infra Tella retirée, 4→2 PIN) + **6.1.1/6.1.2 ✅ Done `5d96f80`** (JWT exp configurable + révoc déjà là ; durcissement domaine derrière flag `DOMAIN`) ; 6.1.3/6.1.6 ✅ vérifiés + **auto-lock ratchet ✅ `a8f1e7d`** (inactivité, défaut 15 min configurable Settings, jamais pendant un enregistrement). Reste : le flip domaine réel = étape opérateur (lié 1.2/1.3) | ~0-2 h | 5 |
 | 7 | UX / Polish | Quasi-complet (18/18 items top-level — voir §9) — **7.3-B/C réglages Qualité+Shake livrés** ; reste 7.7 illus / 7.18-d docs | ~2-3 h | 2, 3 |
 | 8 | Audit externe + publication + F-Droid | Partiel : **publication faite** (8.2.5, dépôt public sous Apache 2.0, modèle B : instantané écrasé, historique non publié) ; reste l'audit externe, F-Droid, et l'arbitrage AGPLv3 | 5-10 j auditeur + ~20 h interne + 30-80 K€ | 4, 5, 6, 7 |
-| 9 | Frappuccino Desktop (rescue client) | À faire | ~40-55 h | 4.4 |
+| 9 | Frappuccino Desktop (rescue client) | Plan refait 2026-10 (`docs/PLAN_APP_BUREAU_2026-10.md`), décisions D1-D6 en attente | ~42-45 j dont 8-11 j de préalables `crypto-rs` | 4.4 |
 | 10 | Photo mode | À faire | ~3-5 j | — (indépendant, post-publication) |
 
 **Cumul dev solo** : ~30-35 jours + budget audit externe 30-80 K€.
@@ -625,6 +625,8 @@ Renforcement du protocole d'audit adverse automatisé (2026-06-05), à partir de
 ---
 
 ## 11. Phase 9 — Frappuccino Desktop (rescue client)
+
+> **2026-10 : la conception ci-dessous est remplacée par [`docs/PLAN_APP_BUREAU_2026-10.md`](docs/PLAN_APP_BUREAU_2026-10.md)** (Windows et Ubuntu, Rust natif iced + GStreamer, coffre séparé, aucune trace de la phrase, aperçu et export par prise de vue). Elle datait d'avant les rapports figés et le secours vérifié : Tauri, lecteur de l'OS et clair en fichiers temporaires n'y sont plus retenus. Le texte suit pour l'historique.
 
 **Objectif** : app desktop dédiée **uniquement à la récupération d'archives** via phrase BIP-39. Scope volontairement minimal — pas d'enrollment, pas d'upload, pas d'enregistrement. Use-case : *« device principal saisi/perdu, je rescape mes streams depuis un PC de confiance »*.
 

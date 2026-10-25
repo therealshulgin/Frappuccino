@@ -80,6 +80,38 @@ class ExportPlanTest {
     }
 
     @Test
+    fun `the joined export lists the chunks by seq, the metadata apart, no raw copy unless asked`() {
+        val joined = ExportPlan.planJoined(
+            listOf("000002.strm", "000000.strm", "000005.strm"), missingSeqs = setOf(3, 4), otsMatched = true,
+            includeRaw = false, ordinal = 4,
+        )
+        assertEquals(4, joined.ordinal)
+        assertEquals("metadata.json", joined.metadata?.targetName)
+        assertEquals(listOf(2, 5), joined.chunks.map { it.seq })
+        assertEquals(setOf(3, 4), joined.missingSeqs)
+        assertEquals(listOf("000002.strm", "000005.strm"), joined.chunks.map { it.sourceName })
+        assertTrue(joined.chunks.all { it.raw == null })
+        // The proof commits to the chunks as recorded: without them, it is
+        // not exported, matched or not.
+        assertTrue(joined.timestamp.isEmpty())
+        assertEquals(3, joined.size)
+    }
+
+    @Test
+    fun `with the raw chunks, they and the matching proof go to the subfolder`() {
+        val names = listOf("000000.strm", "000001.strm", "000002.strm")
+        val joined = ExportPlan.planJoined(names, emptySet(), otsMatched = true, includeRaw = true, ordinal = 1)
+        assertEquals(listOf("part-0001.mp4", "part-0002.mp4"), joined.chunks.map { it.raw?.targetName })
+        assertTrue(joined.chunks.all { it.raw?.inRawFolder == true })
+        assertEquals(listOf("timestamp.ots", "timestamp.otssalt"), joined.timestamp.map { it.targetName })
+        assertTrue(joined.timestamp.all { it.inRawFolder })
+        assertFalse(joined.metadata!!.inRawFolder)
+
+        val unmatched = ExportPlan.planJoined(names, emptySet(), otsMatched = false, includeRaw = true, ordinal = 1)
+        assertTrue(unmatched.timestamp.isEmpty())
+    }
+
+    @Test
     fun `the two exports never share a folder or a file name`() {
         for (ordinal in listOf(1, 7, 42)) {
             assertNotEquals(RescueNames.exportFolderName(ordinal), RescueNames.exportUnverifiedFolderName(ordinal))

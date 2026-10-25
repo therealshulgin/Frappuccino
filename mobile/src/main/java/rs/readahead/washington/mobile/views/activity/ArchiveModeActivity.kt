@@ -1,5 +1,6 @@
 package rs.readahead.washington.mobile.views.activity
 
+import android.annotation.SuppressLint
 import android.content.ActivityNotFoundException
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -8,8 +9,10 @@ import android.content.IntentFilter
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.view.LayoutInflater
 import android.view.View
 import android.view.WindowManager
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.TextView
 import android.widget.Toast
@@ -57,18 +60,20 @@ import uniffi.frappuccino.ProvenanceSigner
  *    à dériver l'identité de déchiffrement, le signataire de provenance et le
  *    contexte de secours ([ArchiveSession]), puis elle est effacée : elle ne
  *    quitte jamais cette activité (pas de log, pas de Bundle, pas d'Intent).
- * 2. RÉCUPÉRER lance la recherche des rapports par dérivation, dans
- *    [ArchiveDownloadService] : l'annuaire, puis chaque index que le plan
- *    désigne. Un 429 fait attendre au moins une minute puis rejoue la même
- *    cible ; une recherche qui ne peut pas aller au bout s'affiche
+ * 2. RÉCUPÉRER MES STREAMS lance la recherche des rapports par dérivation,
+ *    dans [ArchiveDownloadService] : l'annuaire, puis chaque index que le
+ *    plan désigne. Un 429 fait attendre au moins une minute puis rejoue la
+ *    même cible ; une recherche qui ne peut pas aller au bout s'affiche
  *    INCOMPLÈTE, jamais comme une liste courte.
- * 3. VÉRIFIER (par rapport ou TOUT VÉRIFIER) télécharge chaque objet chiffré
- *    dans `noBackupFilesDir/archive_view/<jeton>/`, où Rust le classe ; ce qui
- *    est exclu est effacé et compté. Chaque rapport affiche son statut, ses
- *    compteurs et l'intervalle de dates du relais.
+ * 3. RÉCUPÉRER (par rapport ou TOUT RÉCUPÉRER) télécharge chaque objet
+ *    chiffré dans `noBackupFilesDir/archive_view/<jeton>/`, où Rust le
+ *    classe ; ce qui est exclu est effacé et compté. Chaque rapport affiche
+ *    son statut, ses compteurs et l'intervalle de dates du relais.
  * 4. REGARDER ouvre le lecteur interne ; EXPORTER, après un avertissement,
- *    écrit les seuls objets vérifiés dans un dossier choisi par le témoin.
- *    Plus rien n'est écrit dans le dossier public Download.
+ *    écrit les seuls objets vérifiés dans un dossier choisi par le témoin :
+ *    les morceaux recollés en vidéos sans réencodage, et, si le témoin coche
+ *    l'option, les morceaux bruts avec la preuve d'horodatage. Plus rien
+ *    n'est écrit dans le dossier public Download.
  * 5. Les objets legacy stockés avant que le relais garde les signatures ne
  *    sont ni vérifiés ni exclus : ils sont gardés à part et listés dans la
  *    section « non vérifiable », sous les rapports. On peut les y regarder
@@ -118,7 +123,9 @@ class ArchiveModeActivity : AppCompatActivity() {
             when (answer) {
                 is PendingExport.Answer.Start ->
                     if (uri != null && ArchiveAuthHolder.isUnlocked()) {
-                        ArchiveDownloadService.startExport(this, answer.ordinal, uri, answer.unverifiable)
+                        ArchiveDownloadService.startExport(
+                            this, answer.ordinal, uri, answer.unverifiable, answer.includeRaw,
+                        )
                     } else {
                         Toast.makeText(this, R.string.archive_export_lost, Toast.LENGTH_LONG).show()
                     }
@@ -144,6 +151,7 @@ class ArchiveModeActivity : AppCompatActivity() {
             PendingExport.fromSaved(
                 it.getInt(PendingExport.KEY_ORDINAL, 0),
                 it.getBoolean(PendingExport.KEY_UNVERIFIABLE, false),
+                it.getBoolean(PendingExport.KEY_INCLUDE_RAW, false),
             )
         }
 
@@ -373,10 +381,24 @@ class ArchiveModeActivity : AppCompatActivity() {
      * phone without one says so instead of failing silently. The export of
      * the objects kept apart as not verifiable ([unverifiable]) has its own
      * warning, which adds that nothing proves they are the witness's.
+     *
+     * The export of a verified report joins its chunks into videos; its
+     * warning carries the option to export the chunks as recorded too, with
+     * the timestamp proof, unchecked by default. The not-verifiable export
+     * has no such option: it is the chunks as recorded already.
      */
+    @SuppressLint("InflateParams") // a dialog's view has no parent to inflate into
     private fun confirmExport(ordinal: Int, unverifiable: Boolean = false) {
         if (busy()) return
-        AlertDialog.Builder(this, R.style.AlertDialogDarkTheme)
+        val builder = AlertDialog.Builder(this, R.style.AlertDialogDarkTheme)
+        // Inflated with the dialog's theme, so the box takes its colours.
+        val rawOption = if (unverifiable) {
+            null
+        } else {
+            LayoutInflater.from(builder.context).inflate(R.layout.dialog_archive_export_raw, null)
+        }
+        val rawCheck = rawOption?.findViewById<CheckBox>(R.id.archiveExportRawCheck)
+        builder
             .setTitle(
                 if (unverifiable) R.string.archive_unverifiable_export_warning_title
                 else R.string.archive_export_warning_title,
@@ -385,8 +407,9 @@ class ArchiveModeActivity : AppCompatActivity() {
                 if (unverifiable) R.string.archive_unverifiable_export_warning_message
                 else R.string.archive_export_warning_message,
             )
+            .setView(rawOption)
             .setPositiveButton(R.string.archive_export_confirm) { _, _ ->
-                pendingExport = PendingExport(ordinal, unverifiable)
+                pendingExport = PendingExport(ordinal, unverifiable, includeRaw = rawCheck?.isChecked == true)
                 try {
                     pickExportFolder.launch(null)
                 } catch (e: ActivityNotFoundException) {
@@ -504,10 +527,11 @@ class ArchiveModeActivity : AppCompatActivity() {
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
-        // A position and a flag, nothing secret (see PendingExport).
+        // A position and two flags, nothing secret (see PendingExport).
         pendingExport?.let {
             outState.putInt(PendingExport.KEY_ORDINAL, it.ordinal)
             outState.putBoolean(PendingExport.KEY_UNVERIFIABLE, it.unverifiable)
+            outState.putBoolean(PendingExport.KEY_INCLUDE_RAW, it.includeRaw)
         }
     }
 

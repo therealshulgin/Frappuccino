@@ -21,9 +21,9 @@
   <string name="archive_unlock_failed">La dérivation des clés a échoué.</string>
   <string name="archive_no_server">Aucune adresse de relais configurée dans les réglages.</string>
   <string name="archive_unlocked">ARCHIVE DÉVERROUILLÉE</string>
-  <string name="archive_identity_matches">Cette phrase correspond à l\'identité de cet appareil.\n\nTouchez RÉCUPÉRER pour chercher vos rapports sur le relais.</string>
+  <string name="archive_identity_matches">Cette phrase correspond à l\'identité de cet appareil.\n\nTouchez RÉCUPÉRER MES STREAMS pour chercher vos rapports sur le relais.</string>
   <string name="archive_identity_differs">ATTENTION : cette phrase n\'est PAS l\'identité de cet appareil.\nVous allez récupérer les rapports d\'une autre identité.</string>
-  <string name="archive_identity_none">Aucune identité sur cet appareil : archive seule.\n\nTouchez RÉCUPÉRER pour chercher vos rapports sur le relais.</string>
+  <string name="archive_identity_none">Aucune identité sur cet appareil : archive seule.\n\nTouchez RÉCUPÉRER MES STREAMS pour chercher vos rapports sur le relais.</string>
 
   <!-- Recherche (énumération) -->
   <string name="archive_retry_btn">RECHERCHER À NOUVEAU</string>
@@ -67,7 +67,7 @@
   </plurals>
 
   <!-- Lignes de rapport -->
-  <string name="archive_verify_all_btn">TOUT VÉRIFIER</string>
+  <string name="archive_verify_all_btn">TOUT RÉCUPÉRER</string>
   <string name="archive_busy">Le secours travaille déjà, attendez qu\'il ait fini.</string>
   <string name="archive_report_title">Rapport %1$d</string>
   <string name="archive_report_subtitle_chain">Signé pendant l\'enregistrement · index %1$d</string>
@@ -77,8 +77,8 @@
     <item quantity="other">%d objets sur le relais, pas encore vérifiés.</item>
     <item quantity="many">%d objets sur le relais, pas encore vérifiés.</item>
   </plurals>
-  <string name="archive_status_verifying">Vérification… %1$d / %2$d</string>
-  <string name="archive_status_failed">Vérification interrompue (%1$s). Touchez VÉRIFIER pour réessayer.</string>
+  <string name="archive_status_verifying">Récupération… %1$d / %2$d</string>
+  <string name="archive_status_failed">Récupération interrompue (%1$s). Touchez RÉCUPÉRER pour réessayer.</string>
   <string name="archive_status_complete">COMPLET : l\'enregistrement a été clos et chacun de ses objets est vérifié.</string>
   <string name="archive_status_incomplete">INCOMPLET : l\'enregistrement a été clos, mais certains de ses objets manquent sur le relais.</string>
   <string name="archive_status_altered">ALTÉRÉ : des objets qui ne sont pas les vôtres ont été trouvés sur le relais. Ils sont exclus.</string>
@@ -130,7 +130,7 @@
   <string name="archive_ots_match">Horodatage : la preuve correspond à ces enregistrements. L\'ancrage Bitcoin se vérifie avec l\'outil de bureau.</string>
   <string name="archive_ots_mismatch">Horodatage : la preuve ne correspond PAS aux enregistrements vérifiés.</string>
   <string name="archive_ots_absent">Horodatage : aucun.</string>
-  <string name="archive_verify_btn">VÉRIFIER</string>
+  <string name="archive_verify_btn">RÉCUPÉRER</string>
   <string name="archive_play_btn">REGARDER</string>
   <string name="archive_export_btn">EXPORTER</string>
   <string name="archive_play_none">Aucune vidéo vérifiée dans ce rapport.</string>
@@ -152,13 +152,59 @@
 
   <!-- Export -->
   <string name="archive_export_warning_title">Exporter ce rapport ?</string>
-  <string name="archive_export_warning_message">La copie exportée sort de l\'app : elle est déchiffrée, l\'effacement d\'urgence ne peut pas l\'effacer, et toute app ayant accès au dossier choisi peut la lire. Seuls les enregistrements vérifiés sont exportés, avec la preuve d\'horodatage et son sel quand la preuve correspond.</string>
+  <string name="archive_export_warning_message">La copie exportée sort de l\'app : elle est déchiffrée, l\'effacement d\'urgence ne peut pas l\'effacer, et toute app ayant accès au dossier choisi peut la lire. Seuls les enregistrements vérifiés sont exportés, leurs morceaux recollés en vidéos sans réencodage ; une nouvelle vidéo commence là où le format change ou là où la numérotation des morceaux saute, et avant qu\'une vidéo ne devienne trop grande. La preuve d\'horodatage et son sel portent sur les morceaux bruts, pas sur une vidéo recollée : ils ne sont exportés qu\'avec les morceaux bruts, quand la preuve correspond.</string>
+  <string name="archive_export_raw_option">Inclure aussi les morceaux bruts (preuve)</string>
   <string name="archive_export_confirm">CHOISIR UN DOSSIER</string>
   <string name="archive_cancel">ANNULER</string>
   <string name="archive_export_no_picker">Aucun sélecteur de fichiers sur ce téléphone : l\'export est impossible.</string>
   <string name="archive_export_lost">L\'export n\'a pas démarré. Relancez-le depuis le rapport.</string>
-  <string name="archive_export_running">Export : fichier %1$d sur %2$d</string>
+  <string name="archive_export_running">Export… %1$d / %2$d</string>
   <string name="archive_export_done">Exporté.</string>
+  <!-- Après la ligne de fin d'un rapport vérifié : combien de vidéos recollées
+       ont été écrites, puis, quand il y en a plusieurs, pourquoi. -->
+  <plurals name="archive_export_videos">
+    <item quantity="one">%d vidéo écrite.</item>
+    <item quantity="other">%d vidéos écrites.</item>
+    <item quantity="many">%d vidéos écrites.</item>
+  </plurals>
+  <plurals name="archive_export_cut_missing">
+    <item quantity="one">%d coupure là où un morceau manque sur le relais : une vidéo ne masque jamais un trou.</item>
+    <item quantity="other">%d coupures là où des morceaux manquent sur le relais : une vidéo ne masque jamais un trou.</item>
+    <item quantity="many">%d coupures là où des morceaux manquent sur le relais : une vidéo ne masque jamais un trou.</item>
+  </plurals>
+  <plurals name="archive_export_cut_excluded">
+    <item quantity="one">%d coupure là où un morceau qui ne se déchiffre pas a été exclu : une vidéo ne masque jamais un trou.</item>
+    <item quantity="other">%d coupures là où des morceaux qui ne se déchiffrent pas ont été exclus : une vidéo ne masque jamais un trou.</item>
+    <item quantity="many">%d coupures là où des morceaux qui ne se déchiffrent pas ont été exclus : une vidéo ne masque jamais un trou.</item>
+  </plurals>
+  <!-- Un saut dans les numéros des morceaux sans morceau connu comme manquant :
+       l'enregistreur peut sauter un numéro au changement de qualité sans
+       perdre de vidéo. Le texte ne doit pas affirmer qu'un morceau manque. -->
+  <plurals name="archive_export_cut_numbering">
+    <item quantity="one">%d coupure là où la numérotation des morceaux saute sans qu\'aucun morceau ne soit connu comme manquant : l\'enregistreur peut sauter un numéro au changement de qualité sans perdre de vidéo, et un morceau non vérifié n\'est pas exporté.</item>
+    <item quantity="other">%d coupures là où la numérotation des morceaux saute sans qu\'aucun morceau ne soit connu comme manquant : l\'enregistreur peut sauter un numéro au changement de qualité sans perdre de vidéo, et un morceau non vérifié n\'est pas exporté.</item>
+    <item quantity="many">%d coupures là où la numérotation des morceaux saute sans qu\'aucun morceau ne soit connu comme manquant : l\'enregistreur peut sauter un numéro au changement de qualité sans perdre de vidéo, et un morceau non vérifié n\'est pas exporté.</item>
+  </plurals>
+  <plurals name="archive_export_cut_format">
+    <item quantity="one">%d coupure là où le format vidéo change (qualité ou codec).</item>
+    <item quantity="other">%d coupures là où le format vidéo change (qualité ou codec).</item>
+    <item quantity="many">%d coupures là où le format vidéo change (qualité ou codec).</item>
+  </plurals>
+  <plurals name="archive_export_cut_codec">
+    <item quantity="one">%d coupure là où ce téléphone ne sait pas recoller le codec de la vidéo (le HEVC demande Android 7.0 ou plus) : ces morceaux sont exportés tels qu\'enregistrés, une vidéo chacun.</item>
+    <item quantity="other">%d coupures là où ce téléphone ne sait pas recoller le codec de la vidéo (le HEVC demande Android 7.0 ou plus) : ces morceaux sont exportés tels qu\'enregistrés, une vidéo chacun.</item>
+    <item quantity="many">%d coupures là où ce téléphone ne sait pas recoller le codec de la vidéo (le HEVC demande Android 7.0 ou plus) : ces morceaux sont exportés tels qu\'enregistrés, une vidéo chacun.</item>
+  </plurals>
+  <plurals name="archive_export_cut_size">
+    <item quantity="one">%d coupure pour que chaque vidéo reste sous 3 Go environ, et dans l\'espace libre dont ce téléphone a besoin pour la copier.</item>
+    <item quantity="other">%d coupures pour que chaque vidéo reste sous 3 Go environ, et dans l\'espace libre dont ce téléphone a besoin pour la copier.</item>
+    <item quantity="many">%d coupures pour que chaque vidéo reste sous 3 Go environ, et dans l\'espace libre dont ce téléphone a besoin pour la copier.</item>
+  </plurals>
+  <plurals name="archive_export_cut_other">
+    <item quantity="one">%d coupure là où deux morceaux n\'ont pas pu être recollés sans risque.</item>
+    <item quantity="other">%d coupures là où deux morceaux n\'ont pas pu être recollés sans risque.</item>
+    <item quantity="many">%d coupures là où deux morceaux n\'ont pas pu être recollés sans risque.</item>
+  </plurals>
   <!-- Après la ligne de fin : les objets qui ne se déchiffrent pas sont exclus
        et le reste du rapport est exporté. -->
   <plurals name="archive_export_undecryptable">
@@ -194,6 +240,6 @@
   <string name="archive_fgs_starting">Démarrage du secours…</string>
   <string name="archive_fgs_enumerating">Recherche de vos rapports…</string>
   <string name="archive_fgs_rate_limited">Relais occupé : attente avant reprise…</string>
-  <string name="archive_fgs_verifying">Vérification du rapport %1$d/%2$d</string>
+  <string name="archive_fgs_verifying">Récupération du rapport %1$d/%2$d</string>
   <string name="archive_fgs_exporting">Export…</string>
 </resources>

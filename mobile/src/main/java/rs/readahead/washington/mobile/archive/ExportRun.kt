@@ -11,17 +11,32 @@ import kotlin.coroutines.cancellation.CancellationException
  * @property undecryptable objects excluded because they do not decrypt.
  * @property timestampLeftOut the timestamp proof and its salt were planned,
  *   and excluded because a chunk they commit to was.
+ * @property videos joined videos written ([JoinedExportRun]); 0 for an
+ *   export of the chunks as recorded only.
+ * @property cuts why the chunks make more than one video: one cut per video
+ *   after the first, counted under its reason ([Cut]); a reason that never
+ *   cut is absent.
  */
-data class ExportOutcome(val written: Int, val undecryptable: Int, val timestampLeftOut: Boolean) {
+data class ExportOutcome(
+    val written: Int,
+    val undecryptable: Int,
+    val timestampLeftOut: Boolean,
+    val videos: Int = 0,
+    val cuts: Map<Cut, Int> = emptyMap(),
+) {
 
     /** Every recording planned was excluded: the export holds nothing. */
     val nothingWritten: Boolean get() = written == 0 && undecryptable > 0
 }
 
 /**
- * The loop of one export ([ExportPlan]): which planned files are written, and
- * what becomes of an object that does not decrypt. Kept apart from Android and
- * from the FFI, which are passed in, so the rule is testable on a plain JVM.
+ * The loop of an export of objects as recorded, one file per object: the
+ * export of the section kept apart as not verifiable
+ * ([ExportPlan.planUnverifiable]). The nominal export joins its chunks into
+ * videos instead ([JoinedExportRun]), under the same rules. Which planned
+ * files are written, and what becomes of an object that does not decrypt.
+ * Kept apart from Android and from the FFI, which are passed in, so the rule
+ * is testable on a plain JVM.
  *
  * An object that does not decrypt is excluded from the export and counted,
  * and the rest of the report is exported. A verified signature says who

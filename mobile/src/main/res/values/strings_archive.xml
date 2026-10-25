@@ -21,9 +21,9 @@
   <string name="archive_unlock_failed">Key derivation failed.</string>
   <string name="archive_no_server">No relay address configured in Settings.</string>
   <string name="archive_unlocked">ARCHIVE UNLOCKED</string>
-  <string name="archive_identity_matches">This phrase matches this device\'s identity.\n\nTap RECOVER to look for your reports on the relay.</string>
+  <string name="archive_identity_matches">This phrase matches this device\'s identity.\n\nTap RECOVER MY STREAMS to look for your reports on the relay.</string>
   <string name="archive_identity_differs">WARNING: this phrase is NOT this device\'s identity.\nYou are about to recover the reports of another identity.</string>
-  <string name="archive_identity_none">No identity on this device: archive only.\n\nTap RECOVER to look for your reports on the relay.</string>
+  <string name="archive_identity_none">No identity on this device: archive only.\n\nTap RECOVER MY STREAMS to look for your reports on the relay.</string>
 
   <!-- Search (enumeration) -->
   <string name="archive_retry_btn">SEARCH AGAIN</string>
@@ -63,7 +63,7 @@
   </plurals>
 
   <!-- Report rows -->
-  <string name="archive_verify_all_btn">VERIFY ALL</string>
+  <string name="archive_verify_all_btn">RETRIEVE ALL</string>
   <string name="archive_busy">The rescue is already working, wait for it to finish.</string>
   <string name="archive_report_title">Report %1$d</string>
   <string name="archive_report_subtitle_chain">Signed while recording · index %1$d</string>
@@ -72,8 +72,8 @@
     <item quantity="one">%d object on the relay, not verified yet.</item>
     <item quantity="other">%d objects on the relay, not verified yet.</item>
   </plurals>
-  <string name="archive_status_verifying">Verifying… %1$d / %2$d</string>
-  <string name="archive_status_failed">Verification stopped (%1$s). Tap VERIFY to try again.</string>
+  <string name="archive_status_verifying">Retrieving… %1$d / %2$d</string>
+  <string name="archive_status_failed">Retrieval stopped (%1$s). Tap RETRIEVE to try again.</string>
   <string name="archive_status_complete">COMPLETE: the recording was closed and every one of its objects verified.</string>
   <string name="archive_status_incomplete">INCOMPLETE: the recording was closed, but some of its objects are missing on the relay.</string>
   <string name="archive_status_altered">ALTERED: objects that are not yours were found on the relay. They are excluded.</string>
@@ -117,7 +117,7 @@
   <string name="archive_ots_match">Timestamp: the proof matches these recordings. The Bitcoin anchoring is checked with the desktop tool.</string>
   <string name="archive_ots_mismatch">Timestamp: the proof does NOT match the verified recordings.</string>
   <string name="archive_ots_absent">Timestamp: none.</string>
-  <string name="archive_verify_btn">VERIFY</string>
+  <string name="archive_verify_btn">RETRIEVE</string>
   <string name="archive_play_btn">WATCH</string>
   <string name="archive_export_btn">EXPORT</string>
   <string name="archive_play_none">No verified video in this report.</string>
@@ -138,13 +138,51 @@
 
   <!-- Export -->
   <string name="archive_export_warning_title">Export this report?</string>
-  <string name="archive_export_warning_message">The exported copy leaves the app: it is decrypted, the emergency wipe cannot erase it, and any app with access to the chosen folder can read it. Only verified recordings are exported, with the timestamp proof and its salt when the proof matches.</string>
+  <string name="archive_export_warning_message">The exported copy leaves the app: it is decrypted, the emergency wipe cannot erase it, and any app with access to the chosen folder can read it. Only verified recordings are exported, their chunks joined into videos without re-encoding; a new video starts wherever the format changes or the chunk numbering skips, and before a video grows too large. The timestamp proof and its salt cover the raw chunks, not a joined video: they are exported only with the raw chunks, when the proof matches.</string>
+  <string name="archive_export_raw_option">Also include the raw chunks (proof)</string>
   <string name="archive_export_confirm">CHOOSE A FOLDER</string>
   <string name="archive_cancel">CANCEL</string>
   <string name="archive_export_no_picker">No file picker on this phone: export is not possible.</string>
   <string name="archive_export_lost">The export did not start. Start it again from the report.</string>
-  <string name="archive_export_running">Export: file %1$d of %2$d</string>
+  <string name="archive_export_running">Exporting… %1$d / %2$d</string>
   <string name="archive_export_done">Exported.</string>
+  <!-- After the done line of a verified report: how many joined videos were
+       written, then, when there are several, why. -->
+  <plurals name="archive_export_videos">
+    <item quantity="one">%d video written.</item>
+    <item quantity="other">%d videos written.</item>
+  </plurals>
+  <plurals name="archive_export_cut_missing">
+    <item quantity="one">%d cut where a chunk is missing on the relay: a video never hides a gap.</item>
+    <item quantity="other">%d cuts where chunks are missing on the relay: a video never hides a gap.</item>
+  </plurals>
+  <plurals name="archive_export_cut_excluded">
+    <item quantity="one">%d cut where a chunk that does not decrypt was excluded: a video never hides a gap.</item>
+    <item quantity="other">%d cuts where chunks that do not decrypt were excluded: a video never hides a gap.</item>
+  </plurals>
+  <!-- A jump in the chunk numbers with no chunk known to be missing: the
+       recorder can skip a number at a change of quality without losing any
+       video. The wording must not claim that a chunk is missing. -->
+  <plurals name="archive_export_cut_numbering">
+    <item quantity="one">%d cut where the chunk numbering skips with no chunk known to be missing: the recorder can skip a number at a change of quality without losing any video, and a chunk that is not verified is not exported.</item>
+    <item quantity="other">%d cuts where the chunk numbering skips with no chunk known to be missing: the recorder can skip a number at a change of quality without losing any video, and a chunk that is not verified is not exported.</item>
+  </plurals>
+  <plurals name="archive_export_cut_format">
+    <item quantity="one">%d cut where the video format changes (quality or codec).</item>
+    <item quantity="other">%d cuts where the video format changes (quality or codec).</item>
+  </plurals>
+  <plurals name="archive_export_cut_codec">
+    <item quantity="one">%d cut where this phone cannot join the video\'s codec (HEVC needs Android 7.0 or later): those chunks are exported as recorded, one video each.</item>
+    <item quantity="other">%d cuts where this phone cannot join the video\'s codec (HEVC needs Android 7.0 or later): those chunks are exported as recorded, one video each.</item>
+  </plurals>
+  <plurals name="archive_export_cut_size">
+    <item quantity="one">%d cut to keep each video under about 3 GB, and within the free space this phone needs to copy it out.</item>
+    <item quantity="other">%d cuts to keep each video under about 3 GB, and within the free space this phone needs to copy it out.</item>
+  </plurals>
+  <plurals name="archive_export_cut_other">
+    <item quantity="one">%d cut where two chunks could not be joined safely.</item>
+    <item quantity="other">%d cuts where two chunks could not be joined safely.</item>
+  </plurals>
   <!-- After the done line: objects that did not decrypt are excluded and the
        rest of the report is exported. -->
   <plurals name="archive_export_undecryptable">
@@ -178,6 +216,6 @@
   <string name="archive_fgs_starting">Starting the rescue…</string>
   <string name="archive_fgs_enumerating">Searching for your reports…</string>
   <string name="archive_fgs_rate_limited">Relay busy: waiting before resuming…</string>
-  <string name="archive_fgs_verifying">Verifying report %1$d/%2$d</string>
+  <string name="archive_fgs_verifying">Retrieving report %1$d/%2$d</string>
   <string name="archive_fgs_exporting">Exporting…</string>
 </resources>

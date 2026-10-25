@@ -3,6 +3,7 @@ package rs.readahead.washington.mobile.service
 import android.content.ContentResolver
 import android.content.Context
 import android.net.Uri
+import android.os.Build
 import android.provider.DocumentsContract
 import org.stream.crypto.ArchiveIdentity
 import org.stream.crypto.SecureWipe
@@ -11,6 +12,8 @@ import rs.readahead.washington.mobile.archive.ArchiveLocalData
 import rs.readahead.washington.mobile.archive.ExportOutcome
 import rs.readahead.washington.mobile.archive.ExportPlan
 import rs.readahead.washington.mobile.archive.ExportRun
+import rs.readahead.washington.mobile.archive.JoinedExportRun
+import rs.readahead.washington.mobile.archive.Mp4ChunkMedia
 import rs.readahead.washington.mobile.archive.ObjectPlacement
 import rs.readahead.washington.mobile.archive.RescueCallRunner
 import rs.readahead.washington.mobile.archive.ReportDir
@@ -203,16 +206,19 @@ class ArchiveDownloader(context: Context) {
 
     /**
      * Export the VERIFIED content of [entry] to a folder created in the tree
-     * the witness picked. Each object is decrypted to a private file, copied,
-     * and the private file secure-deleted before the next one; nothing is
-     * decrypted straight into the destination, which the app cannot erase
-     * if the copy is interrupted. An object that does not decrypt is excluded
-     * and counted, and the rest is exported ([ExportRun]). A failed or
-     * cancelled export removes the folder it created, as far as the
-     * destination's provider allows, and so does one in which no object
-     * decrypted.
+     * the witness picked: its chunks joined into videos without re-encoding
+     * ([JoinedExportRun]), its session metadata, and, with [includeRaw], the
+     * chunks as recorded in a subfolder, with the timestamp proof and its
+     * salt when the proof matched. Each object is decrypted to a private
+     * file and the joined video is written to another, each copied out then
+     * secure-deleted; nothing is decrypted or muxed straight into the
+     * destination, which the app cannot erase if the copy is interrupted. An
+     * object that does not decrypt is excluded and counted, and the rest is
+     * exported. A failed or cancelled export removes the folder it created,
+     * as far as the destination's provider allows, and so does one in which
+     * no object decrypted.
      *
-     * @param onItem `(done, total)` after each planned file.
+     * @param onItem `(done, total)` after each object and timestamp file.
      */
     fun exportReport(
         entry: RescueSession.Entry,
@@ -220,25 +226,41 @@ class ArchiveDownloader(context: Context) {
         session: ArchiveSession,
         identity: ArchiveIdentity,
         provenanceSigner: FfiProvenanceSigner?,
+        includeRaw: Boolean,
         isActive: () -> Boolean,
         onItem: (done: Int, total: Int) -> Unit,
     ): ExportOutcome {
         val verdict = entry.verdict ?: throw IOException("report not verified")
         val dir = entry.dir ?: throw IOException("report not verified")
-        val plan = ExportPlan.plan(verdict.verifiedNames, entry.otsProof != null && entry.recordingId != null)
-        return exportItems(
-            entry, plan, entry.verifiedFiles, RescueNames.exportFolderName(entry.ordinal), dir, treeUri,
-            session, identity, provenanceSigner, isActive, onItem,
+        val plan = ExportPlan.planJoined(
+            verdict.verifiedNames,
+            missingSeqs = verdict.missingSeqs.map { it.toInt() }.toSet(),
+            otsMatched = entry.otsProof != null && entry.recordingId != null,
+            includeRaw = includeRaw,
+            ordinal = entry.ordinal,
         )
+        return intoNewFolder(entry, RescueNames.exportFolderName(entry.ordinal), treeUri, provenanceSigner) {
+            JoinedExportRun(
+                decrypt = { sealed, plain -> session.decryptToFile(sealed, plain, identity) },
+                secureDelete = { ArchiveSession.secureDelete(it) },
+                media = Mp4ChunkMedia(),
+                destination = it,
+                sdkInt = Build.VERSION.SDK_INT,
+            ).run(
+                plan, entry.verifiedFiles, File(dir.plain, "export.tmp"), File(dir.plain, "export-video.tmp"),
+                isActive, onItem,
+            )
+        }
     }
 
     /**
-     * Export the objects of [entry] kept apart as not verifiable, to a folder
-     * of their own whose name, like every file in it, carries
-     * [RescueNames.UNVERIFIED_LABEL]. Same handling as [exportReport]: private
-     * decryption, copy, secure deletion, exclusion of what does not decrypt,
-     * removal of a partial folder. Never writes into the verified export's
-     * folder, and never adds a verified object to this one.
+     * Export the objects of [entry] kept apart as not verifiable, as
+     * recorded, to a folder of their own whose name, like every file in it,
+     * carries [RescueNames.UNVERIFIED_LABEL]. Same handling as
+     * [exportReport]: private decryption, copy, secure deletion, exclusion of
+     * what does not decrypt, removal of a partial folder. Never writes into
+     * the verified export's folder, and never adds a verified object to this
+     * one.
      */
     fun exportUnverifiable(
         entry: RescueSession.Entry,
@@ -252,27 +274,27 @@ class ArchiveDownloader(context: Context) {
         val dir = entry.dir ?: throw IOException("report not verified")
         val plan = ExportPlan.planUnverifiable(verdict.unverifiableNames)
         if (plan.isEmpty()) throw IOException("nothing kept apart to export")
-        return exportItems(
-            entry, plan, entry.unverifiableFiles, RescueNames.exportUnverifiedFolderName(entry.ordinal), dir,
-            treeUri, session, identity, provenanceSigner = null, isActive = isActive, onItem = onItem,
-        )
+        return intoNewFolder(entry, RescueNames.exportUnverifiedFolderName(entry.ordinal), treeUri, null) {
+            ExportRun(
+                decrypt = { sealed, plain -> session.decryptToFile(sealed, plain, identity) },
+                secureDelete = { ArchiveSession.secureDelete(it) },
+                destination = it,
+            ).run(plan, entry.unverifiableFiles, File(dir.plain, "export.tmp"), isActive, onItem)
+        }
     }
 
-    /** Write [plan] into a new folder [folderName] of [treeUri], each object
-     *  read from [sources] (relay name → local encrypted file). The proof and
-     *  salt items come from [entry] and only [ExportPlan.plan] lists them. */
-    private fun exportItems(
+    /**
+     * Run [export] into a new folder [folderName] of [treeUri], and remove
+     * the folder when the export fails, is cancelled, or wrote nothing. The
+     * timestamp proof and salt come from [entry]; only the nominal plan lists
+     * them. The raw chunks' subfolder is created with its first file.
+     */
+    private fun intoNewFolder(
         entry: RescueSession.Entry,
-        plan: List<ExportPlan.Item>,
-        sources: Map<String, File>,
         folderName: String,
-        dir: ReportDir,
         treeUri: Uri,
-        session: ArchiveSession,
-        identity: ArchiveIdentity,
         provenanceSigner: FfiProvenanceSigner?,
-        isActive: () -> Boolean,
-        onItem: (done: Int, total: Int) -> Unit,
+        export: (JoinedExportRun.Destination<Uri>) -> ExportOutcome,
     ): ExportOutcome {
         val resolver = appContext.contentResolver
         val parent = DocumentsContract.buildDocumentUriUsingTree(
@@ -281,9 +303,25 @@ class ArchiveDownloader(context: Context) {
         val folder = DocumentsContract.createDocument(
             resolver, parent, DocumentsContract.Document.MIME_TYPE_DIR, folderName,
         ) ?: throw IOException("cannot create the export folder")
-        val destination = object : ExportRun.Destination<Uri> {
+        val destination = object : JoinedExportRun.Destination<Uri> {
+            private var rawFolder: Uri? = null
+
+            private fun rawFolder(): Uri {
+                rawFolder?.let { return it }
+                val created = DocumentsContract.createDocument(
+                    resolver, folder, DocumentsContract.Document.MIME_TYPE_DIR, RescueNames.EXPORT_RAW_FOLDER_NAME,
+                ) ?: throw IOException("cannot create the raw chunks folder")
+                rawFolder = created
+                return created
+            }
+
             override fun create(item: ExportPlan.Item): Uri =
-                DocumentsContract.createDocument(resolver, folder, item.mimeType, item.targetName)
+                DocumentsContract.createDocument(
+                    resolver, if (item.inRawFolder) rawFolder() else folder, item.mimeType, item.targetName,
+                ) ?: throw IOException("cannot create an export file")
+
+            override fun createVideo(name: String): Uri =
+                DocumentsContract.createDocument(resolver, folder, ExportPlan.MIME_MP4, name)
                     ?: throw IOException("cannot create an export file")
 
             override fun copy(plain: File, target: Uri): Long = copyFile(resolver, plain, target)
@@ -306,11 +344,7 @@ class ArchiveDownloader(context: Context) {
         }
         var keep = false
         try {
-            val outcome = ExportRun(
-                decrypt = { sealed, plain -> session.decryptToFile(sealed, plain, identity) },
-                secureDelete = { ArchiveSession.secureDelete(it) },
-                destination = destination,
-            ).run(plan, sources, File(dir.plain, "export.tmp"), isActive, onItem)
+            val outcome = export(destination)
             // A folder in which nothing decrypted holds nothing for anyone.
             keep = !outcome.nothingWritten
             return outcome

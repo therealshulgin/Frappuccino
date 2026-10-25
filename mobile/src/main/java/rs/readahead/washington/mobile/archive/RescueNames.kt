@@ -78,6 +78,27 @@ object RescueNames {
     /** Name of the [part]-th exported video chunk (1-based, reading order). */
     fun exportVideoName(part: Int): String = "part-%04d.mp4".format(part)
 
+    /**
+     * Name of a joined video of the [ordinal]-th report: `prise-NN.mp4` when
+     * the report joined into a single video ([part] null), otherwise
+     * `prise-NN-partie-MM.mp4` for its [part]-th video (1-based).
+     *
+     * The part number is padded to two digits, or to the width of
+     * [maxParts] when it is wider: the most videos the report can make, one
+     * per chunk. Sorted by name, as file managers and shell globs sort them,
+     * the parts then stay in recording order (`partie-02` before
+     * `partie-10`).
+     */
+    fun exportJoinedVideoName(ordinal: Int, part: Int?, maxParts: Int): String {
+        if (part == null) return "prise-%02d.mp4".format(ordinal)
+        val width = maxOf(2, maxParts.toString().length)
+        return "prise-%02d-partie-%0${width}d.mp4".format(ordinal, part)
+    }
+
+    /** Subfolder of a report's export holding its chunks as recorded, with
+     *  the timestamp proof and its salt when they are exported. */
+    const val EXPORT_RAW_FOLDER_NAME = "morceaux-bruts"
+
     const val EXPORT_METADATA_NAME = "metadata.json"
     const val EXPORT_OTS_NAME = "timestamp.ots"
     const val EXPORT_OTS_SALT_NAME = "timestamp.otssalt"

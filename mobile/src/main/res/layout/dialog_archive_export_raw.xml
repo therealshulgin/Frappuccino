@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The option under the export warning of a verified report
+  (ArchiveModeActivity.confirmExport): also export the chunks as recorded,
+  with the timestamp proof. Unchecked unless the witness checks it; the
+  dialog's message says what leaving it unchecked leaves out.
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:paddingStart="20dp"
+    android:paddingEnd="20dp"
+    android:paddingTop="8dp">
+
+    <CheckBox
+        android:id="@+id/archiveExportRawCheck"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:checked="false"
+        android:text="@string/archive_export_raw_option"
+        android:textColor="@color/wa_white" />
+</FrameLayout>

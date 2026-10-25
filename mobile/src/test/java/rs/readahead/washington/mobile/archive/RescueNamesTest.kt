@@ -117,6 +117,33 @@ class RescueNamesTest {
     }
 
     @Test
+    fun `joined videos are named after the report's position only`() {
+        val names = listOf(
+            RescueNames.exportJoinedVideoName(3, null, maxParts = 40),
+            RescueNames.exportJoinedVideoName(3, 1, maxParts = 40),
+            RescueNames.exportJoinedVideoName(3, 12, maxParts = 40),
+            RescueNames.EXPORT_RAW_FOLDER_NAME,
+        )
+        assertEquals(listOf("prise-03.mp4", "prise-03-partie-01.mp4", "prise-03-partie-12.mp4"), names.take(3))
+        for (n in names) {
+            assertFalse(n, n.contains(rid))
+            assertFalse(n, n.contains(sid))
+        }
+    }
+
+    @Test
+    fun `sorted by name, the parts of a report stay in recording order`() {
+        // A file manager or a shell glob sorts by name: partie-10 must not
+        // come before partie-2, nor partie-100 before partie-11.
+        for (maxParts in listOf(1, 9, 10, 99, 100, 120, 1_500)) {
+            val names = (1..maxParts).map { RescueNames.exportJoinedVideoName(3, it, maxParts) }
+            assertEquals("maxParts=$maxParts", names, names.sorted())
+        }
+        assertEquals("prise-03-partie-07.mp4", RescueNames.exportJoinedVideoName(3, 7, maxParts = 12))
+        assertEquals("prise-03-partie-007.mp4", RescueNames.exportJoinedVideoName(3, 7, maxParts = 120))
+    }
+
+    @Test
     fun `relay dates are shortened, anything else is shown as is`() {
         assertEquals("2026-05-15 12:34 UTC", RescueNames.displayDate("2026-05-15T12:34:56.123000+00:00"))
         assertEquals("2026-05-15 12:34 UTC", RescueNames.displayDate("2026-05-15T12:34:56Z"))

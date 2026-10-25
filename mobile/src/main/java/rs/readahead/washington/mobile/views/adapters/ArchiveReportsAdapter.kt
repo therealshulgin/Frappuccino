@@ -8,6 +8,7 @@ import android.widget.TextView
 import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.RecyclerView
 import rs.readahead.washington.mobile.R
+import rs.readahead.washington.mobile.archive.Cut
 import rs.readahead.washington.mobile.archive.ExportOutcome
 import rs.readahead.washington.mobile.archive.FailureReason
 import rs.readahead.washington.mobile.archive.RescueNames
@@ -198,23 +199,40 @@ class ArchiveReportsAdapter(
         fun hasExclusions(outcome: ExportOutcome?): Boolean = (outcome?.undecryptable ?: 0) > 0
 
         /**
-         * The line of a finished export: [done] when nothing was excluded;
-         * otherwise how many objects did not decrypt and were excluded, and
-         * whether the timestamp proof went with them.
+         * The line of a finished export: [done]; for a joined export, how
+         * many videos were written and, when there are several, why the
+         * recording was cut; then how many objects did not decrypt and were
+         * excluded, and whether the timestamp proof went with them.
          */
         fun exportDoneText(ctx: Context, outcome: ExportOutcome?, done: Int): String {
-            val excluded = outcome?.undecryptable ?: 0
-            if (outcome == null || excluded == 0) return ctx.getString(done)
+            if (outcome == null) return ctx.getString(done)
             val r = ctx.resources
+            val excluded = outcome.undecryptable
             if (outcome.nothingWritten) {
                 return r.getQuantityString(R.plurals.archive_export_nothing_decrypted, excluded, excluded)
             }
-            val parts = arrayListOf(
-                ctx.getString(done),
-                r.getQuantityString(R.plurals.archive_export_undecryptable, excluded, excluded),
-            )
+            val parts = arrayListOf(ctx.getString(done))
+            fun add(id: Int, count: Int) {
+                if (count > 0) parts.add(r.getQuantityString(id, count, count))
+            }
+            add(R.plurals.archive_export_videos, outcome.videos)
+            if (outcome.videos > 1) {
+                for (cut in Cut.entries) add(cutText(cut), outcome.cuts[cut] ?: 0)
+            }
+            add(R.plurals.archive_export_undecryptable, excluded)
             if (outcome.timestampLeftOut) parts.add(ctx.getString(R.string.archive_export_timestamp_left_out))
             return parts.joinToString(" ")
+        }
+
+        /** The wording of a [Cut], with its count. */
+        private fun cutText(cut: Cut): Int = when (cut) {
+            Cut.MISSING -> R.plurals.archive_export_cut_missing
+            Cut.EXCLUDED -> R.plurals.archive_export_cut_excluded
+            Cut.NUMBERING -> R.plurals.archive_export_cut_numbering
+            Cut.FORMAT -> R.plurals.archive_export_cut_format
+            Cut.CODEC -> R.plurals.archive_export_cut_codec
+            Cut.SIZE -> R.plurals.archive_export_cut_size
+            Cut.OTHER -> R.plurals.archive_export_cut_other
         }
 
         /** The wording of a [FailureReason]. */

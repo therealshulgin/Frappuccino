@@ -1,6 +1,7 @@
 package rs.readahead.washington.mobile.archive
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Test
@@ -18,6 +19,17 @@ class PendingExportTest {
             PendingExport.Answer.Start(3, unverifiable = true),
             PendingExport.answer(PendingExport(3, unverifiable = true), folderChosen = true),
         )
+    }
+
+    @Test
+    fun `the raw chunks option goes through the picker`() {
+        assertEquals(
+            PendingExport.Answer.Start(2, unverifiable = false, includeRaw = true),
+            PendingExport.answer(PendingExport(2, unverifiable = false, includeRaw = true), folderChosen = true),
+        )
+        assertEquals(PendingExport(2, false, includeRaw = true), PendingExport.fromSaved(2, false, includeRaw = true))
+        // Unchecked unless the witness checked it.
+        assertFalse(PendingExport(2, false).includeRaw)
     }
 
     @Test

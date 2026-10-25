@@ -56,8 +56,8 @@ import kotlin.coroutines.cancellation.CancellationException
  * Secrets never travel through an Intent: the identity, the provenance signer
  * and the rescue context are borrowed from [ArchiveAuthHolder], in RAM; an
  * Intent carries only a report's position in the list, or the destination the
- * witness picked for an export and which of the report's two sections goes
- * there.
+ * witness picked for an export, which of the report's two sections goes
+ * there, and whether the chunks as recorded go too.
  *
  * "The last one alive purges": when a batch ends and no archive screen is
  * attached any more, this service wipes the secrets and purges the local
@@ -147,7 +147,8 @@ class ArchiveDownloadService : Service() {
                 val ordinal = intent.getIntExtra(EXTRA_ORDINAL, -1)
                 val tree = intent.data
                 val unverifiable = intent.getBooleanExtra(EXTRA_UNVERIFIABLE, false)
-                if (ordinal > 0 && tree != null) ({ runExport(ordinal, tree, unverifiable) }) else null
+                val includeRaw = intent.getBooleanExtra(EXTRA_INCLUDE_RAW, false)
+                if (ordinal > 0 && tree != null) ({ runExport(ordinal, tree, unverifiable, includeRaw) }) else null
             }
             else -> null
         }
@@ -355,7 +356,7 @@ class ArchiveDownloadService : Service() {
         }
     }
 
-    private suspend fun runExport(ordinal: Int, tree: Uri, unverifiable: Boolean) {
+    private suspend fun runExport(ordinal: Int, tree: Uri, unverifiable: Boolean, includeRaw: Boolean) {
         val active = activeCheck()
         val session = ArchiveAuthHolder.getSession() ?: return
         val identity = ArchiveAuthHolder.getIdentity() ?: return
@@ -374,6 +375,7 @@ class ArchiveDownloadService : Service() {
         try {
             entry.exportOutcome = ArchiveDownloader(this).exportReport(
                 entry, tree, session, identity, ArchiveAuthHolder.getProvenanceSigner(),
+                includeRaw = includeRaw,
                 isActive = active,
             ) { done, total ->
                 entry.exportDone = done
@@ -533,6 +535,7 @@ class ArchiveDownloadService : Service() {
         private const val EXTRA_ORDINALS = "ordinals"
         private const val EXTRA_ORDINAL = "ordinal"
         private const val EXTRA_UNVERIFIABLE = "unverifiable"
+        private const val EXTRA_INCLUDE_RAW = "includeRaw"
 
         /** Broadcast (confined to the app's package): [RescueSession]
          *  changed, repaint. */
@@ -566,14 +569,22 @@ class ArchiveDownloadService : Service() {
 
         /**
          * Export the report at [ordinal] into the tree [treeUri]: its verified
-         * objects, or, with [unverifiable], only the ones kept apart as not
-         * verifiable, to a separate folder.
+         * objects, joined into videos, plus the chunks as recorded with
+         * [includeRaw]; or, with [unverifiable], only the ones kept apart as
+         * not verifiable, as recorded, to a separate folder.
          */
-        fun startExport(context: Context, ordinal: Int, treeUri: Uri, unverifiable: Boolean = false) = start(
+        fun startExport(
+            context: Context,
+            ordinal: Int,
+            treeUri: Uri,
+            unverifiable: Boolean = false,
+            includeRaw: Boolean = false,
+        ) = start(
             context,
             Intent(context, ArchiveDownloadService::class.java).setAction(ACTION_EXPORT)
                 .putExtra(EXTRA_ORDINAL, ordinal)
                 .putExtra(EXTRA_UNVERIFIABLE, unverifiable)
+                .putExtra(EXTRA_INCLUDE_RAW, includeRaw)
                 .setData(treeUri),
         )
 
