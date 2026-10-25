@@ -61,11 +61,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # `~/.kani` holds the toolchain bundle `cargo kani setup` downloads, which
-      # is the largest single fetch in this workflow. It was outside the cache,
-      # so every run re-downloaded it, and a run that lost that download failed
-      # the job before a single proof had been attempted.
-      - name: Cache cargo + kani toolchain
+      # `~/.kani` holds the bundle `cargo kani setup` unpacks, and that bundle
+      # runs on its own nightly toolchain, which setup installs under
+      # `~/.rustup`. With only the bundle cached, every run still fetched the
+      # nightly (about 570 MB), because setup re-runs in full even when the
+      # bundle is there; a run that lost that download failed the job before a
+      # single proof had been attempted. Both are cached now.
+      #
+      # The nightly's name is fixed by the Kani version: it is the content of
+      # `~/.kani/kani-<version>/rust-toolchain-version`. Bump it, and the key,
+      # together with KANI_VERSION.
+      - name: Cache cargo + kani bundle + kani nightly
         uses: actions/cache@v4
         with:
           path: |
@@ -73,22 +79,37 @@ jobs:
             ~/.cargo/git
             ~/.cargo/bin
             ~/.kani
-          key: ${{ runner.os }}-kani-0.67.0-v2
+            ~/.rustup/toolchains/nightly-2025-11-21-x86_64-unknown-linux-gnu
+          key: ${{ runner.os }}-kani-0.67.0-v3
       - name: Install Kani
+        env:
+          KANI_VERSION: '0.67.0'
         run: |
+          # A cache hit needs no network at all: the driver, the bundle and the
+          # nightly it names are all there, so setup is skipped rather than
+          # re-run. Anything missing falls through to the full install.
+          bundle="$HOME/.kani/kani-${KANI_VERSION}"
+          if cargo kani --version 2>/dev/null | grep -qx "cargo-kani ${KANI_VERSION}" \
+             && [ -f "${bundle}/rust-toolchain-version" ] \
+             && [ -d "$HOME/.rustup/toolchains/$(cat "${bundle}/rust-toolchain-version")" ]; then
+            echo "Kani ${KANI_VERSION}, its bundle and its nightly restored from the cache"
+            exit 0
+          fi
           # Retried, because a proof job that dies in its own installation
           # reports nothing about the proofs: it is the failure mode this
           # workflow exists to rule out, not one it may exhibit. Both commands
-          # are idempotent, so a retry after a partial install is safe.
-          for attempt in 1 2 3; do
-            if cargo install --locked kani-verifier --version 0.67.0 \
+          # are idempotent, so a retry after a partial install is safe. The
+          # waits grow because what fails here is a download, and a download
+          # that failed seconds ago tends to fail again seconds later.
+          for attempt in 1 2 3 4 5; do
+            if cargo install --locked kani-verifier --version "${KANI_VERSION}" \
                && cargo kani setup; then
               exit 0
             fi
             echo "::warning::Kani install attempt ${attempt} failed"
-            sleep $((attempt * 30))
+            sleep $((attempt * attempt * 30))
           done
-          echo "::error::Kani install failed three times; the proofs did not run"
+          echo "::error::Kani install failed five times; the proofs did not run"
           exit 1
       - name: Kani proofs (8 harnesses, count asserted by the runner)
         run: bash crypto-rs/run-kani.sh
