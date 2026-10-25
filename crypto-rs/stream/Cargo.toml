@@ -67,7 +67,7 @@ blake2           = "=0.10.6"                                      # Salamander o
 # S7 — V2 server client (blocking HTTP + custom rustls ServerCertVerifier).
 # Pulled in by the `protocol` feature (on by default).
 reqwest          = { version = "=0.12.28", default-features = false, features = ["blocking", "json", "rustls-tls-manual-roots"], optional = true }
-rustls           = { version = "=0.23.38", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls           = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 rustls-pki-types = { version = "=1.14.0", optional = true }
 serde            = { version = "=1.0.228", features = ["derive"], optional = true }
 serde_json       = { version = "=1.0.149", optional = true }
@@ -79,7 +79,7 @@ subtle           = { version = "=2.6.1", optional = true }        # constant-tim
 # `quic` feature. Versions match the workspace lock (quinn/tokio/rustls/bytes/
 # http already present, dragged un-compiled by reqwest); h3/h3-quinn are new.
 quinn            = { version = "=0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"], optional = true }
-tokio            = { version = "=1.52.1", default-features = false, features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "time"], optional = true }
+tokio            = { version = "=1.53.3", default-features = false, features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "time"], optional = true }
 h3               = { version = "=0.0.8", optional = true }
 h3-quinn         = { version = "=0.0.10", optional = true }
 bytes            = { version = "=1.11.1", optional = true }

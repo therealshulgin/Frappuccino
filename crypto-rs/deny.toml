@@ -67,6 +67,7 @@ deny = [
 ignore = [
     "RUSTSEC-2025-0141",  # bincode unmaintained, via uniffi_macros (build only)
     "RUSTSEC-2024-0436",  # paste unmaintained, via uniffi_bindgen (build only)
+    "RUSTSEC-2026-0374",  # basic-toml unmaintained, via askama_derive <- uniffi_bindgen (build only)
 ]
 
 [sources]

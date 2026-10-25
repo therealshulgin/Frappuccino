@@ -37,8 +37,8 @@ sink = ["dep:rcgen"]
 # Same pinned versions already in the workspace lock (quinn/tokio pulled
 # un-compiled by reqwest; rustls is the protocol stack's pin).
 quinn            = { version = "=0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
-tokio            = { version = "=1.52.1", default-features = false, features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "time"] }
-rustls           = { version = "=0.23.38", default-features = false, features = ["ring", "std"] }
+tokio            = { version = "=1.53.3", default-features = false, features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "time"] }
+rustls           = { version = "=0.23.46", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = "=1.14.0"
 rcgen            = { version = "=0.13.2", default-features = false, features = ["crypto", "ring", "pem"], optional = true }
 
