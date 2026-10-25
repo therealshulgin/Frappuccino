@@ -536,3 +536,31 @@ ssh root@<IP> -i ~/.ssh/id_ed25519 '
   (`frappuccino-backup.timer`). Garde l'œil sur la taille `minio_data`
   (`docker system df -v`) — sur un relais saturé de captures longues il peut
   grossir vite, et tes backups itou.
+
+## Front QUIC (Caddy, `:8444`)
+
+Le plan de données ObfQuic passe par le proxy de désobfuscation
+(`frappuccino-obfs-proxy`, UDP `:8445`) puis par Caddy (`:8444`), qui relaie vers
+le relais sur `127.0.0.1:8000`. Sa configuration est versionnée :
+`deploy/caddy/Caddyfile`, déployée à `/opt/frappuccino/caddy/Caddyfile`.
+
+**Aucun journal d'accès**, comme nginx et uvicorn : le Caddyfile ne contient
+aucune directive `log` (`tests/test_deploy_caddy.py` échoue sinon, et le script
+de lancement refuse un fichier qui en contient une).
+
+- **Modifier la configuration** : réécrire le fichier en place, puis recharger.
+  Le fichier est monté seul dans le conteneur, donc un fichier remplacé (nouvel
+  inode) ne serait pas vu : écrire avec `cat nouveau > /opt/frappuccino/caddy/Caddyfile`,
+  pas avec `mv`.
+
+  ```bash
+  docker exec frappuccino-quic-front caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+  ```
+
+- **Recréer le conteneur** (image épinglée par condensé, journal Docker plafonné) :
+
+  ```bash
+  bash /opt/frappuccino/deploy/caddy/run-quic-front.sh
+  ```
+
+  Supprimer l'ancien conteneur supprime aussi son journal Docker, définitivement.

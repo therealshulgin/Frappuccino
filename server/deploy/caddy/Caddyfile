@@ -1,0 +1,26 @@
+# QUIC front of the relay (HTTP/3 on :8444), behind the Salamander
+# de-obfuscation proxy (`frappuccino-obfs-proxy`, UDP :8445 -> :8444).
+# Deployed at /opt/frappuccino/caddy/Caddyfile and run by run-quic-front.sh.
+#
+# NO ACCESS LOG. This front must keep no trace of the requests it carries,
+# like nginx (`access_log off`) and uvicorn (`--no-access-log`) on the
+# DirectTls path. Caddy writes an access log only when a site block holds a
+# `log` directive; this file has none, and tests/test_deploy_caddy.py fails
+# if one comes back. An earlier copy of this file had one: it recorded, for
+# every request, the time, the full path (report id and object name) and the
+# capability headers, in the container's log, which persists on the host.
+{
+	auto_https off
+	servers {
+		protocols h1 h2 h3
+	}
+}
+
+:8444 {
+	tls /certs/frappuccino_ca.crt /certs/frappuccino_ca.key
+	reverse_proxy 127.0.0.1:8000 {
+		# The relay does not read Host; pass the client's, as nginx does.
+		header_up Host {host}
+		header_up X-Forwarded-Proto https
+	}
+}
