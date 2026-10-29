@@ -123,6 +123,24 @@ server {
         proxy_buffering         off;
         proxy_read_timeout      120s;
     }
+
+    # Diagnostic logs of test builds (app/routes/diag.py): a body is at most
+    # 1 MiB of gzip, so 2m lets every body the route accepts through and keeps
+    # the 32m of the chunk PUTs off this path. On a relay without DIAG_LOGS_DIR
+    # the route does not exist and the request ends in a 404 from the relay.
+    # Same proxying as `location /`: the rate limit keys on X-Forwarded-For.
+    location ^~ /diag/ {
+        client_max_body_size 2m;
+        proxy_pass         http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Forwarded-For   $remote_addr;
+        proxy_set_header   X-Forwarded-Proto https;
+        proxy_set_header   Connection        "";
+        proxy_request_buffering off;
+        proxy_buffering         off;
+        proxy_read_timeout      120s;
+    }
 }
 
 # Bloc HTTP pour challenge ACME Let's Encrypt — uniquement actif si tu utilises

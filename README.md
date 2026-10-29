@@ -171,6 +171,55 @@ Full model, including what is explicitly **not** claimed:
 If lives depend on your footage today, do not make Frappuccino your only line of defense.
 The known limits are documented with the same care as the features.
 
+### Pre-release test builds send diagnostic logs
+
+Builds whose version ends in `-testN` (currently 2.12.0-test2) go to a closed group of
+testers. Unlike any other version, they send diagnostic logs to the **test** relay, so that a
+problem tied to one phone model, such as a camera that does not start, can be diagnosed
+without the phone at hand. This is temporary. The code that collects and sends these logs is
+compiled only into a `-testN` version, and CI checks that a build with any other version
+number contains none of it.
+
+What a test build sends, through the app's pinned HTTPS client and without any account,
+token or identity key:
+
+- the app's own log lines and crash traces, and the app's share of the system log (camera
+  and video encoder messages), each with its time;
+- a description of the phone: manufacturer and model, the full build fingerprint, Android
+  version and security patch level (and One UI on Samsung), chipset, what each camera
+  advertises (frame-rate ranges, zoom range, lenses), the video encoders available, whether
+  camera and microphone access and the battery exemption are granted, the thermal status,
+  and the app's version.
+
+What it is not meant to send: the recovery phrase, the PIN, keys, tokens, report or session
+identifiers, the identity's fingerprint, its batch number or slot counts, or any video. The
+app does not log these. As a second line of defence, every line is filtered on the phone
+before it is stored or sent: long hexadecimal identifiers, grouped hex, UUIDs, tokens, IP and
+e-mail addresses are replaced, a line holding a run of recovery-phrase words is dropped, and
+in file paths and URLs only the identifiers are replaced, so directories and chunk numbers
+remain. This filter works on patterns. It is not a proof: a short secret such as a PIN would
+pass it, which is why the first line of defence is not logging them. Uploads are grouped
+under a random identifier drawn on the phone and reset by the emergency wipe, which also
+erases the logs waiting to be sent. Nothing is sent from the Android Emulator.
+
+On the relay, the logs are kept apart from the testimony blobs and out of the relay's backups
+(a snapshot of the whole disk taken by the host would still hold them), with no client IP,
+and deleted after 30 days. What a test build still gives a relay operator:
+
+- **The logs can be tied to the phone's pseudonymous identity.** They reach the same relay
+  as the phone's authentication and testimony uploads, from the same address, and they hold
+  timed events such as authentications and batch rotations. A live operator can therefore
+  match a phone's logs with its identity and its uploads, even though nothing in the logs
+  names the identity.
+- **The random identifier does not fully separate a phone's life before and after an
+  emergency wipe.** The description of the phone is the same, and the wipe clears the app's
+  share of the system log only as far as the phone allows, so the first upload after a wipe
+  can repeat lines already sent under the previous identifier.
+
+For a test build, a relay operator therefore holds one more thing than the threat model
+above describes: a timeline of app events per test phone, attributable to its pseudonymous
+identity.
+
 ## Documentation map
 
 The deep-dive documents are in French; the Rust workspace documentation and the audit scope

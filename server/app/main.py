@@ -6,10 +6,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
-from app import auth, blob_cleanup, report_cleanup, storage
+from app import auth, blob_cleanup, config, report_cleanup, storage
 from app.ratelimit import limiter
 from app.logging_setup import setup_logging
-from app.routes import archive, auth_routes, auth_v2, timestamp, upload
+from app.routes import archive, auth_routes, auth_v2, diag, timestamp, upload
 
 # Phase 6.1.6 — JSON structured logging sans IP. Voir logging_setup.py
 # pour le rationale (audit SIEM-compatible + threat model "no IP leak").
@@ -49,15 +49,22 @@ async def lifespan(app: FastAPI):
     # it bounded.
     nonce_cleanup_task = asyncio.create_task(auth.nonce_cleanup_loop())
 
+    # Diagnostic logs of test builds (routes/diag.py), on a relay that has them
+    # on: delete the files past their retention now, then every hour, uploads
+    # or not.
+    background = [cleanup_task, report_cleanup_task, nonce_cleanup_task]
+    if config.DIAG_LOGS_DIR:
+        await diag.startup_purge()
+        background.append(asyncio.create_task(diag.purge_loop()))
+
     logger.info("STREAM blind relay server ready")
     yield
 
     # Shutdown
     logger.info("Shutting down — cancelling background tasks")
-    cleanup_task.cancel()
-    report_cleanup_task.cancel()
-    nonce_cleanup_task.cancel()
-    for task in (cleanup_task, report_cleanup_task, nonce_cleanup_task):
+    for task in background:
+        task.cancel()
+    for task in background:
         try:
             await task
         except asyncio.CancelledError:
@@ -149,3 +156,8 @@ app.include_router(archive.router)
 # §10.11 Phase B slice 2 — relay-assisted OpenTimestamps, prefix /api/v2.
 # Dormant unless OTS_ENABLED (config).
 app.include_router(timestamp.router)
+# Diagnostic logs of pre-release test builds. Mounted only when the operator set
+# DIAG_LOGS_DIR, which only the test relay does: elsewhere POST /diag/v1/logs
+# does not exist and answers 404 like any unknown path. See routes/diag.py.
+if config.DIAG_LOGS_DIR:
+    app.include_router(diag.router)

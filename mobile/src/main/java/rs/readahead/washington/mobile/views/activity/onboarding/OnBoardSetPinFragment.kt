@@ -232,8 +232,7 @@ class OnBoardSetPinFragment : BaseFragment(), PinLockListener {
             try {
                 // 1. Dérivation + stockage local (Argon2id ~1.2s)
                 proof = manager.enrollFromMnemonic(mnemonicBytes, pin)
-                Timber.d("Local enrollment OK — fingerprint: %s",
-                    proof.identity.readableFingerprint())
+                Timber.d("Local enrollment OK")
 
                 // 2. UI update : enrôlement serveur
                 view?.post { msgView.text = "ENRÔLEMENT SERVEUR…" }

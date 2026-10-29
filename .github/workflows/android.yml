@@ -11,7 +11,9 @@ name: Android build + tests
 #                mobile/src/main/jniLibs/ is gitignored, so a clean clone has no
 #                binary at all and this job is the only thing that puts one back.
 #   apk          the Kotlin compiles, the unit tests pass, the .so gates fire,
-#                and the packaged APK really contains the native libraries.
+#                the packaged APK really contains the native libraries, and the
+#                log upload of pre-release test builds is absent from a build
+#                with a production version name.
 #   instrumented the x86_64 .so loads on a live Android system and the UniFFI
 #                bridge answers across JNA -- the on-device half a host JVM
 #                cannot stand in for.
@@ -49,6 +51,7 @@ on:
       - 'gradle.properties'
       - 'gradle/**'
       - 'gradlew'
+      - 'scripts/check-diag-dex.sh'
       - '.github/workflows/android.yml'
   pull_request:
     paths:
@@ -61,6 +64,7 @@ on:
       - 'gradle.properties'
       - 'gradle/**'
       - 'gradlew'
+      - 'scripts/check-diag-dex.sh'
       - '.github/workflows/android.yml'
   workflow_dispatch:
 
@@ -306,6 +310,54 @@ jobs:
           path: |
             mobile/build/reports/**
             stream-crypto/build/reports/**
+
+      # A pre-release test build (version name ending in -testN) compiles the
+      # diagnostics that send logs to the test relay; any other version name
+      # compiles a facade without them (mobile/build.gradle). These two controls
+      # check that switch on the dex itself, and they come last, after the
+      # uploads, because the second one rebuilds the debug APK under another
+      # version name and must not replace the artefact.
+      #
+      # The positive control first, so that "absent" below cannot pass on a
+      # search that never finds anything. It uses this run's APK while the
+      # version is a test name, and builds a test-named one otherwise, so that
+      # it keeps proving something once the version goes to production.
+      - name: Diagnostics control -- a test-named build carries the upload code
+        run: |
+          set -euo pipefail
+          meta=mobile/build/outputs/apk/debug/output-metadata.json
+          test -f "$meta" || { echo "FAIL: $meta is missing"; exit 1; }
+          ver="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["elements"][0]["versionName"])' "$meta")"
+          echo "this run's APK: versionName=$ver"
+          if ! [[ "$ver" =~ -test[0-9]+$ ]]; then
+            echo "not a test name: building one for the control"
+            rm -rf mobile/build/outputs/apk/debug
+            ./gradlew :mobile:assembleDebug -Pfrappuccino.versionName=0.0.0-test1
+          fi
+          apk="$(find mobile/build/outputs/apk/debug -name '*.apk' -print -quit)"
+          bash scripts/check-diag-dex.sh "$apk" present
+
+      - name: Diagnostics control -- a production-named build carries none of it
+        run: |
+          set -euo pipefail
+          # Removed first: a build that failed to write its APK must not leave
+          # the previous one to be checked in its place.
+          rm -rf mobile/build/outputs/apk/debug
+          ./gradlew :mobile:assembleDebug -Pfrappuccino.versionName=9.9.9
+          meta=mobile/build/outputs/apk/debug/output-metadata.json
+          test -f "$meta" || { echo "FAIL: $meta is missing"; exit 1; }
+          ver="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["elements"][0]["versionName"])' "$meta")"
+          test "$ver" = "9.9.9" || { echo "FAIL: the build is versionName=$ver, the override did not apply"; exit 1; }
+          apk="$(find mobile/build/outputs/apk/debug -name '*.apk' -print -quit)"
+          bash scripts/check-diag-dex.sh "$apk" absent
+
+      # The unit tests again, under the same production name: the job's test
+      # step above only ever sees the version the tree carries. Here
+      # DiagnosticsChannelTest checks that the uploader classes are absent, and
+      # DiagnosticsLeftoversTest the cleanup the production facade runs.
+      # Writes no APK.
+      - name: Diagnostics control -- the unit tests of a production-named build
+        run: ./gradlew :mobile:testDebugUnitTest -Pfrappuccino.versionName=9.9.9
 
   instrumented:
     name: connectedAndroidTest on an emulator

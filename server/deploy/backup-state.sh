@@ -13,6 +13,12 @@
 #                        the archive retrieval flow (Phase 4.4) returns
 #                        empty for every report.
 #
+# The third volume, `diag_logs` (diagnostic logs of test builds, mounted at
+# /diag), is left out on purpose and must stay out: those logs are kept for the
+# length of a test and purged at its end, and a backup would keep them as long
+# as the backups are kept, wherever they are copied. tests/test_diag.py fails
+# if a third volume is added to the tarball.
+#
 # Both volumes live at `/var/lib/docker/volumes/<name>/_data/` on the
 # host. We don't tar them directly from the host because dockerd may
 # hold open file handles ; instead we spin up a transient alpine

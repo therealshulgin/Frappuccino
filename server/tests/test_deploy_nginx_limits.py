@@ -9,6 +9,11 @@ every body at its `client_max_body_size`. If the front's cap for `/close/` were
 lower, the closure of a long report would be refused there with a 413 and never
 reach the route. This reads the template and checks the cap that applies to
 `/close/<report_id>` against the route's.
+
+The diagnostic-logs route of test builds (`/diag/v1/logs`, app/routes/diag.py)
+is checked the same way, and from the other side too: its location must let
+through every body the route accepts, and keep the chunk PUTs' larger cap off
+that path.
 """
 
 import os
@@ -21,7 +26,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 os.environ.setdefault("JWT_SECRET", "test-secret-do-not-use")
 
 from app import paths  # noqa: E402
-from app.routes import upload  # noqa: E402
+from app.routes import diag, upload  # noqa: E402
 
 TEMPLATE = PROJECT_ROOT / "deploy" / "nginx" / "relay.conf.template"
 _UNITS = {"": 1, "k": 1024, "m": 1024 ** 2, "g": 1024 ** 3}
@@ -39,18 +44,35 @@ def _relay_server_block(text: str) -> str:
     return text[start:end]
 
 
-def _close_cap(text: str) -> int:
-    """The body cap nginx applies to `POST /close/<rid>`: the one set in a
-    location matching `/close/`, else the server-level one."""
-    server = _relay_server_block(text)
-    location = re.search(r"location\s+\^~\s+/close/\s*\{(.*?)\n    \}", server, re.DOTALL)
-    if location is not None:
-        inner = _SIZE.search(location.group(1))
-        if inner is not None:
-            return _bytes(inner)
+def _location(server: str, prefix: str) -> str | None:
+    """The body of the `location ^~ <prefix>` block, if there is one."""
+    found = re.search(
+        r"location\s+\^~\s+" + re.escape(prefix) + r"\s*\{(.*?)\n    \}", server, re.DOTALL
+    )
+    return None if found is None else found.group(1)
+
+
+def _server_cap(server: str) -> int:
     # Server level: the first directive outside any location block.
     outside = server.split("location", 1)[0]
     return _bytes(_SIZE.search(outside))
+
+
+def _location_cap(text: str, prefix: str) -> int:
+    """The body cap nginx applies under `prefix`: the one set in a location
+    matching it, else the server-level one."""
+    server = _relay_server_block(text)
+    location = _location(server, prefix)
+    if location is not None:
+        inner = _SIZE.search(location)
+        if inner is not None:
+            return _bytes(inner)
+    return _server_cap(server)
+
+
+def _close_cap(text: str) -> int:
+    """The body cap nginx applies to `POST /close/<rid>`."""
+    return _location_cap(text, "/close/")
 
 
 def test_the_largest_manifest_fits_the_route():
@@ -63,3 +85,22 @@ def test_nginx_lets_any_closure_the_route_accepts_through():
     assert cap >= upload.MAX_MANIFEST_SIZE, (
         f"nginx caps /close/ at {cap} bytes, the route at {upload.MAX_MANIFEST_SIZE}"
     )
+
+
+def test_nginx_lets_any_diagnostics_body_the_route_accepts_through():
+    text = TEMPLATE.read_text(encoding="utf-8")
+    cap = _location_cap(text, "/diag/")
+    assert cap >= diag.MAX_BODY_BYTES, (
+        f"nginx caps /diag/ at {cap} bytes, the route at {diag.MAX_BODY_BYTES}"
+    )
+    # Its own, smaller cap: the chunk PUTs' server-level one does not apply.
+    assert cap < _server_cap(_relay_server_block(text))
+
+
+def test_the_diagnostics_location_is_proxied_with_the_client_address():
+    # The route's rate limit keys on the address nginx forwards.
+    server = _relay_server_block(TEMPLATE.read_text(encoding="utf-8"))
+    location = _location(server, "/diag/")
+    assert location is not None
+    assert re.search(r"proxy_pass\s+http://127\.0\.0\.1:8000;", location)
+    assert re.search(r"proxy_set_header\s+X-Forwarded-For\s+\$remote_addr;", location)

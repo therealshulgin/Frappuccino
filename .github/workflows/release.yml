@@ -167,6 +167,29 @@ jobs:
             echo "  ok  $abi"
           done
 
+      # A pre-release test build (version name ending in -testN) sends its logs
+      # to the test relay; a production release must not even contain the code
+      # (mobile/build.gradle switches the source set on the version name). The
+      # tag says which one this release is meant to be, the APK which one it
+      # is, and the two must agree before the dex is checked.
+      - name: The diagnostics match the release channel
+        run: |
+          set -euo pipefail
+          meta=mobile/build/outputs/apk/release/output-metadata.json
+          test -f "$meta" || { echo "FAIL: $meta is missing"; exit 1; }
+          ver="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["elements"][0]["versionName"])' "$meta")"
+          if [[ "$ver" =~ -test[0-9]+$ ]]; then want=present; else want=absent; fi
+          echo "versionName=$ver: diagnostics expected $want"
+          if [ "${GITHUB_REF_TYPE:-}" = tag ]; then
+            if [[ "$GITHUB_REF_NAME" =~ -test[0-9]+$ ]]; then tag_want=present; else tag_want=absent; fi
+            test "$tag_want" = "$want" || {
+              echo "FAIL: tag $GITHUB_REF_NAME and versionName $ver disagree on whether this is a test build"
+              exit 1
+            }
+          fi
+          apk="$(find mobile/build/outputs/apk/release -name '*.apk' -print -quit)"
+          bash scripts/check-diag-dex.sh "$apk" "$want"
+
       - name: Collect the bundle and its checksums
         run: |
           set -euo pipefail

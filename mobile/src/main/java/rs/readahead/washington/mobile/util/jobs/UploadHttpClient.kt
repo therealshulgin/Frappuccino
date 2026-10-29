@@ -19,7 +19,9 @@ import java.util.concurrent.TimeUnit
  * client is the provenance timestamp POST, whose `.ots` response body has to be
  * read in the JVM ([ProvenanceTimestampWorker]), and the `/health` reachability
  * probe, which derives a 3 s-callTimeout client from this one
- * ([rs.readahead.washington.mobile.service.StreamRecordingService]).
+ * ([rs.readahead.washington.mobile.service.StreamRecordingService]), and, in
+ * a pre-release test build only, the diagnostics upload (src/diagnostics/java,
+ * DiagnosticsHttp), which must not go through a client without these pins.
  * [UploadAuthHolder] also evicts this pool on clear, because OkHttp's HTTP/2
  * layer keeps bearer copies on the pooled connections.
  *

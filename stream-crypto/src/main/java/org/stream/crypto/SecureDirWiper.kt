@@ -98,11 +98,17 @@ object SecureDirWiper {
      * background pass): every `<name>.wipe-*` sibling of [names] under [parent].
      */
     fun finishLeftovers(parent: File, names: Collection<String>) {
-        val leftovers = parent.listFiles()?.filter { f ->
-            names.any { f.name.startsWith(it + WIPE_SUFFIX) }
-        } ?: return
+        val leftovers = leftovers(parent, names)
         if (leftovers.isNotEmpty()) wipeInBackground(leftovers, "secure-dir-wipe-resume")
     }
+
+    /**
+     * What [finishLeftovers] erases, without erasing it: every `<name>.wipe-*`
+     * sibling of [names] under [parent], for a caller that hands them to its
+     * own background pass.
+     */
+    fun leftovers(parent: File, names: Collection<String>): List<File> =
+        parent.listFiles()?.filter { f -> names.any { f.name.startsWith(it + WIPE_SUFFIX) } }.orEmpty()
 
     private fun secureDelete(file: File) {
         try {

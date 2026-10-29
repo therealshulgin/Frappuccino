@@ -145,6 +145,13 @@ public class MyApplication extends MultiDexApplication implements Configuration.
                 Timber.w(t, "MetricsFileLogger plant failed (non-fatal)");
             }
         }
+        // A pre-release test build (version name ending in -testN) plants its
+        // diagnostics tree here, the only tree of a release build, and
+        // schedules the uploads to the test relay. A production version
+        // compiles a facade that only removes what a test build left behind
+        // (mobile/build.gradle picks the source set). Planted before anything
+        // below logs, so that a failed start is in the log.
+        rs.readahead.washington.mobile.diagnostics.Diagnostics.INSTANCE.install(this);
         CommonPrefs.getInstance().init(this);
         SharedPrefs.getInstance().init(this);
 

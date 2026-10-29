@@ -28,6 +28,12 @@ OSError ne le signale, puisqu'il ne s'est rien passé.
 
 Appelants : `auth._save_nonces_unlocked`, `jwt_blacklist._save_unlocked`,
 `ratchet_registry._save`.
+
+`atomic_bytes_save` fait la même chose pour des octets bruts. Son seul appelant
+est `routes/diag.py` (journaux de diagnostic des versions de test), qui n'est pas
+de l'état mais veut la même garantie : un fichier lu par l'opérateur est soit
+complet, soit absent. Le fichier temporaire vient de `mkstemp`, donc il est créé
+en 0600 et le rename garde ce mode.
 """
 
 import json
@@ -35,7 +41,7 @@ import logging
 import os
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import IO, Any, Callable
 
 logger = logging.getLogger("stream.atomic_io")
 
@@ -63,7 +69,19 @@ def atomic_json_save(
     only (None = compact), and data that is not JSON-serializable raises
     TypeError.
     """
-    p = Path(path)
+    _write_then_replace(
+        Path(path), "w", lambda f: json.dump(data, f, indent=indent)
+    )
+
+
+def atomic_bytes_save(path: Path | str, data: bytes) -> None:
+    """`atomic_json_save` for raw bytes: same tmp file, fsync and rename, same
+    OSError propagation. The file ends up 0600 (mkstemp's mode, kept by the
+    rename)."""
+    _write_then_replace(Path(path), "wb", lambda f: f.write(data))
+
+
+def _write_then_replace(p: Path, mode: str, write: Callable[[IO], Any]) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     # mkstemp returns an OS file descriptor + a str path. Use the str
     # path for os.replace and the fd for the write loop. The temp file
@@ -75,8 +93,9 @@ def atomic_json_save(
     )
     tmp = Path(tmp_str)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=indent)
+        encoding = None if "b" in mode else "utf-8"
+        with os.fdopen(fd, mode, encoding=encoding) as f:
+            write(f)
             # Durability before rename : ensure the bytes are on disk
             # (not just in the page cache) so a crash after the rename
             # leaves a complete file, not a 0-byte hole. fsync is
@@ -93,7 +112,7 @@ def atomic_json_save(
             tmp.unlink(missing_ok=True)
         except OSError as cleanup_err:
             logger.warning(
-                "atomic_json_save: failed to clean up tmp %s : %s",
+                "atomic save: failed to clean up tmp %s : %s",
                 tmp, cleanup_err,
             )
         raise

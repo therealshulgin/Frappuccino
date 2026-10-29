@@ -581,3 +581,68 @@ sysctl -p /etc/sysctl.d/90-frappuccino-udp.conf
 ```bash
 docker restart frappuccino-quic-front && systemctl restart frappuccino-obfs-proxy
 ```
+
+## Journaux de diagnostic des versions de test (relais de TEST seulement)
+
+Les versions de test de l'app (nom de version en `-testN`) envoient leurs
+journaux et une description du téléphone (modèle, version d'Android, caméras,
+encodeurs) sur `POST /diag/v1/logs`, sans JWT ni rien qui vienne de l'identité.
+Les versions de production ne contiennent pas cet envoi. Côté relais, la route
+n'existe que si `DIAG_LOGS_DIR` est rempli dans `.env` ; vide ou absent, elle
+répond 404 comme n'importe quel chemin inconnu. **Ne l'activer que sur le relais
+de test.** Détail de la route (en-têtes, plafonds, rétention) :
+`app/routes/diag.py`.
+
+Les fichiers vont dans le volume `diag_logs`, monté sur `/diag`, distinct de
+`server_state` : `backup-state.sh` ne les copie pas. Plafonds : 1 Mio de gzip par
+requête (8 Mio une fois décompressé), 512 Mio en tout, 64 Mio par installation,
+chaque fichier compté en blocs de 4 Kio (sa place réelle sur le disque) ;
+au-delà, 507 et l'app réessaie plus tard. Le plafond de 512 Mio est commun : un
+client qui connaît la route peut le remplir seul, et tous les envois répondent
+alors 507 jusqu'à l'expiration de ses fichiers ou une purge (ci-dessous). Les
+fichiers de plus de 30 jours sont supprimés au démarrage du relais, puis toutes
+les heures.
+
+**Activer** (sur le relais de test, après avoir copié le code à jour comme à
+l'étape 4) :
+
+```bash
+cd /opt/frappuccino
+echo 'DIAG_LOGS_DIR=/diag' >> .env
+docker compose up -d --build server
+# nginx : le template a un bloc `location ^~ /diag/` (corps plafonné à 2m).
+# Re-rendre la conf comme à l'étape 3, puis `nginx -t && systemctl reload nginx`.
+```
+
+`/diag` est la seule valeur à utiliser : un dossier sous `/state` mettrait les
+journaux dans chaque sauvegarde.
+
+Sonde depuis ta machine, un POST nu :
+
+```bash
+curl -sk -o /dev/null -w '%{http_code}\n' -X POST "https://<IP>:8443/diag/v1/logs"
+# → 400 : route active (en-têtes absents).
+# → 404 : route désactivée.
+```
+
+**Lire** : un dossier par installation (identifiant aléatoire tiré par l'app),
+un fichier `<date UTC>-<8 hex>-<version>.log.gz` par envoi, stocké tel que reçu.
+
+```bash
+cd /opt/frappuccino
+docker compose exec server ls -lR /diag
+docker compose exec server sh -c 'zcat /diag/<installation>/*.log.gz' | less
+# Rapatrier une copie (à effacer de ta machine elle aussi en fin de test) :
+docker compose exec -T server tar -C /diag -czf - . > diag-logs.tgz
+```
+
+**Purger à la fin du test** : retirer la ligne `DIAG_LOGS_DIR` de `.env`, puis
+
+```bash
+cd /opt/frappuccino
+docker compose up -d server                          # la route disparaît (404)
+docker compose exec server find /diag -mindepth 1 -delete
+docker compose exec server ls -A /diag               # → rien
+```
+
+C'est un effacement ordinaire : les blocs du disque ne sont pas réécrits.

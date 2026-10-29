@@ -288,8 +288,10 @@ class StreamUploadManager private constructor(private val context: Context) {
                 Timber.w(e, "provenance seed setup failed at enrollment (non-fatal)")
             }
 
-            Timber.d("V2 enrollment complete. Fingerprint: %s",
-                kotlinIdentity.readableFingerprint())
+            // No fingerprint, nor anything else from the identity, in a log
+            // line: a test build sends its log to the relay, which holds the
+            // identity's public key and could match the two.
+            Timber.d("V2 enrollment complete")
 
             // Persist the proof BEFORE the network call so a
             // server-side failure during onboarding doesn't leave the
@@ -687,7 +689,7 @@ class StreamUploadManager private constructor(private val context: Context) {
             batch0PublicKeys = pending.batch0Pks,
             enrollmentSignature = pending.enrollmentSignature,
         )
-        Timber.i("retryServerEnrollment: attempting %s", identity.readableFingerprint())
+        Timber.i("retryServerEnrollment: attempting")
         return enrollOnServer(proof)
     }
 
@@ -917,7 +919,9 @@ class StreamUploadManager private constructor(private val context: Context) {
         }
         if (lastAccepted >= 0) {
             StreamPreferences.setPendingRotations(context, pending.drop(lastAccepted + 1))
-            Timber.i("Relay caught up to batch #%d", pending[lastAccepted].newBatchNumber)
+            // No batch number in the line: the relay stores each identity's
+            // batch, and a test build sends its log to the relay.
+            Timber.i("Relay caught up with the queued rotations")
         }
     }
 
@@ -1005,7 +1009,7 @@ class StreamUploadManager private constructor(private val context: Context) {
                     // device's batch and every older proof in the queue starts
                     // from a batch it has left.
                     StreamPreferences.clearPendingRotations(context)
-                    Timber.i("Auto-rotated to batch #%d", proof.newBatchNumber.toInt())
+                    Timber.i("Auto-rotated to the next batch")
                 } else {
                     // Kept pending on purpose. The relay answers a single opaque
                     // 401 for every rotation refusal (anti-oracle, R-SRV-1), so

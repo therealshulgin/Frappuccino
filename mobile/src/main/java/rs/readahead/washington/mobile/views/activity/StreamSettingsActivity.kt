@@ -1047,10 +1047,11 @@ class StreamSettingsActivity : AppCompatActivity() {
      *     archive session's keys;
      *  4. wipe keys, preferences, the queue key and the report state, then
      *     rename the queues and scratch directories out of reach, the internal
-     *     archive viewer's with them, and overwrite them all in one background
+     *     archive viewer's with them (and the diagnostics log of a
+     *     pre-release test build), and overwrite them all in one background
      *     pass, the plaintext of every part before any ciphertext
      *     ([StreamUploadManager.panicWipe], given
-     *     [rs.readahead.washington.mobile.archive.ArchiveLocalData.detachForPanic]);
+     *     [rs.readahead.washington.mobile.util.AppPanicDirs.detach]);
      *     that pass also removes the exports this installation made to
      *     Download/Frappuccino;
      *  5. cancel and prune the jobs once more.
@@ -1102,14 +1103,15 @@ class StreamSettingsActivity : AppCompatActivity() {
                         }
 
                         // 4. Keys, preferences, queue key, report state, and
-                        // the queues and scratch directories. The archive
-                        // viewer's directories are renamed in the same step,
-                        // right after the queues' and before any overwrite
-                        // starts, and erased in the same pass (panicWipe
-                        // catches a failure here and erases the rest).
+                        // the queues and scratch directories. The app's own
+                        // directories (the archive viewer's, and the
+                        // diagnostics log of a pre-release test build) are
+                        // renamed in the same step, right after the queues'
+                        // and before any overwrite starts, and erased in the
+                        // same pass (panicWipe catches a failure here and
+                        // erases the rest).
                         StreamUploadManager.getInstance(this).panicWipe {
-                            rs.readahead.washington.mobile.archive.ArchiveLocalData
-                                .detachForPanic(this)
+                            rs.readahead.washington.mobile.util.AppPanicDirs.detach(this)
                         }
                         // §10.6 — also drop the upload bearer on the Kotlin
                         // side. panicWipe() already zeroizes the Rust-held

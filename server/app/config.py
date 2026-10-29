@@ -118,3 +118,20 @@ OTS_CALENDAR_URLS = [
 # and the device retries, so we don't want a slow calendar tying up the single
 # worker on a thread.
 OTS_SUBMIT_TIMEOUT_S = float(os.getenv("OTS_SUBMIT_TIMEOUT_S", "10"))
+
+# Diagnostic logs of pre-release test builds (routes/diag.py). Off unless this
+# names a directory: with it unset or empty, main.py does not mount the route at
+# all and the path answers 404. Only a TEST relay sets it, and in the compose
+# deployment it must be /diag, the mount point of the dedicated `diag_logs`
+# volume: any directory inside the `server_state` volume would put the testers'
+# logs into every backup (deploy/backup-state.sh copies that whole volume).
+DIAG_LOGS_DIR = os.getenv("DIAG_LOGS_DIR", "").strip()
+
+# Ceilings on what the diagnostics directory may hold, in all and per install.
+# Beyond either one an upload is refused with 507, which the app retries later.
+DIAG_MAX_TOTAL_BYTES = int(os.getenv("DIAG_MAX_TOTAL_BYTES", str(512 * 1024 * 1024)))
+DIAG_MAX_INSTALL_BYTES = int(os.getenv("DIAG_MAX_INSTALL_BYTES", str(64 * 1024 * 1024)))
+
+# Diagnostic files older than this are deleted, at startup and then at most once
+# an hour when an upload arrives.
+DIAG_RETENTION_DAYS = int(os.getenv("DIAG_RETENTION_DAYS", "30"))

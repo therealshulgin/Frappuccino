@@ -229,6 +229,62 @@ if (keystorePropsFile.exists()) {
     keystorePropsFile.withInputStream { keystoreProps.load(it) }
 }
 
+// === Diagnostics in pre-release test builds ===
+// A version name ending in -testN (2.12.0-test2) is a pre-release test build:
+// it sends its app log, its own logcat and a description of the phone to the
+// test relay, through the code under src/diagnostics/java. Any other version
+// name compiles src/diagnosticsOff/java instead, which holds the same facade
+// (rs.readahead.washington.mobile.diagnostics.Diagnostics) and no uploader, no
+// endpoint and no Timber tree. The choice is made here, on the version name,
+// so that a production version cannot ship the code by mistake: it is not in
+// the build at all, and CI checks the dex of a production-named build for the
+// endpoint path (.github/workflows/android.yml).
+//
+// -Pfrappuccino.versionName overrides the version name. It exists for those CI
+// controls, which build the same tree under a production name (9.9.9) and,
+// when the version is not a test one, under a test name; nothing else should
+// need it.
+def appVersionName = (findProperty('frappuccino.versionName') ?: '2.12.0-test2').toString()
+def preprodDiagnostics = appVersionName ==~ /.*-test\d+/
+
+// The log redactor (main source set, LogRedactor) drops any line holding
+// three consecutive words of the French BIP-39 list. The list lives once, in
+// crypto-rs/core/src/bip39_fr.txt, where the Rust core embeds it; this task
+// copies it into the APK's Java resources rather than keeping a second copy
+// in the tree that could drift from the first. A list that does not hold
+// 2048 words fails the build: a redactor checking against a short list would
+// let a recovery phrase through without any error.
+abstract class FrenchWordlistResource extends DefaultTask {
+    @InputFile
+    @PathSensitive(PathSensitivity.NONE)
+    abstract RegularFileProperty getWordlist()
+
+    @OutputDirectory
+    abstract DirectoryProperty getOutputDir()
+
+    @TaskAction
+    void copy() {
+        def words = wordlist.get().asFile.getText('UTF-8').readLines()*.trim().findAll { !it.isEmpty() }
+        if (words.size() != 2048) {
+            throw new GradleException(
+                "FrenchWordlistResource: ${wordlist.get().asFile} holds ${words.size()} words, " +
+                "expected the 2048 of the French BIP-39 list.")
+        }
+        def out = outputDir.file('rs/readahead/washington/mobile/diagnostics/bip39_fr.txt').get().asFile
+        out.parentFile.mkdirs()
+        out.setText(words.join('\n') + '\n', 'UTF-8')
+    }
+}
+def frenchWordlist = tasks.register('frenchWordlistResource', FrenchWordlistResource) {
+    wordlist = file("$rootDir/crypto-rs/core/src/bip39_fr.txt")
+    outputDir = layout.buildDirectory.dir('generated/frenchWordlist')
+}
+androidComponents {
+    onVariants(selector().all()) { variant ->
+        variant.sources.resources?.addGeneratedSourceDirectory(frenchWordlist, { it.outputDir })
+    }
+}
+
 android {
     compileSdk versions.compileSdk
 
@@ -241,9 +297,13 @@ android {
         minSdkVersion versions.minSdk
         compileSdkVersion versions.compileSdk
         targetSdkVersion versions.targetSdk
-        versionCode 187
-        versionName "2.12.0-test1"
+        versionCode 188
+        versionName appVersionName
         buildConfigField "String", "GIT_HASH", "\"${gitHashShort}\""
+        // True in a pre-release test build only (see the diagnostics block
+        // above android {}); the source set switch below follows the same
+        // value.
+        buildConfigField "boolean", "PREPROD_DIAGNOSTICS", "${preprodDiagnostics}"
         multiDexEnabled true
         // Modern test runner required by AndroidJUnit4. Without it, Gradle falls back
         // to the deprecated android.test.InstrumentationTestRunner (API 24 obsolete).
@@ -428,6 +488,15 @@ android {
         // are byte-checked only when already present, so an arm64-only build
         // packages no x86_64 .so and the test fails on an x86_64 emulator.
         androidTest.java.srcDirs += 'src/androidTestRust/java'
+
+        // Exactly one of the two diagnostics source sets is compiled (see the
+        // diagnostics block above android {}). Their tests follow the
+        // same switch: they exercise code a production build does not have.
+        main.java.srcDirs += preprodDiagnostics ? 'src/diagnostics/java' : 'src/diagnosticsOff/java'
+        if (preprodDiagnostics) {
+            test.java.srcDirs += 'src/testDiagnostics/java'
+            androidTest.java.srcDirs += 'src/androidTestDiagnostics/java'
+        }
     }
 }
 

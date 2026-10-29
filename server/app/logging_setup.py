@@ -9,6 +9,8 @@ donc désarmer la configuration livrée. C'est le travail de `setup_logging` :
 `uvicorn` et `uvicorn.error` sont re-routés vers notre formatter, et
 `uvicorn.access` est intégralement désactivé (handlers vidés, propagate=False,
 disabled=True). Il n'y a plus d'access log applicatif du tout, scrubé ou non.
+Même traitement pour `slowapi`, qui écrit l'IP du client à chaque 429 : c'est la
+clé de ses compteurs (app/ratelimit.py).
 
 Le format structuré, lui, est là pour rester lisible par un outil SIEM
 (filebeat, vector, logstash) : du texte humain va très bien en debug local, plus
@@ -132,6 +134,16 @@ def setup_logging(level: str = "INFO") -> None:
     logging.getLogger("uvicorn.access").handlers = []
     logging.getLogger("uvicorn.access").propagate = False
     logging.getLogger("uvicorn.access").disabled = True
+
+    # slowapi logs every refused request at WARNING with the key of its
+    # counter, and that key is the client IP (app/ratelimit.py keys by
+    # get_remote_address): "ratelimit 12 per 1 minute (<client IP>) exceeded
+    # at endpoint: ...". It reaches the root formatter with the IP inside
+    # `msg`, which no extra-field blocklist can see. Silenced whole, like
+    # uvicorn.access: the client still gets its 429, only the line goes.
+    logging.getLogger("slowapi").handlers = []
+    logging.getLogger("slowapi").propagate = False
+    logging.getLogger("slowapi").disabled = True
 
     # These four lines look redundant with the global exception handler in
     # main.py. They are not: that handler only covers its own line, never

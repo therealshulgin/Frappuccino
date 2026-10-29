@@ -126,8 +126,14 @@ services:
       # /project/default renvoie 500 → client crash sur JSONObject("")
       # dans StreamRecordingService.initServerSession:1114.
       REPORTS_DB_PATH: /state/reports.json
+      # Diagnostic logs of pre-release test builds (app/routes/diag.py). Empty
+      # unless the operator sets it in .env, and empty means the route does not
+      # exist. Only a TEST relay sets it, to /diag: the `diag_logs` volume below,
+      # kept out of `server_state` so that backup-state.sh never copies the logs.
+      DIAG_LOGS_DIR: ${DIAG_LOGS_DIR:-}
     volumes:
       - server_state:/state
+      - diag_logs:/diag
     # Must match the `stream` user created in the Dockerfile (Phase 6.1.7 — UID 1001).
     # Phase 3.37-redeploy (2026-05-14) — was 1000:1000 historically, but since
     # commit f525bb6 the Dockerfile pins UID 1001 with `chmod -R u=rX,g=,o= /app`,
@@ -172,3 +178,4 @@ services:
 volumes:
   minio_data:
   server_state:  # V2 : persistance ratchet + identités autorisées
+  diag_logs:  # journaux de diagnostic des versions de test, hors sauvegardes

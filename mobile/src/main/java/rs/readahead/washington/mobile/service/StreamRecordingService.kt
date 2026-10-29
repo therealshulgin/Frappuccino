@@ -68,6 +68,12 @@ class StreamRecordingService : Service(), LifecycleOwner {
         const val DEFAULT_CHUNK_INTERVAL_MS = 5000L
         const val DEFAULT_SERVER_URL = "https://relay.shake-document-protect.org:8443"
 
+        // The CONTROL_AE_TARGET_FPS_RANGE requested on the Preview
+        // (buildHevcPreview), named so that the field log of what the camera
+        // advertises compares against the value actually requested.
+        private const val AE_TARGET_FPS_MIN = 24
+        private const val AE_TARGET_FPS_MAX = 30
+
         // Device-side low-storage thresholds (free bytes on
         // the internal /data partition, checked on the 1 Hz notification tick).
         // Below WARN we surface a heads-up in the notification; below CRITICAL
@@ -1265,6 +1271,9 @@ class StreamRecordingService : Service(), LifecycleOwner {
                     // change swaps the encoder in place, with no camera rebind,
                     // so nothing resets it to 1.0× (H2-B §Bugs #5).
                     applyHevcCameraConfig(camera)
+                    // Logging only: what the camera does after the bind, and
+                    // whether the AE range we ask for is one it offers.
+                    logCameraStateAndAeRanges(camera)
                 }
 
                 // Promote the refs so applyQuality() has a
@@ -1788,9 +1797,69 @@ class StreamRecordingService : Service(), LifecycleOwner {
             .setSessionCaptureCallback(aeFpsCaptureCallback)
             .setCaptureRequestOption(
                 android.hardware.camera2.CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                android.util.Range(24, 30)
+                android.util.Range(AE_TARGET_FPS_MIN, AE_TARGET_FPS_MAX)
             )
         return builder.build()
+    }
+
+    /**
+     * Field diagnostics for a camera that fails after the bind, logged under
+     * StreamMetrics: each transition of CameraX's camera state with its error
+     * (code, name, and whether CameraX classes it as critical), and the AE
+     * target range [buildHevcPreview] requests next to the ranges this camera
+     * advertises. A requested range absent from the advertised list is left
+     * to the camera HAL to handle, and HALs differ in how they do. Logging
+     * only: nothing here changes what the camera is asked to do.
+     *
+     * The observer is bound to this service's lifecycle, which the teardown
+     * moves to DESTROYED, so it does not outlive the session.
+     */
+    @androidx.annotation.OptIn(androidx.camera.camera2.interop.ExperimentalCamera2Interop::class)
+    private fun logCameraStateAndAeRanges(camera: androidx.camera.core.Camera) {
+        try {
+            camera.cameraInfo.cameraState.observe(this, ::logCameraState)
+        } catch (e: Exception) {
+            Timber.w(e, "camera state observer not installed")
+        }
+        try {
+            val advertised = androidx.camera.camera2.interop.Camera2CameraInfo.from(camera.cameraInfo)
+                .getCameraCharacteristic(
+                    android.hardware.camera2.CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES
+                )
+            val offered = advertised?.any { it.lower == AE_TARGET_FPS_MIN && it.upper == AE_TARGET_FPS_MAX }
+            Timber.tag("StreamMetrics").i(
+                "aeFpsRanges requested=[%d,%d] advertised=%s requestedAdvertised=%s",
+                AE_TARGET_FPS_MIN, AE_TARGET_FPS_MAX,
+                advertised?.joinToString(",") { "[${it.lower},${it.upper}]" } ?: "?",
+                offered?.toString() ?: "?"
+            )
+        } catch (e: Exception) {
+            Timber.w(e, "AE range comparison failed")
+        }
+    }
+
+    private fun logCameraState(state: androidx.camera.core.CameraState) {
+        val error = state.error
+        if (error == null) {
+            Timber.tag("StreamMetrics").i("cameraState type=%s", state.type)
+        } else {
+            Timber.tag("StreamMetrics").w(
+                "cameraState type=%s error=%d(%s) critical=%b",
+                state.type, error.code, cameraStateErrorName(error.code),
+                error.type == androidx.camera.core.CameraState.ErrorType.CRITICAL
+            )
+        }
+    }
+
+    private fun cameraStateErrorName(code: Int): String = when (code) {
+        androidx.camera.core.CameraState.ERROR_STREAM_CONFIG -> "STREAM_CONFIG"
+        androidx.camera.core.CameraState.ERROR_CAMERA_IN_USE -> "CAMERA_IN_USE"
+        androidx.camera.core.CameraState.ERROR_MAX_CAMERAS_IN_USE -> "MAX_CAMERAS_IN_USE"
+        androidx.camera.core.CameraState.ERROR_OTHER_RECOVERABLE_ERROR -> "OTHER_RECOVERABLE_ERROR"
+        androidx.camera.core.CameraState.ERROR_CAMERA_DISABLED -> "CAMERA_DISABLED"
+        androidx.camera.core.CameraState.ERROR_CAMERA_FATAL_ERROR -> "CAMERA_FATAL_ERROR"
+        androidx.camera.core.CameraState.ERROR_DO_NOT_DISTURB_MODE_ENABLED -> "DO_NOT_DISTURB_MODE_ENABLED"
+        else -> "UNKNOWN"
     }
 
     /**
@@ -2478,8 +2547,10 @@ class StreamRecordingService : Service(), LifecycleOwner {
             // §10.6 — the fresh bearer is now in the Rust holder (stashed by
             // verify()); we only bump the issuance clock here.
             authTokenIssuedAtMs = System.currentTimeMillis()
-            Timber.i("[Phase 2.4.3] JWT refresh OK (batch=%d remaining=%d)",
-                manager.currentBatchNumber(), manager.remainingKeysInBatch())
+            // No batch number or slot count in the line: the relay stores
+            // each identity's batch and used slots, and a test build sends
+            // its log to the relay.
+            Timber.i("[Phase 2.4.3] JWT refresh OK")
         } catch (e: Exception) {
             Timber.e(e, "[Phase 2.4.3] JWT refresh threw")
         }
@@ -2574,8 +2645,11 @@ class StreamRecordingService : Service(), LifecycleOwner {
             // ProvenanceTimestampWorker, for the .ots submission. Nothing is
             // persisted by WorkManager (Audit R-01) and the JWT is never a
             // long-lived JVM String.
-            Timber.i("V2 auth OK — batch=%d remaining=%d",
-                manager.currentBatchNumber(), manager.remainingKeysInBatch())
+            //
+            // No batch number or slot count in the line: the relay stores
+            // each identity's batch and used slots, and a test build sends
+            // its log to the relay.
+            Timber.i("V2 auth OK")
 
             // Do not add a report-creation call here: its absence is
             // deliberate. The report was opened locally at session start (Rust
@@ -2895,6 +2969,14 @@ class StreamRecordingService : Service(), LifecycleOwner {
         if (ownsSession) isShuttingDown = false
         synchronized(lifecycleLock) { teardownFinished = true }
         releaseClaimIfDone()
+        // A pre-release test build requests an upload of its log now (it
+        // leaves once a network is there), including the lines of a recording
+        // that failed to start; a production build does nothing here.
+        try {
+            rs.readahead.washington.mobile.diagnostics.Diagnostics.onRecordingFinished(this)
+        } catch (e: Exception) {
+            Timber.w(e, "diagnostics upload request failed")
+        }
         stopSelf()
     }
 

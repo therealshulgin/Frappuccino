@@ -37,6 +37,13 @@ RUN chown -R stream:stream /app && chmod -R u=rX,g=,o= /app
 # where the volume is already chown'd correctly.
 RUN install -d -m 0750 -o stream -g stream /state
 
+# Same reason for /diag, the mount point of the `diag_logs` volume that holds
+# the diagnostic logs of test builds (app/routes/diag.py): a new, empty volume
+# takes this ownership and mode when it is first mounted. 0700 because the relay
+# keeps those files private to its own user, and refuses to write them into a
+# directory it cannot make 0700.
+RUN install -d -m 0700 -o stream -g stream /diag
+
 USER stream
 
 # Phase 6.1.3 — `--workers 1` EXPLICITE.
