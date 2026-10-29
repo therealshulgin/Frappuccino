@@ -52,6 +52,7 @@ on:
       - 'gradle/**'
       - 'gradlew'
       - 'scripts/check-diag-dex.sh'
+      - 'scripts/annotate-test-failures.py'
       - '.github/workflows/android.yml'
   pull_request:
     paths:
@@ -65,6 +66,7 @@ on:
       - 'gradle/**'
       - 'gradlew'
       - 'scripts/check-diag-dex.sh'
+      - 'scripts/annotate-test-failures.py'
       - '.github/workflows/android.yml'
   workflow_dispatch:
 
@@ -399,6 +401,12 @@ jobs:
           target: google_apis
           disable-animations: true
           script: ./gradlew :mobile:connectedDebugAndroidTest
+
+      # The job log is readable only by a signed-in viewer: each failing test
+      # is also written as an annotation, shown on the run's summary page.
+      - name: Name the failing instrumented tests
+        if: failure()
+        run: python3 scripts/annotate-test-failures.py mobile/build/outputs/androidTest-results/connected
 
       - uses: actions/upload-artifact@v4
         if: always()

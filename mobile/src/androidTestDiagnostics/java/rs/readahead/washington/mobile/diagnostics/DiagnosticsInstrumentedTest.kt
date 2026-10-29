@@ -56,7 +56,14 @@ class DiagnosticsInstrumentedTest {
     fun the_logcat_capture_has_the_app_s_own_lines_redacted() {
         val marker = "diagtest-" + UUID.randomUUID().toString().take(8)
         Log.i("DiagTest", "$marker session 0123456789abcdef0123456789abcdef")
-        val capture = LogcatCapture.capture()
+        // logd stores the line asynchronously, and a loaded emulator can take
+        // a while: capture again until it is there. The app itself captures
+        // at upload time, long after its lines were logged.
+        var capture = ""
+        waitFor("the marker to reach logcat", timeoutMs = 20_000) {
+            capture = LogcatCapture.capture()
+            capture.lines().any { it.contains(marker) }
+        }
         val line = capture.lines().firstOrNull { it.contains(marker) }
         assertNotNull("marker not in the capture", line)
         assertTrue(line, line!!.contains("session <hex>"))
@@ -129,8 +136,8 @@ class DiagnosticsInstrumentedTest {
     private fun stored(dir: File): String =
         (dir.listFiles() ?: emptyArray()).sortedBy { it.name }.joinToString("") { it.readText() }
 
-    private fun waitFor(what: String, condition: () -> Boolean) {
-        val deadline = System.currentTimeMillis() + 5_000
+    private fun waitFor(what: String, timeoutMs: Long = 5_000, condition: () -> Boolean) {
+        val deadline = System.currentTimeMillis() + timeoutMs
         while (!condition()) {
             if (System.currentTimeMillis() > deadline) throw AssertionError("timed out waiting for $what")
             Thread.sleep(50)

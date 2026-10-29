@@ -220,7 +220,8 @@ def test_an_existing_directory_is_made_0700(relay):
     # The volume root exists before the first upload; mkdir's mode does not
     # apply to it.
     relay.root.mkdir()
-    os.chmod(relay.root, 0o755)
+    # Too open on purpose: the test checks that the relay narrows it.
+    os.chmod(relay.root, 0o755)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
     assert _post(relay.client, _gz(TEXT)).status_code == 204
     assert relay.root.stat().st_mode & 0o777 == 0o700
 
