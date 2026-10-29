@@ -672,12 +672,6 @@
             column="13"/>
     </issue>
 
-    <issue
-        id="ObsoleteSdkInt"
-        message="This folder configuration (`v21`) is unnecessary; `minSdkVersion` is 21. Merge all the resources in this folder into `layout`.">
-        <location
-            file="src/main/res/layout-v21"/>
-    </issue>
 
     <issue
         id="ObsoleteSdkInt"

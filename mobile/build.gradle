@@ -356,7 +356,7 @@ android {
     // lint-baseline.xml was made from exactly those and nothing else, so the
     // task fails on a NEW error and passes on the old ones (a new warning is
     // reported, not fatal). It now holds exactly what lintDebug still finds, 24
-    // errors and 158 warnings. An entry that matches nothing any more is
+    // errors and 157 warnings. An entry that matches nothing any more is
     // reported by lint as LintBaselineFixed and is to be removed by hand, and
     // CI fails until it is: lint matches an entry by issue, message and file,
     // not by line, so a stale entry would silently absorb the same issue if it
