@@ -33,10 +33,11 @@ import kotlin.coroutines.cancellation.CancellationException
  * secure-deleted once copied and in every outcome, the private chunk after
  * each object. Anything else stops the export and is rethrown, for the
  * caller to remove the folder: a write to the destination or to the private
- * video, a copy shorter than its private file, a cancellation, any error
- * that does not say the object itself does not decrypt. Cancellation is
- * checked again after every chunk and every copy, so one seen while a file
- * was being written still removes the folder.
+ * video, a video its media cannot finish, a copy shorter than its private
+ * file, a cancellation, any error that does not say the object itself does
+ * not decrypt. Cancellation is checked again after every chunk and every
+ * copy, so one seen while a file was being written still removes the
+ * folder.
  *
  * The timestamp proof and its salt are written last, in the raw chunks'
  * subfolder, and left out once a chunk is excluded, as in [ExportRun]: they
@@ -79,8 +80,9 @@ internal class JoinedExportRun<D, V>(
          *  shifted by [offsetUs]. */
         fun append(video: V, chunk: File, offsetUs: Long)
 
-        /** Finish [video] so its file is complete, and release it; it is
-         *  released even when finishing throws. */
+        /** Finish [video] so its file is complete and ready to be copied
+         *  out, and release it; it is released even when finishing throws.
+         *  A file that cannot be made ready throws here, before any copy. */
         fun finish(video: V)
 
         /** Release [video] after a failure; never throws. */

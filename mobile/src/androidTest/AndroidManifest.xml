@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Components of the test APK only; nothing here goes into the app.
+
+  ProcessTextFixtureActivity stands for another app that offers to process
+  selected text, as a translator does: SecretEditTextInstrumentedTest checks
+  that a secret field never starts it, after checking that a plain field of
+  the same window does. The launch is intercepted by the test before it
+  happens; the activity is never shown.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application>
+        <activity
+            android:name="rs.readahead.washington.mobile.views.ProcessTextFixtureActivity"
+            android:exported="true"
+            android:label="Process text fixture"
+            android:theme="@android:style/Theme.NoDisplay">
+            <intent-filter>
+                <action android:name="android.intent.action.PROCESS_TEXT" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

@@ -227,12 +227,27 @@ jobs:
       - name: Compile the instrumented tests
         run: ./gradlew :mobile:assembleDebugAndroidTest
 
-      # mobile/lint-baseline.xml holds the 32 errors and 201 warnings that were
-      # already in the tree when lint first ran, so this task fails on a NEW
-      # finding only. See the lint block in mobile/build.gradle for what that
+      # mobile/lint-baseline.xml was made from the 32 errors and 201 warnings
+      # already in the tree when lint first ran; it now holds exactly the 24
+      # errors and 158 warnings lintDebug still finds. This task fails on a NEW
+      # error only. See the lint block in mobile/build.gradle for what that
       # trade does and does not buy.
       - name: Android lint
         run: ./gradlew :mobile:lintDebug
+
+      # A baseline entry that no longer matches would silently absorb the same
+      # issue if it came back in that file, so lint reporting one fails the job.
+      - name: No stale lint baseline entry
+        run: |
+          set -euo pipefail
+          r=mobile/build/reports/lint-results-debug.txt
+          test -f "$r" || { echo "$r is missing: the lint step above wrote no text report"; exit 1; }
+          if grep -q LintBaselineFixed "$r"; then
+            grep LintBaselineFixed "$r"
+            echo "FAIL: remove the entries lint lists as fixed from mobile/lint-baseline.xml"
+            exit 1
+          fi
+          echo "ok: every baseline entry still matches an issue"
 
       - name: Negative control -- lint must fail without its baseline
         run: |

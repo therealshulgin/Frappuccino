@@ -4,7 +4,6 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.View
-import android.view.WindowManager
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import rs.readahead.washington.mobile.views.pin.NoImeEditText
@@ -14,6 +13,7 @@ import org.stream.crypto.upload.StreamUploadManager
 import uniffi.frappuccino.FfiException
 import rs.readahead.washington.mobile.R
 import timber.log.Timber
+import rs.readahead.washington.mobile.views.base_ui.refuseScreenCapture
 
 /**
  * PinUnlockActivity — Écran de déverrouillage du ratchet V2.
@@ -56,8 +56,9 @@ class PinUnlockActivity : AppCompatActivity(), PinLockListener {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // FLAG_SECURE : empêche les screenshots et apparition dans overview
-        window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
+        // FLAG_SECURE (captures, aperçu des récents) et Content Capture coupé,
+        // avant setContentView : cf. refuseScreenCapture.
+        refuseScreenCapture()
         setContentView(R.layout.activity_pin_unlock)
 
         pinEditText = findViewById(R.id.unlockDots)

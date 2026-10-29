@@ -38,13 +38,6 @@
 
   <!-- i18n FR -->
 
-  <!-- Onboarding : code d'invitation -->
-  <string name="onboard_invite_code_title">Code d\'invitation</string>
-  <string name="onboard_invite_code_explanation">Entrez le code d\'invitation fourni par votre organisation pour vous connecter au serveur.</string>
-  <string name="onboard_invite_code_hint">Code d\'invitation</string>
-  <string name="onboard_invite_code_validate">Valider</string>
-  <string name="onboard_invite_code_skip">Passer</string>
-
   <!-- Onboarding : génération mnémonique -->
   <string name="onboard_mnemonic_generate_title">Votre phrase secrète</string>
   <string name="onboard_mnemonic_generate_explanation">Notez ces 12 mots dans l\'ordre exact. C\'est votre seule clé de chiffrement. Personne d\'autre ne peut la récupérer.</string>
@@ -54,7 +47,7 @@
   <!-- Onboarding : confirmation mnémonique -->
   <string name="onboard_mnemonic_confirm_title">Confirmez votre phrase</string>
   <string name="onboard_mnemonic_confirm_explanation">Entrez les mots demandés pour vérifier que vous avez bien noté votre phrase.</string>
-  <string name="onboard_mnemonic_confirm_hint">Entrez le mot</string>
+  <string name="onboard_mnemonic_confirm_hint">Entrez le mot (accents facultatifs)</string>
   <string name="onboard_mnemonic_confirm_button">Confirmer</string>
 
   <!-- Bouton retour générique -->
@@ -64,7 +57,7 @@
   <string name="archive_title">MODE ARCHIVE</string>
   <string name="archive_prompt">SAISISSEZ VOTRE PHRASE BIP-39\nPOUR DÉCHIFFRER VOS STREAMS</string>
   <string name="archive_warning">⚠ LA PHRASE NE QUITTE PAS CET ÉCRAN. NE LA PARTAGEZ JAMAIS.\nLes vidéos récupérées restent chiffrées dans l\'app et ne sont déchiffrées que pendant que vous les regardez. Elles sont effacées à la fermeture de cet écran et par l\'effacement d\'urgence. Un export sort de la protection de l\'app.</string>
-  <string name="archive_input_hint">12 mots séparés par des espaces</string>
+  <string name="archive_input_hint">12 mots séparés par des espaces, accents facultatifs</string>
   <string name="archive_unlock">DÉVERROUILLER</string>
   <string name="archive_close">← Fermer : annule le téléchargement et efface les copies récupérées</string>
   <string name="archive_retrieve_btn">RÉCUPÉRER MES STREAMS</string>

@@ -55,9 +55,10 @@ l'APK. Elle doit être identique à celle du fichier que vous avez téléchargé
 3. **Regarder** : les vidéos se lisent dans l'app. Rien n'est écrit dans la galerie, et tout
    est effacé à la fermeture du mode archive.
 4. **Exporter** (geste volontaire) : chaque enregistrement devient une vidéo, recollée sans
-   perte de qualité. Il peut y en avoir plusieurs pour un même enregistrement, si le téléphone
-   a changé de format vidéo en cours de route ou s'il manque un morceau : une vidéo exportée
-   ne cache jamais un trou. Option : les morceaux d'origine, pour servir de preuve. Les
+   perte de qualité. Il peut y en avoir plusieurs pour un même enregistrement : l'app adapte la
+   qualité de l'image au réseau pendant qu'elle filme, et chaque changement de qualité commence
+   une nouvelle vidéo ; de même s'il manque un morceau, car une vidéo exportée ne cache jamais
+   un trou. Option : les morceaux d'origine, pour servir de preuve. Les
    fichiers exportés sortent de la protection de l'app : rangez-les sur un support chiffré.
 
 ## 5. Nous faire un retour
@@ -120,8 +121,9 @@ must match the file you downloaded.
 3. **Watch**: videos play inside the app. Nothing is written to the gallery, and everything is
    erased when archive mode closes.
 4. **Export** (a deliberate step): each recording becomes one video, joined without any loss
-   of quality. A recording can give several videos if the phone switched video format midway
-   or if a piece is missing: an exported video never hides a gap. Option: the original pieces,
+   of quality. A recording can give several videos: the app adapts the image quality to the
+   network while it films, and each change of quality starts a new video; the same happens if
+   a piece is missing, because an exported video never hides a gap. Option: the original pieces,
    as evidence. Exported files leave the app's protection: keep them on encrypted storage.
 
 ## 5. Give us feedback

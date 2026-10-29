@@ -64,6 +64,7 @@ class JoinedExportRunTest {
         val refusedTargets: Set<String> = emptySet(),
         val shortTargets: Set<String> = emptySet(),
         val failAppend: Boolean = false,
+        val failFinish: Boolean = false,
     ) {
         val secureDeleted = ArrayList<File>()
         val videos = ArrayList<FakeVideo>()
@@ -84,6 +85,7 @@ class JoinedExportRunTest {
 
             override fun finish(video: FakeVideo) {
                 video.finished = true
+                if (failFinish) throw IOException("video not cleared")
             }
 
             override fun abandon(video: FakeVideo) {
@@ -385,6 +387,24 @@ class JoinedExportRunTest {
         } catch (_: IllegalStateException) {
         }
         assertTrue(fakes.videos.single().abandoned)
+        noPrivatePlaintextLeft()
+    }
+
+    /** The joined video's metadata scrub refusing the file, for one: the
+     *  video never reaches the destination. */
+    @Test
+    fun `a video its media cannot finish fails the export before any copy`() {
+        layout()
+        val sources = sources("000001.strm", "000002.strm")
+        val fakes = Fakes(probes = sources.keys.associateWith { probe(avc) }, failFinish = true)
+
+        try {
+            fakes.run(plan(sources), sources)
+            fail("a video that cannot be finished must fail the export")
+        } catch (_: IOException) {
+        }
+        assertEquals(emptySet<String>(), exported())
+        assertTrue(fakes.videos.single().finished)
         noPrivatePlaintextLeft()
     }
 

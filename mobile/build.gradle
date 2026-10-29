@@ -353,20 +353,26 @@ android {
     // anywhere before that, and the first clean run reported 32 errors and 201
     // warnings, every one of them pre-existing.
     //
-    // lint-baseline.xml records exactly those and nothing else, so the task
-    // fails on a NEW finding and passes on the old ones. That is a deliberate
-    // trade and it is worth being precise about what it does and does not mean:
+    // lint-baseline.xml was made from exactly those and nothing else, so the
+    // task fails on a NEW error and passes on the old ones (a new warning is
+    // reported, not fatal). It now holds exactly what lintDebug still finds, 24
+    // errors and 158 warnings. An entry that matches nothing any more is
+    // reported by lint as LintBaselineFixed and is to be removed by hand, and
+    // CI fails until it is: lint matches an entry by issue, message and file,
+    // not by line, so a stale entry would silently absorb the same issue if it
+    // came back in that file. That is a deliberate trade and it is worth being
+    // precise about what it does and does not mean:
     //
-    //   - It is a ledger, not a fix. Every entry is a real finding still in the
-    //     tree; the file names each one with its file and line, so the debt is
-    //     readable rather than hidden behind a disabled check.
+    //   - It is a ledger, not a fix. Every entry lint still matches is a real
+    //     finding in the tree; the file names each one with its file and line,
+    //     so the debt is readable rather than hidden behind a disabled check.
     //   - The alternative, abortOnError=false, is worse than no lint at all: a
     //     check that cannot fail reads as coverage while proving nothing.
     //   - Deleting the file and regenerating it silently absorbs whatever broke
     //     in between. Regenerate deliberately, and read the diff.
     //
-    // The 28 NewApi entries are not cosmetic: minSdkVersion is 21 and the code
-    // calls API 23/24/26/28 methods unguarded (ConnectivityManager.activeNetwork,
+    // The NewApi entries (20, all still matched) are not cosmetic: minSdkVersion is
+    // 21 and the code calls API 23/24/26/28 methods unguarded (ConnectivityManager.activeNetwork,
     // PowerManager.isIgnoringBatteryOptimizations, registerReceiver with
     // RECEIVER_NOT_EXPORTED, Context.getSystemService(Class)). On an API 21 or 22
     // handset those throw NoSuchMethodError, which is an Error and therefore not
@@ -526,6 +532,57 @@ dependencies {
 
 kapt {
     correctErrorTypes true
+}
+
+// SecretInputLayoutTest and SecureScreensTest (unit tests) read the resources,
+// the hand-written sources and the manifests of every module merged into the
+// APK: this one and the projects it depends on, through api or implementation,
+// transitively. The directories come from each module's Android source sets
+// (all but the test ones), so a new source set or a src/main/kotlin is scanned
+// without editing this list; sources generated under a build directory are not.
+// Gradle cannot know that a test reads files, so they are declared as inputs of
+// the test tasks: an edit to a layout alone then reruns the tests instead of
+// leaving the task up to date. The tests take the paths from these system
+// properties and fail without them. Read once every project is evaluated, since
+// the other modules are configured after this one.
+gradle.projectsEvaluated {
+    def apkProjects = new LinkedHashSet<Project>()
+    def visit
+    visit = { Project p ->
+        if (!apkProjects.add(p)) return
+        ['api', 'implementation'].each { name ->
+            p.configurations.findByName(name)?.dependencies?.withType(ProjectDependency)?.each {
+                visit(it.dependencyProject)
+            }
+        }
+    }
+    visit(project)
+    def shipped = { Project p ->
+        p.android.sourceSets.findAll { !it.name.startsWith('test') && !it.name.startsWith('androidTest') }
+    }
+    def handWritten = { Project p, Collection<File> dirs ->
+        def build = p.layout.buildDirectory.get().asFile.toPath()
+        dirs.findAll { it.isDirectory() && !it.toPath().startsWith(build) }
+    }
+    def resDirs = apkProjects.collectMany { p -> handWritten(p, shipped(p).collectMany { it.res.srcDirs }) }.unique()
+    def srcDirs = apkProjects.collectMany { p ->
+        handWritten(p, shipped(p).collectMany { it.java.srcDirs + it.kotlin.srcDirs })
+    }.unique()
+    def manifests = apkProjects.collectMany { p -> shipped(p).collect { it.manifest.srcFile }.findAll { it.isFile() } }.unique()
+    tasks.withType(Test).configureEach {
+        inputs.files(resDirs)
+            .withPropertyName('secretInputResDirs')
+            .withPathSensitivity(PathSensitivity.RELATIVE)
+        inputs.files(srcDirs)
+            .withPropertyName('secretInputSrcDirs')
+            .withPathSensitivity(PathSensitivity.RELATIVE)
+        inputs.files(manifests)
+            .withPropertyName('secretInputManifests')
+            .withPathSensitivity(PathSensitivity.RELATIVE)
+        systemProperty 'secretInput.resDirs', resDirs.collect { it.absolutePath }.join(File.pathSeparator)
+        systemProperty 'secretInput.srcDirs', srcDirs.collect { it.absolutePath }.join(File.pathSeparator)
+        systemProperty 'secretInput.manifests', manifests.collect { it.absolutePath }.join(File.pathSeparator)
+    }
 }
 
 import com.android.tools.profgen.ArtProfileKt

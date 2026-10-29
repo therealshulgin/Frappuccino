@@ -185,6 +185,55 @@ metadata turns every object of a never-closed report into an unverifiable one
 
 ---
 
+## Secret entry and display (recovery phrase)
+
+The recovery phrase is shown once (enrollment), typed back in part (confirmation) and typed
+in full to open the archive. Every field that takes it is a `SecretEditText`, which applies
+its protections itself at construction and on every later setter: no suggestions and the
+visible-password variation, no personalized learning, no extract or full-screen keyboard UI,
+not in the saved instance state, excluded from autofill and Content Capture, no text
+classifier, `accessibilityDataSensitive` on API 34+, copy, cut, share, undo and redo
+refused, a drag of the selected text cancelled as soon as it starts. Accessibility services
+are neither offered nor allowed the copy, cut and share actions, nor the actions that hand
+the selected text to another app: the text-processing actions of other apps (`PROCESS_TEXT`,
+"Translate" and the like, which would start that app with the words in an Intent) and the
+text classifier's "smart" actions. The actions a screen reader needs to read and edit the
+field are kept. The secret layouts also turn the undo history off (`allowUndo="false"`). `SecretInputLayoutTest` resolves every layout tag of the
+modules merged into the APK to its class and refuses any other editable field, and its source
+and bytecode scans refuse any text field built in code. It lets through, each with its
+reason, only the PIN dots of the two PIN screens (`NoImeEditText`, filled by the in-app
+keypad and kept out of the saved state) and two inherited `shared-ui` sheets that nothing
+shows. The screens that show or take a secret set `FLAG_SECURE` and turn Content Capture off
+in `onCreate`, before their content (`SecureScreensTest` holds every activity of the manifest
+to that); a `SecretEditText` attached to a window without `FLAG_SECURE` sets it as a
+fallback. The archive screen empties the phrase field when it goes to the background. What
+remains:
+
+| ID | Residual | Why bounded / why accepted | Status |
+|----|----------|----------------------------|--------|
+| **S1** | **The system keyboard receives every keystroke.** The keyboard is a separate app: it gets each key and can read the field's whole text through its input connection. `textNoSuggestions`, `textVisiblePassword` and `flagNoPersonalizedLearning` are requests; a keyboard may ignore them, and a malicious or compromised keyboard is not stopped by them. | The app always sends the flags; what a given keyboard does with them is outside its control. The structural fix is an in-app keypad for the phrase, as the PIN screens already have (`PinLockView`); it is **not done**: entering words from a 2048-word list needs an in-app keyboard with word completion, a UI project of its own. | Accepted; in-app phrase keypad not done. |
+| **S2** | **Accessibility services.** `accessibilityDataSensitive` (on the phrase fields and on the grid that displays the twelve words) exists only from API 34; below it, any enabled accessibility service can read the words on screen and in the fields. On API 34+ a service that declares itself an accessibility tool (`isAccessibilityTool`) is still let through, by design of the platform. What is accepted is the service **reading** the words; a service cannot, through the field, have them handed to another app (the actions that would do so are refused, see above). That refusal goes by TextView's own action ids, private values read in the platform sources: a build that numbered them otherwise would offer those actions again. The instrumented test checks the share and `PROCESS_TEXT` ids on the device it runs on, not the "smart" ones, which the field's no-op classifier never produces there. | An accessibility service is normally enabled by the user in the system settings, behind a warning. The app cannot tell a legitimate screen reader from a hostile service that claims the same status; refusing all of them would lock out the witnesses who depend on one. | Accepted. |
+| **S3** | **The phrase passes through JVM `String`s.** The field's text, the words read from it, the phrase joined back before it is converted to bytes for Rust, and the twelve words shown on the generation screen are `String`s (or the field's own buffer): not wipeable, reachable in the heap until collected. Clearing a field removes the text from the screen, not from memory. The confirmation screen keeps only the three sampled words, not the twelve. | The reader this requires is a live memory read of an unlocked device, the adversary of **R-D-1**, out of the model. The bytes handed to Rust are wiped after use, and Rust holds the phrase in `Zeroizing`. Removing the `String`s from the input path means entering the phrase without a platform text field (see S1). The heap-level work of `ROADMAP` §10.7 (heap-0) took the upload token out of the JVM heap; it does not cover the phrase, for which it is deferred. | Accepted; heap level deferred. |
+
+---
+
+## Video export from the rescue
+
+The nominal export joins the verified chunks of a recording into videos with the platform
+muxer, without re-encoding (`Mp4ChunkMedia`), then clears in place what that muxer writes
+about the export (`Mp4MetadataScrub`): the creation and modification dates of the movie,
+tracks and media become 0, and the metadata boxes, where the muxer writes the Android version
+of the exporting phone (`com.android.version`), become `free` boxes of zeros. An exported
+file leaves the app's protection by design: it is meant for a third party. What the cleared
+file still tells:
+
+| ID | Residual | Why bounded / why accepted | Status |
+|----|----------|----------------------------|--------|
+| **E1** | **The cleared box keeps its size.** Nothing in the file moves, so the sample offsets stay right; a cleared metadata box therefore keeps its size, and the size of the `meta` box depends on the length of the Android version string it held: "9" is one character, "10" to "16" two, releases such as "8.1.0" more. A joined video thus tells the length class of the exporting phone's version string, never the string itself. On a build whose vendor turns on the recorder property that also writes the manufacturer and the model (`media.recorder.show_manufacturer_and_model`, off by default), their lengths would add to it; that branch is from the platform's native muxer and was not checked here. | A length class, not the value, and only of the phone that exports, which in a rescue need not be the witness's. Removing the box rather than clearing it would not make files from different Android releases alike: the rest of the layout is the exporting phone's muxer's and may differ between releases as well. | Accepted. |
+| **E2** | **Chunks exported as recorded keep the recorder's tags.** Three paths copy a chunk byte for byte, without the muxer and without the scrub: the raw chunks' subfolder of the nominal export, when the witness asks for it; the nominal export itself, which writes a chunk as a video of its own when this phone cannot read it for a join or its muxer does not write its codec (HEVC below Android 7.0); and the export of the section kept apart as not verifiable (`ExportPlan.planUnverifiable`), which joins nothing. Such a copy keeps what the phone that recorded it wrote, among it that phone's `com.android.version` and the dates of the recording. | Each path has its own reason. Raw subfolder: the timestamp proof commits to the chunks as recorded, so these copies could not be cleared without breaking it, and the witness asks for them. Chunk the export cannot join: the copy is made without asking, so that no part of the recording is dropped; it happens only for a chunk this phone cannot read or mux, and the scrub is not run on it. Section kept apart: a separate export the witness starts, of objects whose provenance was not verified, where nothing is muxed. Nothing in these copies was written by the exporting phone. | Accepted. |
+
+---
+
 ## What is NOT in this register (because it was fixed, not accepted)
 
 For the auditor's orientation: the at-rest identity leak (STRM header `author_pk` → STRM **V3**,

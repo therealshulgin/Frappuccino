@@ -39,7 +39,11 @@ object StreamPreferences {
     private const val KEY_ED25519_PK = "ed25519_pk_hex"
     private const val KEY_X25519_PK = "x25519_pk_hex"
     private const val KEY_RATCHET_BLOB = "ratchet_blob_b64"
-    private const val KEY_INVITE_CODE = "invite_code"
+    // Retired: the invitation code of the V1 onboarding. It named the
+    // organisation behind the witness, nothing read it, and the relay no longer
+    // has an invite route. Phones that stored it erase it (forgetRetiredKeys).
+    // Do not reuse the key.
+    private const val KEY_RETIRED_INVITE_CODE = "invite_code"
     private const val KEY_SERVER_URL = "server_url"
     private const val KEY_PENDING_ENROLLMENT = "pending_enrollment_v1"
     private const val KEY_PENDING_ROTATIONS = "pending_rotations_v1"
@@ -96,7 +100,24 @@ object StreamPreferences {
             context, PREFS_NAME, masterKey,
             EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
             EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-        ).also { cachedPrefs = it }
+        ).also {
+            forgetRetiredKeys(it)
+            cachedPrefs = it
+        }
+    }
+
+    /**
+     * Erases what an earlier version stored and no version reads any more. It
+     * runs once per process, on the first access, before anything reads the
+     * prefs: today that is the invitation code ([KEY_RETIRED_INVITE_CODE]),
+     * which named the organisation behind the witness. `commit()`, so the file
+     * no longer holds it when this returns; if the write fails, the key is
+     * still there and the next process tries again.
+     */
+    internal fun forgetRetiredKeys(prefs: SharedPreferences) {
+        if (prefs.contains(KEY_RETIRED_INVITE_CODE)) {
+            prefs.edit().remove(KEY_RETIRED_INVITE_CODE).commit()
+        }
     }
 
     // -- Identité publique --
@@ -231,17 +252,13 @@ object StreamPreferences {
             .remove(KEY_PROVENANCE_TIMESTAMP_ENABLED)
             // Legacy report master (key material) if the migration never ran.
             .remove(KEY_REPORT_MASTER_BLOB)
+            // Erased at the first access already; listed so the wipe does not
+            // depend on that having succeeded.
+            .remove(KEY_RETIRED_INVITE_CODE)
             .commit()
     }
 
     // -- Config diverse (inchangée) --
-
-    fun saveInviteCode(context: Context, code: String) {
-        getPrefs(context).edit().putString(KEY_INVITE_CODE, code).apply()
-    }
-
-    fun getInviteCode(context: Context): String? =
-        getPrefs(context).getString(KEY_INVITE_CODE, null)
 
     fun saveServerUrl(context: Context, url: String) {
         getPrefs(context).edit().putString(KEY_SERVER_URL, url).apply()

@@ -41,13 +41,6 @@
   <!-- i18n — strings extraites des layouts/code hardcoded.
        Convention naming : context_purpose, en snake_case. -->
 
-  <!-- Onboarding : invite code -->
-  <string name="onboard_invite_code_title">Invitation code</string>
-  <string name="onboard_invite_code_explanation">Enter the invitation code provided by your organization to connect to the server.</string>
-  <string name="onboard_invite_code_hint">Invitation code</string>
-  <string name="onboard_invite_code_validate">Validate</string>
-  <string name="onboard_invite_code_skip">Skip</string>
-
   <!-- Onboarding : mnemonic generate -->
   <string name="onboard_mnemonic_generate_title">Your secret phrase</string>
   <string name="onboard_mnemonic_generate_explanation">Note these 12 words in the exact order. This is your only encryption key. No one else can recover it.</string>
@@ -57,7 +50,7 @@
   <!-- Onboarding : mnemonic confirm -->
   <string name="onboard_mnemonic_confirm_title">Confirm your phrase</string>
   <string name="onboard_mnemonic_confirm_explanation">Enter the requested words to verify you correctly noted your phrase.</string>
-  <string name="onboard_mnemonic_confirm_hint">Enter the word</string>
+  <string name="onboard_mnemonic_confirm_hint">Enter the word (accents optional)</string>
   <string name="onboard_mnemonic_confirm_button">Confirm</string>
 
   <!-- Common back button -->
@@ -67,7 +60,7 @@
   <string name="archive_title">ARCHIVE MODE</string>
   <string name="archive_prompt">ENTER YOUR BIP-39 PHRASE\nTO DECRYPT YOUR STREAMS</string>
   <string name="archive_warning">⚠ THE PHRASE STAYS ON THIS SCREEN. NEVER SHARE IT.\nRecovered videos stay encrypted inside the app and are decrypted only while you watch them. They are erased when you close this screen and by the emergency wipe. An export leaves the app\'s protection.</string>
-  <string name="archive_input_hint">12 words separated by spaces</string>
+  <string name="archive_input_hint">12 words separated by spaces, accents optional</string>
   <string name="archive_unlock">UNLOCK</string>
   <string name="archive_close">← Close: cancel the download and erase the recovered copies</string>
   <string name="archive_retrieve_btn">RECOVER MY STREAMS</string>

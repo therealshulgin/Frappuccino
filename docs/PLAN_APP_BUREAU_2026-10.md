@@ -54,13 +54,18 @@ Relevés dans le code ; « [à mesurer] » signale ce qui reste à confirmer sur
 Faites avec ffprobe et ffmpeg sur les morceaux exportés (métadonnées et recollage d'essai
 seulement, rien de copié ni de publié).
 
-- **13 morceaux en 720×1280, et un changement de codec dans la prise** : morceaux 1 à 10 en
-  HEVC (`hvc1`, Main, niveau 3.1), morceaux 11 à 13 en H.264 (`avc1`, High, niveau 3.1). Le
-  morceau 10, sur lequel l'encodeur HEVC a lâché, ne dure que 1,45 s : c'est le repli prévu,
-  bien réel en usage. Sa cause reste à reproduire, journal en capture.
-- **Paramètres d'encodage identiques à l'octet** d'un morceau à l'autre au sein d'un même codec
-  (`hvcC` des morceaux 1 à 10, `avcC` des 11 à 13) ; configuration audio identique partout. Un
-  seul descripteur d'échantillons par segment suffit.
+- **13 morceaux, et un changement de qualité dans la prise, pas un repli de codec.** Sur le
+  relais, les morceaux 1 à 9 pèsent environ 1,5 Mo (720p HEVC), le morceau 10 s'arrête à 1,45 s
+  et les morceaux 11 à 13 pèsent environ 3 Mo, la taille d'un morceau 1080p HEVC à 4 Mbit/s. Le
+  morceau 10 a été coupé par le passage adaptatif de 720p à 1080p : une prise du 2026-10-26,
+  journalisée de bout en bout sur le même téléphone, montre la même coupure et aucune erreur
+  d'encodeur. Les fichiers exportés étudiés ici donnent pourtant les morceaux 11 à 13 en H.264
+  720×1280 de 1,7 Mo : ils ont été convertis après l'export, hors de l'app, qui ne contient aucun
+  encodeur en dehors de la capture. Ce qui suit sur ces trois morceaux décrit la conversion, pas
+  l'app.
+- **Paramètres d'encodage identiques à l'octet** d'un morceau à l'autre au sein d'une même
+  configuration (`hvcC` des morceaux 1 à 10) ; configuration audio identique partout. Un seul
+  descripteur d'échantillons par segment suffit.
 - **Image clé au début de chaque morceau, aucune image B.**
 - **Audio** : AAC-LC 48 kHz mono, amorçage non signalé (`initial_padding` 0), une liste
   d'édition par morceau. Chaque morceau a 70 à 130 ms d'audio de plus que de vidéo ; dans le
@@ -68,13 +73,14 @@ seulement, rien de copié ni de publié).
 - **Métadonnées** : pas de `creation_time` ; une étiquette `com.android.version` (version
   d'Android du téléphone) dans chaque morceau, à retirer à l'export.
 - **Recollage d'essai sans réencodage** (ffmpeg, démultiplexeur concat, copie) : le segment
-  H.264 sort propre ; le segment HEVC garde ses 1 140 images, placées sur l'horloge de l'audio
+  H.264 (converti) sort propre ; le segment HEVC garde ses 1 140 images, placées sur l'horloge de l'audio
   (aucune dérive : dernière image à 47,57 s pour 47,61 s d'audio), mais ffmpeg écrit un
   en-tête de piste faux (40,0 s annoncées pour 47,6 s d'échantillons). Conséquences : **le placement ancré sur l'audio est le bon** ; l'outil d'assemblage
   doit écrire ses propres en-têtes au lieu de s'en remettre à ffmpeg ; entre deux morceaux, la
   dernière image reste affichée 80 à 150 ms (l'audio est plus long), ce qui est sans perte.
-- **Pas encore mesuré** : un changement de qualité (résolution) dans une prise, donc le cas à
-  plusieurs descripteurs ; la frontière audio à l'oreille (amorçage de chaque encodeur).
+- **Pas encore mesuré** : les morceaux bruts d'un changement de qualité (résolution), donc le
+  cas à plusieurs descripteurs, pourtant le cas courant : les deux prises connues passent de
+  720p à 1080p en cours de route ; la frontière audio à l'oreille (amorçage de chaque encodeur).
 
 ## 3. Architecture retenue
 

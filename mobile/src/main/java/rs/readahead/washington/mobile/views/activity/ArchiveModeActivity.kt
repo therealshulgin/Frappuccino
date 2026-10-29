@@ -11,7 +11,6 @@ import android.os.Build
 import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
-import android.view.WindowManager
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.TextView
@@ -49,6 +48,7 @@ import rs.readahead.washington.mobile.views.adapters.ArchiveUnverifiableAdapter
 import timber.log.Timber
 import uniffi.frappuccino.FfiException
 import uniffi.frappuccino.ProvenanceSigner
+import rs.readahead.washington.mobile.views.base_ui.refuseScreenCapture
 
 /**
  * ArchiveModeActivity — l'écran de secours : retrouver et vérifier son
@@ -143,7 +143,7 @@ class ArchiveModeActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
+        refuseScreenCapture()
         ArchiveWipeWatch.attach(this) { finish() }
         setContentView(R.layout.activity_archive_mode)
         // Before the picker's answer, which arrives after onStart.
@@ -234,7 +234,8 @@ class ArchiveModeActivity : AppCompatActivity() {
                     is Unlock.Done -> {
                         ArchiveAuthHolder.set(result.identity, result.session, result.signer)
                         unowned = null
-                        // Cleared on success only: a mistyped phrase stays to be corrected.
+                        // A mistyped phrase stays to be corrected, but only
+                        // while the screen is in front: onStop empties the field.
                         mnemonicInput.setText("")
                         hideKeyboard()
                         showUnlocked(result.identity)
@@ -560,6 +561,17 @@ class ArchiveModeActivity : AppCompatActivity() {
         } catch (_: Exception) {
         }
         super.onPause()
+    }
+
+    override fun onStop() {
+        // A phrase typed and not sent, or sent with a wrong word, still holds
+        // most of the right words. It must not wait in the field for whoever
+        // brings the app back to the front later: the keys derived from it
+        // expire, the phrase itself would not. setText also forgets the undo
+        // history. During a configuration change that recreates the screen,
+        // the new field starts empty anyway (the field saves no state).
+        if (!isChangingConfigurations) mnemonicInput.setText("")
+        super.onStop()
     }
 
     /** Explicit close: confirm if work is running (it will be cancelled). */

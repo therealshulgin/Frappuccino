@@ -12,6 +12,7 @@
   Retirer l'un sans l'autre redonne deux scrollers qui se disputent le geste.
 -->
 <androidx.core.widget.NestedScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="@color/dark_purple">
@@ -55,8 +56,14 @@
         <!-- Saisie de la phrase. `saveEnabled="false"` : sans lui, l'EditText
              range son texte dans l'état sauvegardé de l'activité, un Bundle
              confié au système, et la phrase quitterait l'écran. Pour la même
-             raison, pas d'autofill. -->
-        <EditText
+             raison, pas d'autofill, le clavier ne doit rien en apprendre
+             (`flagNoPersonalizedLearning`), et pas d'historique d'annulation
+             qui garderait le texte effacé (`allowUndo="false"`, que seul le
+             layout peut poser). SecretEditText réapplique les autres
+             protections lui-même et refuse copier, couper et annuler ; les
+             attributs restent ici pour qu'on les lise. Le champ est vidé quand
+             l'écran passe en arrière-plan (onStop). -->
+        <rs.readahead.washington.mobile.views.SecretEditText
             android:id="@+id/archiveMnemonicInput"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -64,9 +71,11 @@
             android:minLines="3"
             android:maxLines="4"
             android:inputType="textMultiLine|textNoSuggestions|textVisiblePassword"
-            android:imeOptions="actionDone"
+            android:imeOptions="actionDone|flagNoPersonalizedLearning"
             android:saveEnabled="false"
             android:importantForAutofill="no"
+            android:allowUndo="false"
+            tools:ignore="UnusedAttribute"
             android:textColor="@color/wa_white"
             android:textSize="14sp"
             android:fontFamily="monospace"

@@ -13,20 +13,25 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
 import java.nio.ByteBuffer
+import java.util.zip.CRC32
 
 /**
  * The joined export on the platform's own extractor and muxer: chunks of one
  * format become one valid MP4 holding every sample, at strictly increasing
  * times on each track, as long as the chunks' audio together; a change of
- * codec or a gap makes two files.
+ * codec or a gap makes two files. The dates and the Android version the
+ * muxer writes about the export are cleared ([Mp4MetadataScrub]) without
+ * moving a sample.
  *
  * Runs the export loop ([JoinedExportRun]) with [Mp4ChunkMedia], on plain
  * files: "decrypting" is a copy, and the destination is a directory. The
@@ -102,6 +107,72 @@ class Mp4JoinInstrumentedTest {
         } finally {
             retriever.release()
         }
+        // Nor anything about the export: no date, no Android version.
+        assertCleared(videos.single(), tracks = 2)
+    }
+
+    /**
+     * What the platform muxer writes about the export is there before the
+     * scrub, and gone after it, while every sample stays where it was: the
+     * same file, the same size, changed only inside the date fields and the
+     * metadata boxes, and read back by the platform's extractor with the
+     * same tracks and the same samples, byte for byte, at the same times.
+     */
+    @Test
+    fun theScrubClearsTheExportAndMovesNoSample() {
+        val sets = mutableListOf(listOf(asset("h264-1.mp4"), asset("h264-2.mp4"), asset("h264-3.mp4")))
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) sets.add(listOf(asset("hevc-1.mp4"), asset("hevc-2.mp4")))
+        for ((n, files) in sets.withIndex()) {
+            val (_, joined) = join(
+                files.mapIndexed { i, f -> i + 1 to f },
+                out = File(root, "reference-$n"),
+                media = Mp4ChunkMedia(scrub = {}),
+            )
+            val reference = joined.single()
+            val before = reference.readBytes()
+            val found = Mp4MetadataScrub.inspect(reference)
+            // The muxer did write them: without this, the rest checks nothing.
+            assertTrue("no export date in the reference", found.dates.any { it.value != 0L })
+            assertTrue("no metadata box in the reference", found.metadata.isNotEmpty())
+            assertTrue("no Android version in the reference", contains(before, ANDROID_VERSION_KEY))
+            val scrubbed = File(root, "scrubbed-$n.mp4")
+            reference.copyTo(scrubbed)
+
+            Mp4MetadataScrub.scrub(scrubbed)
+
+            val after = scrubbed.readBytes()
+            assertEquals(before.size, after.size)
+            val cleared = found.dates.map { it.offset until it.offset + it.width } +
+                found.metadata.map { it.offset + 4 until it.end }
+            for (i in before.indices) {
+                if (before[i] != after[i]) {
+                    assertTrue("byte $i changed out of a date or a metadata box", cleared.any { i.toLong() in it })
+                }
+            }
+            assertCleared(scrubbed, tracks = 2)
+            assertEquals(formats(reference), formats(scrubbed))
+            val expected = samples(reference)
+            assertEquals(files.sumOf { samples(it).size }, expected.size)
+            assertEquals(expected, samples(scrubbed))
+        }
+    }
+
+    /** A video the scrub refuses never reaches the destination, and its
+     *  private file is deleted, as after any failed write. */
+    @Test
+    fun aVideoTheScrubRefusesFailsTheExport() {
+        val out = File(root, "out")
+        try {
+            join(
+                listOf(1 to asset("h264-1.mp4"), 2 to asset("h264-2.mp4")),
+                out = out,
+                media = Mp4ChunkMedia(scrub = { throw Mp4MetadataScrub.Unexpected("refused") }),
+            )
+            fail("a video the scrub refuses must fail the export")
+        } catch (_: Mp4MetadataScrub.Unexpected) {
+        }
+        assertEquals(emptyList<String>(), out.list().orEmpty().toList())
+        assertEquals(emptyList<String>(), File(root, "work").list().orEmpty().toList())
     }
 
     /**
@@ -246,6 +317,7 @@ class Mp4JoinInstrumentedTest {
         chunks: List<Pair<Int, File>>,
         out: File = File(root, "out"),
         missingSeqs: Set<Int> = emptySet(),
+        media: Mp4ChunkMedia = Mp4ChunkMedia(),
     ): Pair<ExportOutcome, List<File>> {
         out.mkdirs()
         val sources = chunks.associate { (seq, file) -> "%06d.strm".format(seq) to file }
@@ -262,12 +334,80 @@ class Mp4JoinInstrumentedTest {
         val outcome = JoinedExportRun(
             decrypt = { sealed, plain -> sealed.copyTo(plain, overwrite = true) },
             secureDelete = { it.delete() },
-            media = Mp4ChunkMedia(),
+            media = media,
             destination = destination,
             sdkInt = Build.VERSION.SDK_INT,
         ).run(plan, sources, File(work, "chunk.tmp"), File(work, "video.tmp"), isActive = { true }) { _, _ -> }
         assertTrue("private files left behind", work.list().orEmpty().isEmpty())
         return outcome to out.listFiles().orEmpty().filter { it.name.startsWith("prise-") }.sortedBy { it.name }
+    }
+
+    /** [file] holds no date and no metadata box, as the walk of the scrub
+     *  reads it, and not the Android version tag anywhere in its bytes. */
+    private fun assertCleared(file: File, tracks: Int) {
+        val found = Mp4MetadataScrub.inspect(file)
+        // Two dates in the movie header, and in each track's track and media
+        // headers.
+        assertEquals(2 * (1 + 2 * tracks), found.dates.size)
+        assertTrue("a date left", found.dates.all { it.value == 0L })
+        assertEquals(emptyList<String>(), found.metadata.map { it.type })
+        assertFalse("Android version left", contains(file.readBytes(), ANDROID_VERSION_KEY))
+    }
+
+    private fun contains(bytes: ByteArray, text: String): Boolean {
+        val needle = text.toByteArray(Charsets.ISO_8859_1)
+        return (0..bytes.size - needle.size).any { i -> needle.indices.all { bytes[i + it] == needle[it] } }
+    }
+
+    /** What the platform's extractor reads of each track of [file]. */
+    private fun formats(file: File): List<String> {
+        val extractor = MediaExtractor()
+        try {
+            extractor.setDataSource(file.path)
+            return (0 until extractor.trackCount).map { i ->
+                val f = extractor.getTrackFormat(i)
+                buildString {
+                    append(f.getString(MediaFormat.KEY_MIME))
+                    for (key in INT_KEYS) if (f.containsKey(key)) append(" $key=${f.getInteger(key)}")
+                    if (f.containsKey(MediaFormat.KEY_DURATION)) append(" duration=${f.getLong(MediaFormat.KEY_DURATION)}")
+                    if (f.containsKey(MediaFormat.KEY_LANGUAGE)) append(" language=${f.getString(MediaFormat.KEY_LANGUAGE)}")
+                    var n = 0
+                    while (true) {
+                        val csd = f.getByteBuffer("csd-$n")?.duplicate() ?: break
+                        val bytes = ByteArray(csd.remaining()).also { csd.get(it) }
+                        append(" csd-$n=").append(bytes.joinToString("") { "%02x".format(it) })
+                        n++
+                    }
+                }
+            }
+        } finally {
+            extractor.release()
+        }
+    }
+
+    private data class Sample(val track: Int, val timeUs: Long, val flags: Int, val size: Int, val crc: Long)
+
+    /** Every sample of [file], in the order the platform's extractor reads
+     *  them: track, time, flags, size and a checksum of the bytes. */
+    private fun samples(file: File): List<Sample> {
+        val extractor = MediaExtractor()
+        try {
+            extractor.setDataSource(file.path)
+            for (i in 0 until extractor.trackCount) extractor.selectTrack(i)
+            val buffer = ByteBuffer.allocate(1 shl 20)
+            val crc = CRC32()
+            val out = ArrayList<Sample>()
+            while (extractor.sampleTrackIndex >= 0) {
+                val size = extractor.readSampleData(buffer, 0)
+                crc.reset()
+                crc.update(buffer.array(), buffer.arrayOffset(), size)
+                out.add(Sample(extractor.sampleTrackIndex, extractor.sampleTime, extractor.sampleFlags, size, crc.value))
+                if (!extractor.advance()) break
+            }
+            return out
+        } finally {
+            extractor.release()
+        }
     }
 
     private class Read(val videoMime: String?, val video: List<Long>, val audio: List<Long>, val durationUs: Long)
@@ -361,5 +501,9 @@ class Mp4JoinInstrumentedTest {
         const val AAC_FRAME_US = 1024L * 1_000_000 / 48_000
         const val LATE_US = 300_000L
         val PART_NAME = Regex("""part-(\d+)\.mp4""")
+        const val ANDROID_VERSION_KEY = "com.android.version"
+        val INT_KEYS = listOf(
+            MediaFormat.KEY_WIDTH, MediaFormat.KEY_HEIGHT, MediaFormat.KEY_SAMPLE_RATE, MediaFormat.KEY_CHANNEL_COUNT,
+        )
     }
 }

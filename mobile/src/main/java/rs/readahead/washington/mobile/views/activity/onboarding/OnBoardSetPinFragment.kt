@@ -35,7 +35,7 @@ import timber.log.Timber
  * ne sont plus dans le dépôt, seuls leurs noms subsistent dans des
  * commentaires. Si les deux saisies correspondent,
  * [StreamUploadManager.enrollFromMnemonic] persiste l'identité et le ratchet
- * PIN-wrappé, puis on navigue vers OnBoardInviteCodeFragment ; sinon on
+ * PIN-wrappé, puis on navigue vers OnBoardAllDoneFragment ; sinon on
  * revient à la première saisie avec un message d'erreur.
  */
 class OnBoardSetPinFragment : BaseFragment(), PinLockListener {
@@ -285,13 +285,13 @@ class OnBoardSetPinFragment : BaseFragment(), PinLockListener {
                                 "depuis Réglages → Réessayer l'enrôlement serveur.",
                             android.widget.Toast.LENGTH_LONG
                         ).show()
-                        navigateToInviteCode()
+                        navigateToAllDone()
                     }
                     else -> {
                         // Local + serveur OK → enroll terminé.
                         MnemonicHolder.clear()
                         Timber.i("V2 enrollment complete — server + local OK")
-                        navigateToInviteCode()
+                        navigateToAllDone()
                     }
                 }
             }
@@ -300,8 +300,8 @@ class OnBoardSetPinFragment : BaseFragment(), PinLockListener {
 
     /**
      * Toujours dépiler TOUTE la chaîne identity-setup avant d'ajouter
-     * InviteCode : sans ce pop, `addFragment` empile, et un back depuis
-     * InviteCode revient sur un SetPin orphelin dont l'état a survécu (vue et
+     * AllDone : sans ce pop, `addFragment` empile, et un back depuis
+     * AllDone revient sur un SetPin orphelin dont l'état a survécu (vue et
      * listener [PinLockView] intacts) alors que MnemonicHolder vient d'être
      * vidé. L'utilisateur retape son PIN et reçoit "Phrase perdue" — de son
      * point de vue, sa phrase de récupération a disparu après un enrôlement
@@ -316,12 +316,12 @@ class OnBoardSetPinFragment : BaseFragment(), PinLockListener {
      * cache à l'entrée depuis `goToIdentitySetup()`. Le couplage ne se lit
      * dans aucun des deux fichiers pris isolément.
      */
-    private fun navigateToInviteCode() {
+    private fun navigateToAllDone() {
         baseActivity.supportFragmentManager.popBackStackImmediate(
             null, FragmentManager.POP_BACK_STACK_INCLUSIVE
         )
         baseActivity.addFragment(
-            this@OnBoardSetPinFragment, OnBoardInviteCodeFragment(), R.id.rootOnboard
+            this@OnBoardSetPinFragment, OnBoardAllDoneFragment(), R.id.rootOnboard
         )
     }
 

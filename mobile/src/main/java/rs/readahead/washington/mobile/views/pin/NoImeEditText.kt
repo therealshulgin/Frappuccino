@@ -25,6 +25,17 @@ class NoImeEditText @JvmOverloads constructor(
     defStyleAttr: Int = 0,
 ) : androidx.appcompat.widget.AppCompatEditText(context, attrs, defStyleAttr) {
 
+    init {
+        // The dots mirror the PIN being typed. Without this, an EditText puts
+        // its text in the activity's saved state, a Bundle handed to the
+        // system when the screen stops. The keypad does not save its digits
+        // either, so after a recreation both start empty.
+        isSaveEnabled = false
+    }
+
+    /** An EditText answers true here, which puts its text in its saved state. */
+    override fun getFreezesText(): Boolean = false
+
     /**
      * Called before the keyboard appears when text is selected — hide it.
      */

@@ -28,9 +28,10 @@ import timber.log.Timber
  *
  * Le holder lui-même ne matérialise jamais de `String`, et le chemin
  * d'enrôlement reste en bytes jusqu'au FFI. Un consommateur peut en revanche
- * en fabriquer une : l'écran de confirmation construit une String transitoire
- * pour découper les mots ([OnBoardMnemonicConfirmFragment]), résidu borné et
- * documenté sur place. Si tu ajoutes un consommateur, reste sur les bytes.
+ * en fabriquer : l'écran de confirmation repère les mots dans les octets et ne
+ * décode en String que les trois mots tirés au sort
+ * ([OnBoardMnemonicConfirmFragment]), résidu borné et documenté sur place. Si
+ * tu ajoutes un consommateur, reste sur les bytes.
  */
 object MnemonicHolder {
 

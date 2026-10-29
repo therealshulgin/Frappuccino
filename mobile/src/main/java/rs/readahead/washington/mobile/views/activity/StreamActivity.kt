@@ -39,6 +39,7 @@ import rs.readahead.washington.mobile.util.jobs.OrphanSweepWorker
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import rs.readahead.washington.mobile.views.base_ui.refuseScreenCapture
 
 class StreamActivity : AppCompatActivity() {
 
@@ -154,11 +155,9 @@ class StreamActivity : AppCompatActivity() {
             WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
         )
-        // V2 : empêche screenshots, apparition dans l'overview, capture d'écran à distance
-        window.setFlags(
-            WindowManager.LayoutParams.FLAG_SECURE,
-            WindowManager.LayoutParams.FLAG_SECURE
-        )
+        // V2 : empêche screenshots, apparition dans l'overview, capture d'écran à distance,
+        // et coupe Content Capture (API 29+), avant setContentView.
+        refuseScreenCapture()
 
         setContentView(R.layout.activity_stream)
 

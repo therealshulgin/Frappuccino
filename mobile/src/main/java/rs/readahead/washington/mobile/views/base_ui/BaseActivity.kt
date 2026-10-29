@@ -27,13 +27,16 @@ abstract class BaseActivity : AppCompatActivity() {
     private lateinit var container: ViewGroup
     private lateinit var loading: View
     override fun onCreate(savedInstanceState: Bundle?) {
+        // First thing, before the subclass sets its content and before any
+        // restored fragment draws: the onboarding shows the recovery phrase and
+        // takes it back. Here and not only in onResume, because the Content
+        // Capture session starts in onPostCreate with the window flags present
+        // then (see refuseScreenCapture). onResume sets FLAG_SECURE again.
+        refuseScreenCapture()
         super.onCreate(savedInstanceState)
         setThemeStyle()
         supportFragmentManager.setupForAccessibility(this)
 
-        // start with preventing showing screen in tasks?
-        // getWindow().setFlags(WindowManager.LayoutParams.FLAG_SECURE,
-        //        WindowManager.LayoutParams.FLAG_SECURE);
         if (!isManualOrientation && !resources.getBoolean(R.bool.isTablet)) {
             requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         }

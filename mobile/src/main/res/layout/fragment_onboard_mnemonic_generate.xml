@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="@color/wa_purple"
@@ -35,8 +36,16 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 
+    <!-- Les douze mots de la phrase de secours s'affichent ici.
+         `accessibilityDataSensitive="yes"` (API 34+, ignoré avant) les cache aux
+         services d'accessibilité qui ne se déclarent pas outils
+         d'accessibilité ; les mots, ajoutés par le code, en héritent (valeur par
+         défaut `auto`). Pas d'autofill non plus : rien ici n'est à remplir. -->
     <androidx.gridlayout.widget.GridLayout
         android:id="@+id/wordsGrid"
+        android:accessibilityDataSensitive="yes"
+        android:importantForAutofill="noExcludeDescendants"
+        tools:targetApi="34"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
         android:layout_marginTop="24dp"

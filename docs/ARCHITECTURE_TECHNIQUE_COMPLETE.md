@@ -60,10 +60,13 @@ Propriétés saillantes, dans l'état courant du code :
 - **Cryptographie 100 % Rust** (`crypto-rs/` : six crates au workspace, soit `core`, `stream`, `ffi`, `cli`, `obfs-proxy` et `quic-spike`, plus la crate `fuzz` hors workspace ; **trois seulement partent dans le `.so`** : `core`, `stream`, `ffi`) exposée à Kotlin via UniFFI.
   Zéro `unsafe`, dépendances épinglées en version exacte, secrets en `Zeroizing`,
   `clippy -D warnings` en gate. Aucun secret *long-lived* ne réside dans la heap
-  JVM ; les seuls résidus sont transitoires et bornés à quelques millisecondes (le
-  `String` PIN/mnémonique imposé par le composant clavier legacy, le `ByteArray` de
-  métadonnées de session wipé en `finally`), hors modèle de menace (R-D-1, heap-dump
-  d'un device déverrouillé/rooté ; cf. §2.4 et `GUIDE_AUDITEUR §4` frontière zeroize).
+  JVM ; les résidus sont transitoires : le `String` PIN imposé par le composant clavier
+  legacy et le `ByteArray` de métadonnées de session wipé en `finally`, bornés à
+  quelques millisecondes ; la phrase de secours, elle, passe en `String` le temps de
+  son affichage, de sa confirmation et du déverrouillage d'archive (texte des champs de
+  saisie compris, non wipable, jusqu'au GC ; cf. §3.3). Ces résidus sont hors modèle de
+  menace (R-D-1, heap-dump d'un device déverrouillé/rooté ; cf. §2.4 et
+  `GUIDE_AUDITEUR §4` frontière zeroize).
 - **Ratchet éphémère batché** : lignée de signatures Ed25519 forward-secure. Chaque
   authentification consomme une clé à usage unique, détruite immédiatement ; chaque
   batch de 50 clés est authentifié par une signature du batch précédent, remontant à
@@ -330,8 +333,26 @@ tolérante aux accents identique côté Rust et côté CLI). La phrase est :
 - **générée sur le device, affichée une fois**, confirmée, jamais persistée ;
 - le **seul** chemin vers la clé privée X25519 (archives) et la clé privée Ed25519
   long-terme (ré-enrôlement) ;
-- saisie exclusivement via un flux dédié en `ByteArray` wipé (jamais de `String` JVM),
-  côté Rust en `Zeroizing`.
+- saisie dans un champ `SecretEditText` (confirmation à l'enrôlement, écran d'archive),
+  qui demande au clavier de ne rien suggérer ni apprendre, n'entre pas dans l'état
+  sauvegardé de l'activité, est exclu de l'autofill et, sur API 34+, des services
+  d'accessibilité qui ne se déclarent pas outils d'accessibilité, refuse copier,
+  couper, partager et annuler, et annule le glisser-déposer du texte sélectionné dès
+  qu'il démarre. Aux services d'accessibilité, il ne propose ni n'exécute copier,
+  couper, partager, ni les actions qui remettraient la sélection à une autre app :
+  traitement du texte par une autre app (`PROCESS_TEXT`, « Traduire » et
+  semblables, qui la recevraient dans un Intent) et actions « intelligentes » du
+  classifieur de texte ; il garde celles dont un lecteur d'écran a besoin. Ce refus
+  passe par les identifiants d'action propres à `TextView`, valeurs privées lues dans
+  les sources de la plateforme : une version qui les numéroterait autrement
+  proposerait de nouveau ces actions (résidu S2).
+  L'écran d'archive vide le champ quand il passe en arrière-plan. La
+  saisie passe par des `String` JVM : le texte du champ, puis les mots lus et la phrase
+  rejointe, non wipables, atteignables jusqu'au GC. La phrase
+  traverse ensuite la frontière UniFFI en `ByteArray` wipé après usage, et vit côté Rust
+  en `Zeroizing`. Le clavier système reçoit chaque frappe : les drapeaux sont des
+  demandes qu'il peut ignorer. Résidus : `ACCEPTED_RESIDUALS_2026-06-28.md`, section
+  « Secret entry and display ».
 
 Un 13ᵉ mot optionnel (passphrase BIP-39 standard) dérive une identité disjointe -
 support de déni plausible, à la crédibilité duquel le design ne prétend pas au-delà de
@@ -974,10 +995,23 @@ Le harness est conservé pour re-valider tout futur device.
 
 ### 7.2 Hygiène des secrets côté UI
 
-Les entrées sensibles (PIN, mnemonic) vivent en `CharArray`/`ByteArray` wipés
-(`SecureWipe`, qui évite l'élision JIT du `fill(0)` nu) ; aucun secret dans les Intents,
-les logs (`logcat` gardé par règles Semgrep dédiées), ou les `SharedPreferences` non
-chiffrées. `FLAG_SECURE` + `excludeFromRecents` + stealth black screen (overlay noir
+Les secrets que l'app manipule elle-même (PIN converti, mnemonic transmis à Rust) vivent
+en `CharArray`/`ByteArray` wipés (`SecureWipe`, qui évite l'élision JIT du `fill(0)`
+nu) ; ce qui passe par un champ de saisie ou un `TextView` passe aussi par des `String`
+non wipables (§3.3). Aucun secret dans les Intents que l'app émet, les logs (`logcat`
+gardé par règles Semgrep dédiées), ou les `SharedPreferences` non chiffrées ; la
+plateforme, elle, peut placer le texte sélectionné d'un champ dans un Intent vers une
+autre app (`PROCESS_TEXT`, par le menu de sélection ou par une action d'accessibilité),
+chemins que `SecretEditText` refuse pour la phrase (§3.3). Tout champ qui reçoit la
+phrase est un `SecretEditText` (§3.3), règle tenue par un test
+JVM qui résout chaque balise de layout en classe et refuse tout champ construit dans le
+code. Ce test laisse passer, chacun avec sa raison, les points du PIN des deux écrans PIN
+(`NoImeEditText`, remplis par le clavier intégré à l'app et exclus de l'état sauvegardé)
+et deux feuilles héritées de `shared-ui` que rien n'affiche. La grille qui affiche les
+douze mots est marquée `accessibilityDataSensitive` (API 34+). `FLAG_SECURE` est posé dès
+`onCreate`, avant le contenu, et Content Capture est coupé pour l'activité (API 29+), sur
+toutes les activités qui montrent un secret (un test JVM le vérifie pour chaque activité
+du manifeste) ; plus `excludeFromRecents` + stealth black screen (overlay noir
 immédiat, tap-to-exit) sur les surfaces exposées.
 
 ### 7.3 Panic wipe

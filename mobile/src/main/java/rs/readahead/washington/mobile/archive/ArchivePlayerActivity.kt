@@ -6,7 +6,6 @@ import android.content.Intent
 import android.media.MediaPlayer
 import android.os.Bundle
 import android.view.View
-import android.view.WindowManager
 import android.widget.MediaController
 import android.widget.TextView
 import android.widget.VideoView
@@ -21,6 +20,7 @@ import java.io.File
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
+import rs.readahead.washington.mobile.views.base_ui.refuseScreenCapture
 
 /**
  * Internal player of the rescue: plays the chunks of one report, in seq order,
@@ -78,7 +78,7 @@ class ArchivePlayerActivity : AppCompatActivity() {
     @SuppressLint("InflateParams") // the root is attached by setContentView below
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
+        refuseScreenCapture()
         ArchiveWipeWatch.attach(this) { finish() }
 
         // Inflate, flag the surface, THEN attach: setSecure is ignored on a

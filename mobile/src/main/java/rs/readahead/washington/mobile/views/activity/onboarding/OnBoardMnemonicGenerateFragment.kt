@@ -77,9 +77,11 @@ class OnBoardMnemonicGenerateFragment : BaseFragment() {
 
         // Conversion ByteArray UTF-8 -> String pour
         // l'affichage TextView (TextView.setText prend CharSequence, impose
-        // par Android). C'est le seul chemin ou le mnemonic prend la forme
-        // String : la phrase entiere le temps du decoupage, puis un mot par
-        // TextView. Ces Strings ne sont jamais persistees, mais elles ne sont
+        // par Android). Sur cet ecran, c'est le seul chemin ou le mnemonic
+        // prend la forme String : la phrase entiere le temps du decoupage, puis
+        // un mot par TextView. L'ecran de confirmation en decode trois mots, et
+        // la saisie (confirmation, ecran d'archive) passe par le texte du
+        // champ. Ces Strings ne sont jamais persistees, mais elles ne sont
         // pas wipables et restent atteignables en heap tant que la grille est
         // affichee, puis jusqu'au GC — residu transitoire assume (cf. WP-G).
         // Le reste du flow (passage a FFI Rust) reste en bytes.

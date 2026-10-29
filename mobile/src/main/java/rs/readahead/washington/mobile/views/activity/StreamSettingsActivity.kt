@@ -5,7 +5,6 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.view.View
-import android.view.WindowManager
 import android.widget.TextView
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -14,6 +13,7 @@ import org.stream.crypto.upload.StreamUploadManager
 import rs.readahead.washington.mobile.BuildConfig
 import rs.readahead.washington.mobile.data.sharedpref.Preferences
 import rs.readahead.washington.mobile.R
+import rs.readahead.washington.mobile.views.base_ui.refuseScreenCapture
 
 private const val AGPL_V3_URL = "https://www.gnu.org/licenses/agpl-3.0.html"
 
@@ -82,7 +82,7 @@ class StreamSettingsActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
+        refuseScreenCapture()
         setContentView(R.layout.activity_stream_settings)
 
         fingerprintView = findViewById(R.id.settingsFingerprint)

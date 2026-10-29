@@ -26,23 +26,38 @@ import java.nio.ByteBuffer
  * orientation hint keeps its default of 0, as in the chunks. Each track is
  * declared from scratch with its MIME, its dimensions or audio layout and its
  * codec configuration, and nothing else from the chunk's own track format.
- * The platform muxer still writes what it writes in any MP4 it produces: the
- * Android version of the phone that exports (`com.android.version`), a tag
- * each chunk already carries for the phone that recorded it; a default
- * language code on each track; and the creation and modification times,
- * which here are those of the export, not of the recording.
+ * The platform muxer still writes, in any MP4 it produces, the Android
+ * version of the phone that exports (`com.android.version`, in a metadata
+ * box) and creation and modification times that are those of the export,
+ * not of the recording. [finish] clears both in place once the muxer has
+ * stopped, before the file is copied out ([Mp4MetadataScrub]): the times
+ * are set to 0 and the metadata boxes become `free` boxes of zeros, at the
+ * same sizes and places, so no sample moves. A file the scrub does not
+ * recognise fails the export rather than leave the app half cleared. What
+ * stays: a language code and a handler name on each track, the layout of the
+ * file as the exporting phone's muxer writes it, and the size of the cleared
+ * metadata box, which depends on the length of that phone's Android version
+ * string ([Mp4MetadataScrub] says more). A chunk exported as recorded is not
+ * muxed and keeps what its recorder wrote.
  *
  * The samples are plaintext of the testimony. They pass through one heap
  * buffer per video, wiped when the video is finished or abandoned, and when
  * a larger one replaces it. What the platform's extractor and muxer keep in
  * native memory while they work is out of the app's reach.
+ *
+ * @param scrub clears what the muxer wrote about the export from the
+ *   finished private file, in place; throws for a file it cannot clear.
  */
-internal class Mp4ChunkMedia : JoinedExportRun.Media<Mp4ChunkMedia.Video> {
+internal class Mp4ChunkMedia(
+    private val scrub: (File) -> Unit = Mp4MetadataScrub::scrub,
+) : JoinedExportRun.Media<Mp4ChunkMedia.Video> {
 
-    /** A joined video being written. [videoTrack] and [audioTrack] are the
-     *  muxer's track indices, -1 for a track the video does not have. */
+    /** A joined video being written to the private [file]. [videoTrack] and
+     *  [audioTrack] are the muxer's track indices, -1 for a track the video
+     *  does not have. */
     class Video internal constructor(
         internal val muxer: MediaMuxer,
+        internal val file: File,
         internal val videoTrack: Int,
         internal val audioTrack: Int,
     ) {
@@ -116,7 +131,7 @@ internal class Mp4ChunkMedia : JoinedExportRun.Media<Mp4ChunkMedia.Video> {
             val videoTrack = first.video?.let { muxer.addTrack(toMediaFormat(it.format, video = true)) } ?: -1
             val audioTrack = first.audio?.let { muxer.addTrack(toMediaFormat(it.format, video = false)) } ?: -1
             muxer.start()
-            return Video(muxer, videoTrack, audioTrack)
+            return Video(muxer, file, videoTrack, audioTrack)
         } catch (e: Exception) {
             releaseQuietly(muxer)
             throw e
@@ -159,6 +174,9 @@ internal class Mp4ChunkMedia : JoinedExportRun.Media<Mp4ChunkMedia.Video> {
             releaseQuietly(video.muxer)
             video.wipeBuffer()
         }
+        // Only after stop(): the muxer writes the movie box, and with it the
+        // dates and its metadata, as it finishes the file.
+        scrub(video.file)
     }
 
     override fun abandon(video: Video) {
