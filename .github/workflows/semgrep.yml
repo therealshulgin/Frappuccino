@@ -59,6 +59,13 @@ jobs:
             --exclude='**/*.lock' \
             --metrics=off
 
+      # Neither the job log nor the Security tab is readable without signing
+      # in: each result is also written as an annotation, shown on the run's
+      # summary page.
+      - name: Name the findings
+        if: failure()
+        run: python3 scripts/annotate-sarif.py semgrep.sarif
+
       - name: Upload SARIF to GitHub Security tab
         if: always()
         uses: github/codeql-action/upload-sarif@v3

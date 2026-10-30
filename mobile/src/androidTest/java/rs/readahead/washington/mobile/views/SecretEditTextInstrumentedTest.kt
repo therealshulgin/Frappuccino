@@ -411,10 +411,36 @@ class SecretEditTextInstrumentedTest {
             val inside = onMain { onScreen(field, field.layout.getPrimaryHorizontal(3)) }
             val stillInside = onMain { onScreen(field, field.layout.getPrimaryHorizontal(8)) }
             val onTarget = onMain { onScreen(scene.target, scene.target.width / 2f, scene.target.height / 2f) }
-            val down = SystemClock.uptimeMillis()
-            mouse(down, MotionEvent.ACTION_DOWN, inside, MotionEvent.BUTTON_PRIMARY)
-            mouse(down, MotionEvent.ACTION_MOVE, stillInside, MotionEvent.BUTTON_PRIMARY)
-            scene.awaitDragStarted()
+            // A loaded emulator sometimes lets the gesture go without starting
+            // a drag at all, which leaves nothing to guard. The gesture is
+            // tried again, the selection restored first, and the test still
+            // fails when no attempt starts one.
+            var down = 0L
+            var attempts = 0
+            while (DragEvent.ACTION_DRAG_STARTED !in scene.events && attempts < 3) {
+                attempts++
+                if (attempts > 1) {
+                    mouse(down, MotionEvent.ACTION_UP, stillInside, 0)
+                    instrumentation.waitForIdleSync()
+                    onMain {
+                        field.requestFocus()
+                        field.setSelection(0, SECRET_TEXT.length)
+                    }
+                    instrumentation.waitForIdleSync()
+                }
+                down = SystemClock.uptimeMillis()
+                mouse(down, MotionEvent.ACTION_DOWN, inside, MotionEvent.BUTTON_PRIMARY)
+                mouse(down, MotionEvent.ACTION_MOVE, stillInside, MotionEvent.BUTTON_PRIMARY)
+                scene.awaitDragStarted(timeoutMs = 5_000)
+            }
+            val state = onMain {
+                "focused=${field.isFocused} windowFocus=${field.hasWindowFocus()} " +
+                    "selection=${field.selectionStart}..${field.selectionEnd}"
+            }
+            assertTrue(
+                "no drag started after $attempts attempts: the test did not reach what it guards ($state)",
+                DragEvent.ACTION_DRAG_STARTED in scene.events,
+            )
             for (step in 1..10) {
                 val x = stillInside.first + (onTarget.first - stillInside.first) * step / 10f
                 val y = stillInside.second + (onTarget.second - stillInside.second) * step / 10f
@@ -827,8 +853,8 @@ class SecretEditTextInstrumentedTest {
             activity.addContentView(column, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         }
 
-        fun awaitDragStarted() {
-            val deadline = SystemClock.uptimeMillis() + 10_000
+        fun awaitDragStarted(timeoutMs: Long = 10_000) {
+            val deadline = SystemClock.uptimeMillis() + timeoutMs
             while (DragEvent.ACTION_DRAG_STARTED !in events && SystemClock.uptimeMillis() < deadline) SystemClock.sleep(50)
         }
 
