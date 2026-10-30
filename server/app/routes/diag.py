@@ -359,9 +359,8 @@ def _private_dir(path: Path) -> None:
     # already exists, so the mode is checked and set explicitly. If the relay
     # cannot set it (a directory it does not own), the upload fails with 503
     # rather than land in a directory others may read.
-    if stat.S_IMODE(os.stat(path).st_mode) != 0o700:
-        # The rule flags every chmod; this one narrows the mode to the owner.
-        os.chmod(path, 0o700)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
+    if stat.S_IMODE(path.stat().st_mode) != 0o700:
+        path.chmod(0o700)
 
 
 def _read_usage(root: Path) -> None:

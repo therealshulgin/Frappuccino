@@ -221,7 +221,7 @@ def test_an_existing_directory_is_made_0700(relay):
     # apply to it.
     relay.root.mkdir()
     # Too open on purpose: the test checks that the relay narrows it.
-    os.chmod(relay.root, 0o755)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
+    relay.root.chmod(0o755)
     assert _post(relay.client, _gz(TEXT)).status_code == 204
     assert relay.root.stat().st_mode & 0o777 == 0o700
 
